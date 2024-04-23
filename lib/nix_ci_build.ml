@@ -97,7 +97,7 @@ let nix_eval_jobs proc_mgr ~sw { Config.flake; skip_cached; max_jobs; _ } =
     in
     if skip_cached then base @ [ "--check-cache-status" ] else base
   in
-  Logs.info (fun m -> m "run `%s`" (String.concat ~sep:" " args));
+  Logs.debug (fun m -> m "run `%s`" (String.concat ~sep:" " args));
   (* TODO: suppress stderr for evaluation if successful. *)
   parse_out ~sw proc_mgr args
 
@@ -150,7 +150,7 @@ let nix_build proc_mgr (job : Job.t) =
     ; "--quiet"
     ]
   in
-  Logs.info (fun m -> m "run `%s`" (String.concat ~sep:" " args));
+  Logs.debug (fun m -> m "run `%s`" (String.concat ~sep:" " args));
   (* let null = Eio.Path.(open_out ~sw ~create:`Never (fs / Filename.null))
      in *)
   match Eio.Process.run proc_mgr args with

@@ -34,8 +34,11 @@ let eval_fiber ~sw t (jobs, finished_p) () =
       let job : Job.t = job |> Yojson.Safe.from_string |> Job.t_of_yojson in
       push_to_builds (Some job))
     jobs;
-  Promise.await_exn finished_p;
-  push_to_builds None
+  match Promise.await_exn finished_p with
+  | () -> push_to_builds None
+  | exception (Eio.Exn.Io _ as ex) ->
+    let bt = Printexc.get_raw_backtrace () in
+    Eio.Exn.reraise_with_context ex bt "Evaluating jobs"
 
 let build_fiber t ~sw ~domain_mgr ~process_mgr () =
   let pool =
@@ -57,7 +60,12 @@ let build_fiber t ~sw ~domain_mgr ~process_mgr () =
           Logs.info (fun m -> m "building %s" job.attr);
           Nix_ci_build.nix_build process_mgr job
         in
-        match Eio.Executor_pool.submit_exn pool ~weight:0.25 task with
+        match
+          Eio.Executor_pool.submit_exn
+            pool (* 2 jobs per core *)
+            ~weight:0.5
+            task
+        with
         | Ok _ ->
           (* TODO: put this in an upload queue *)
           t.successful_jobs <- t.successful_jobs + 1;
@@ -128,8 +136,8 @@ let main config stdenv =
   Switch.run (fun sw ->
     let process_mgr = Eio.Stdenv.process_mgr stdenv
     and domain_mgr = Eio.Stdenv.domain_mgr stdenv in
-    let jobs = Nix_ci_build.nix_eval_jobs process_mgr ~sw config in
     let t = make config in
+    let jobs = Nix_ci_build.nix_eval_jobs process_mgr ~sw config in
     let eval_fiber = eval_fiber ~sw t jobs
     and build_fiber = build_fiber t ~sw ~domain_mgr ~process_mgr in
     Fiber.both eval_fiber build_fiber;
