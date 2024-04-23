@@ -50,7 +50,6 @@ let parse_out t ~sw ?cwd ?stdin ?stderr ?is_success ?env ?executable args =
 
 let create_temp_dir () =
   let rand_num = Random.int 1000000 in
-  Format.eprintf "%d@." rand_num;
   let pattern = "nix-ci-build" in
   let tmp_dir =
     Format.sprintf

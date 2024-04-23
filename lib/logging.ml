@@ -7,6 +7,12 @@ let setup file =
   let module Logs = (val Logs.src_log src) in
   (module Logs : Logger)
 
+let set_mutex () =
+  let lock = Mutex.create () in
+  let lock () = Mutex.lock lock
+  and unlock () = Mutex.unlock lock in
+  Logs.set_reporter_mutex ~lock ~unlock
+
 let setup_logging ?style_renderer level =
   let pp_header src ppf (l, h) =
     let src_segment =
@@ -26,6 +32,7 @@ let setup_logging ?style_renderer level =
     in
     { Logs.report }
   in
+  set_mutex ();
   Fmt_tty.setup_std_outputs ?style_renderer ();
   Logs.set_level (Some level);
   Logs.set_reporter format_reporter
