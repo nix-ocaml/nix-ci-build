@@ -48,7 +48,7 @@ let build_fiber t ~domain_mgr ~process_mgr () =
     let pool =
       Eio.Executor_pool.create ~sw ~domain_count:t.config.max_jobs domain_mgr
     in
-    Stream.iter build_stream ~f:(fun (job : Job.t) ->
+    Stream.iter_p ~sw build_stream ~f:(fun (job : Job.t) ->
       let drv_path = job.drvPath in
       let seen = StringSet.mem drv_path t.seen_drv_paths in
       if not seen then t.all_jobs <- t.all_jobs + 1;
@@ -63,21 +63,20 @@ let build_fiber t ~domain_mgr ~process_mgr () =
             Logs.info (fun m -> m "building %s" job.attr);
             Nix_ci_build.nix_build process_mgr job
           in
-          Fiber.fork ~sw (fun () ->
-            match
-              Eio.Executor_pool.submit_exn
-                pool (* 2 jobs per core *)
-                ~weight:0.5
-                task
-            with
-            | Ok () ->
-              t.successful_jobs <- t.successful_jobs + 1;
-              let push_to_uploads = snd t.uploads in
-              push_to_uploads (Some job);
-              Logs.info (fun m -> m "%s built successfully" job.attr)
-            | Error _ ->
-              (* TODO: capture stderr and add it to the build summary too. *)
-              t.failed_jobs <- job :: t.failed_jobs)));
+          match
+            Eio.Executor_pool.submit_exn
+              pool (* 2 jobs per core *)
+              ~weight:0.5
+              task
+          with
+          | Ok () ->
+            t.successful_jobs <- t.successful_jobs + 1;
+            let push_to_uploads = snd t.uploads in
+            push_to_uploads (Some job);
+            Logs.info (fun m -> m "%s built successfully" job.attr)
+          | Error _ ->
+            (* TODO: capture stderr and add it to the build summary too. *)
+            t.failed_jobs <- job :: t.failed_jobs));
   let push_to_uploads = snd t.uploads in
   push_to_uploads None
 
