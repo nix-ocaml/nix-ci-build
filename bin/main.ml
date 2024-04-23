@@ -48,12 +48,17 @@ let build_fiber t ~domain_mgr ~process_mgr () =
     let pool =
       Eio.Executor_pool.create ~sw ~domain_count:t.config.max_jobs domain_mgr
     in
+    let seen_mutex = Mutex.create () in
     Stream.iter_p ~sw build_stream ~f:(fun (job : Job.t) ->
       let drv_path = job.drvPath in
-      let seen = StringSet.mem drv_path t.seen_drv_paths in
-      if not seen then t.all_jobs <- t.all_jobs + 1;
-      if job.isCached then t.cached_jobs <- t.cached_jobs + 1;
-      t.seen_drv_paths <- StringSet.add drv_path t.seen_drv_paths;
+      let seen =
+        Mutex.protect seen_mutex (fun () ->
+          let seen = StringSet.mem drv_path t.seen_drv_paths in
+          if not seen then t.all_jobs <- t.all_jobs + 1;
+          if job.isCached then t.cached_jobs <- t.cached_jobs + 1;
+          t.seen_drv_paths <- StringSet.add drv_path t.seen_drv_paths;
+          seen)
+      in
       if not seen
       then
         if job.isCached
@@ -70,13 +75,15 @@ let build_fiber t ~domain_mgr ~process_mgr () =
               task
           with
           | Ok () ->
-            t.successful_jobs <- t.successful_jobs + 1;
+            Mutex.protect seen_mutex (fun () ->
+              t.successful_jobs <- t.successful_jobs + 1);
             let push_to_uploads = snd t.uploads in
             push_to_uploads (Some job);
             Logs.info (fun m -> m "%s built successfully" job.attr)
           | Error _ ->
             (* TODO: capture stderr and add it to the build summary too. *)
-            t.failed_jobs <- job :: t.failed_jobs));
+            Mutex.protect seen_mutex (fun () ->
+              t.failed_jobs <- job :: t.failed_jobs)));
   let push_to_uploads = snd t.uploads in
   push_to_uploads None
 
