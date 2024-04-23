@@ -1,0 +1,7 @@
+(library
+ (public_name nix-ci-build)
+ (name nix_ci_build)
+ (preprocess
+  (pps ppx_yojson_conv))
+ (libraries eio eio_main logs unix fmt.tty logs.fmt)
+ (flags :standard -open StdLabels))

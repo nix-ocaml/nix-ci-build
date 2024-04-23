@@ -1,0 +1,5 @@
+(executable
+ (public_name nix-ci-build)
+ (name main)
+ (libraries nix-ci-build eio_main logs cmdliner)
+ (flags :standard -open StdLabels))
