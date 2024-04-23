@@ -32,7 +32,6 @@ let parse_out t ~sw ?cwd ?stdin ?stderr ?is_success ?env ?executable args =
           Eio.Flow.close r;
           None)
     in
-
     let finished_p =
       Eio.Fiber.fork_promise ~sw (fun () ->
         Eio.Process.await_exn ?is_success child)

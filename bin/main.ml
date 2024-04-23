@@ -34,8 +34,8 @@ let eval_fiber ~sw t (jobs, finished_p) () =
       let job : Job.t = job |> Yojson.Safe.from_string |> Job.t_of_yojson in
       push_to_builds (Some job))
     jobs;
-  push_to_builds None;
-  Promise.await_exn finished_p
+  Promise.await_exn finished_p;
+  push_to_builds None
 
 let build_fiber t ~sw ~domain_mgr ~process_mgr () =
   let pool =

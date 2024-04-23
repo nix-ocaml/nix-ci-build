@@ -5,7 +5,6 @@ type 'a kind =
   | Push of
       { stream : 'a Eio.Stream.t
       ; capacity : int
-      ; mutex : Mutex.t
       }
 
 type 'a t =
@@ -33,7 +32,7 @@ let push t item =
 let create capacity =
   let stream = Eio.Stream.create capacity in
   let t =
-    { stream = Push { stream; capacity; mutex = Mutex.create () }
+    { stream = Push { stream; capacity }
     ; is_closed = Atomic.make false
     ; closed = Promise.create ()
     }
@@ -71,9 +70,9 @@ let take t =
       close t;
       None)
   | Push { capacity = 0; _ } -> None
-  | Push { stream; mutex; _ } ->
+  | Push { stream; _ } ->
     Fiber.first
-      (fun () -> Mutex.protect mutex (fun () -> Some (Eio.Stream.take stream)))
+      (fun () -> Some (Eio.Stream.take stream))
       (fun () ->
          let { closed = p, _; _ } = t in
          Promise.await p;
