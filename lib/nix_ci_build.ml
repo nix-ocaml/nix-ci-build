@@ -9,8 +9,9 @@ module Logs = (val Logging.setup __FILE__)
  * 4. collect build statistics, write to github build summary?
 
  * TODO:
-
- *  - decide whether our tool accepts config file or CLI options
+   - limit number of jobs (both for `nix-eval-jobs` and our build queue)
+   - add uploading with `nix copy`
+   -
  *)
 
 let parse_out t ~sw ?cwd ?stdin ?stderr ?is_success ?env ?executable args =
@@ -153,6 +154,7 @@ let nix_build proc_mgr (job : Job.t) =
     ; "--keep-going"
     ; "--no-link"
     ; "--no-build-output"
+    ; "--quiet"
     ]
   in
   Logs.info (fun m -> m "run `%s`" (String.concat ~sep:" " args));
