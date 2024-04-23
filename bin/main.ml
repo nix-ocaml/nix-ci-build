@@ -49,19 +49,22 @@ let build_fiber t ~sw ~domain_mgr ~process_mgr () =
     if job.isCached then t.cached_jobs <- t.cached_jobs + 1;
     t.seen_drv_paths <- StringSet.add drv_path t.seen_drv_paths;
     if not seen
-    then (
+    then
       if job.isCached
       then Logs.info (fun m -> m "skipping %s (cached)" job.attr)
-      else Logs.info (fun m -> m "building %s" job.attr);
-      let task () = Nix_ci_build.nix_build process_mgr job in
-      match Eio.Executor_pool.submit_exn pool ~weight:0.25 task with
-      | Ok _ ->
-        (* TODO: put this in an upload queue *)
-        t.successful_jobs <- t.successful_jobs + 1;
-        Logs.info (fun m -> m "%s built successfully" job.attr)
-      | Error _ ->
-        (* TODO: capture stderr and add it to the build summary too. *)
-        t.failed_jobs <- job :: t.failed_jobs))
+      else
+        let task () =
+          Logs.info (fun m -> m "building %s" job.attr);
+          Nix_ci_build.nix_build process_mgr job
+        in
+        match Eio.Executor_pool.submit_exn pool ~weight:0.25 task with
+        | Ok _ ->
+          (* TODO: put this in an upload queue *)
+          t.successful_jobs <- t.successful_jobs + 1;
+          Logs.info (fun m -> m "%s built successfully" job.attr)
+        | Error _ ->
+          (* TODO: capture stderr and add it to the build summary too. *)
+          t.failed_jobs <- job :: t.failed_jobs)
 
 let dump_build_summary (stdenv : Eio_unix.Stdenv.base) ~sw t =
   let sink =
