@@ -39,7 +39,7 @@
             ]);
             # Needed for x86_64-darwin
             buildDunePackage =
-              if stdenv.isDarwin && not stdenv.isAarch64
+              if stdenv.isDarwin && !stdenv.isAarch64
               then
                 ocamlPackages.buildDunePackage.override
                   { stdenv = pkgs.overrideSDK stdenv "11.0"; }
