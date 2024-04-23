@@ -10,6 +10,7 @@ type t =
   { config : Nix_ci_build.Config.t
   ; mutable seen_drv_paths : StringSet.t
   ; builds : Job.t Stream.t * (Job.t option -> unit)
+  ; uploads : Job.t Stream.t * (Job.t option -> unit)
   ; mutable all_jobs : int
   ; mutable cached_jobs : int
   ; mutable successful_jobs : int
@@ -20,6 +21,7 @@ let make config =
   { config
   ; seen_drv_paths = StringSet.empty
   ; builds = Stream.create 128
+  ; uploads = Stream.create 128
   ; all_jobs = 0
   ; cached_jobs = 0
   ; successful_jobs = 0
@@ -40,40 +42,59 @@ let eval_fiber ~sw t (jobs, finished_p) () =
     let bt = Printexc.get_raw_backtrace () in
     Eio.Exn.reraise_with_context ex bt "Evaluating jobs"
 
-let build_fiber t ~sw ~domain_mgr ~process_mgr () =
-  let pool =
-    Eio.Executor_pool.create ~sw ~domain_count:t.config.max_jobs domain_mgr
-  in
-  let build_stream, _ = t.builds in
-  Stream.iter build_stream ~f:(fun (job : Job.t) ->
-    let drv_path = job.drvPath in
-    let seen = StringSet.mem drv_path t.seen_drv_paths in
-    if not seen then t.all_jobs <- t.all_jobs + 1;
-    if job.isCached then t.cached_jobs <- t.cached_jobs + 1;
-    t.seen_drv_paths <- StringSet.add drv_path t.seen_drv_paths;
-    if not seen
-    then
-      if job.isCached
-      then Logs.info (fun m -> m "skipping %s (cached)" job.attr)
-      else
-        let task () =
-          Logs.info (fun m -> m "building %s" job.attr);
-          Nix_ci_build.nix_build process_mgr job
-        in
-        Fiber.fork ~sw (fun () ->
-          match
-            Eio.Executor_pool.submit_exn
-              pool (* 2 jobs per core *)
-              ~weight:0.5
-              task
-          with
-          | Ok _ ->
-            (* TODO: put this in an upload queue *)
-            t.successful_jobs <- t.successful_jobs + 1;
-            Logs.info (fun m -> m "%s built successfully" job.attr)
-          | Error _ ->
-            (* TODO: capture stderr and add it to the build summary too. *)
-            t.failed_jobs <- job :: t.failed_jobs))
+let build_fiber t ~domain_mgr ~process_mgr () =
+  Switch.run (fun sw ->
+    let build_stream, _ = t.builds in
+    let pool =
+      Eio.Executor_pool.create ~sw ~domain_count:t.config.max_jobs domain_mgr
+    in
+    Stream.iter build_stream ~f:(fun (job : Job.t) ->
+      let drv_path = job.drvPath in
+      let seen = StringSet.mem drv_path t.seen_drv_paths in
+      if not seen then t.all_jobs <- t.all_jobs + 1;
+      if job.isCached then t.cached_jobs <- t.cached_jobs + 1;
+      t.seen_drv_paths <- StringSet.add drv_path t.seen_drv_paths;
+      if not seen
+      then
+        if job.isCached
+        then Logs.info (fun m -> m "skipping %s (cached)" job.attr)
+        else
+          let task () =
+            Logs.info (fun m -> m "building %s" job.attr);
+            Nix_ci_build.nix_build process_mgr job
+          in
+          Fiber.fork ~sw (fun () ->
+            match
+              Eio.Executor_pool.submit_exn
+                pool (* 2 jobs per core *)
+                ~weight:0.5
+                task
+            with
+            | Ok () ->
+              t.successful_jobs <- t.successful_jobs + 1;
+              let push_to_uploads = snd t.uploads in
+              push_to_uploads (Some job);
+              Logs.info (fun m -> m "%s built successfully" job.attr)
+            | Error _ ->
+              (* TODO: capture stderr and add it to the build summary too. *)
+              t.failed_jobs <- job :: t.failed_jobs)));
+  let push_to_uploads = snd t.uploads in
+  push_to_uploads None
+
+let upload_fiber t ~process_mgr () =
+  match t.config.copy_to with
+  | None ->
+    let push_to_uploads = snd t.uploads in
+    push_to_uploads None
+  | Some copy_to ->
+    let upload_stream, _ = t.uploads in
+    Switch.run (fun _sw ->
+      Stream.iter upload_stream ~f:(fun (job : Job.t) ->
+        match Nix_ci_build.nix_copy process_mgr ~copy_to job with
+        | Ok () -> ()
+        | Error _ -> ()));
+    let push_to_uploads = snd t.uploads in
+    push_to_uploads None
 
 let dump_build_summary (stdenv : Eio_unix.Stdenv.base) ~sw t =
   let sink =
@@ -140,8 +161,9 @@ let main config stdenv =
     let t = make config in
     let jobs = Nix_ci_build.nix_eval_jobs process_mgr ~sw config in
     let eval_fiber = eval_fiber ~sw t jobs
-    and build_fiber = build_fiber t ~sw ~domain_mgr ~process_mgr in
-    Fiber.both eval_fiber build_fiber;
+    and build_fiber = build_fiber t ~domain_mgr ~process_mgr
+    and upload_fiber = upload_fiber t ~process_mgr in
+    Fiber.all [ eval_fiber; build_fiber; upload_fiber ];
     dump_build_summary stdenv ~sw t;
     `Ok ())
 
@@ -183,15 +205,21 @@ module CLI = struct
       & opt int (Domain.recommended_domain_count ())
       & info [ "j"; "jobs" ] ~doc ~docv)
 
-  let parse flake max_jobs build_summary_output =
+  let copy_to =
+    let doc = "Copy build results to the given URL" in
+    let docv = "URL" in
+    Arg.(value & opt (some string) None & info [ "copy-to" ] ~doc ~docv)
+
+  let parse flake max_jobs copy_to build_summary_output =
     let flake = Option.get flake in
     { Nix_ci_build.Config.flake
     ; skip_cached = true
     ; max_jobs
+    ; copy_to
     ; build_summary_output
     }
 
-  let default_cmd = Term.(const parse $ flake $ max_jobs $ output)
+  let default_cmd = Term.(const parse $ flake $ max_jobs $ copy_to $ output)
 
   let t =
     let open Cmdliner in

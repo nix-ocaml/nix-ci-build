@@ -76,6 +76,7 @@ module Config = struct
     ; max_jobs : int
     ; skip_cached : bool
     ; build_summary_output : output
+    ; copy_to : string option
     }
 end
 
@@ -153,6 +154,25 @@ let nix_build proc_mgr (job : Job.t) =
   Logs.debug (fun m -> m "run `%s`" (String.concat ~sep:" " args));
   (* let null = Eio.Path.(open_out ~sw ~create:`Never (fs / Filename.null))
      in *)
+  match Eio.Process.run proc_mgr args with
+  | () -> Ok ()
+  | exception (Eio.Exn.Io _ as exn) -> Error exn
+
+let nix_copy proc_mgr ~copy_to (job : Job.t) =
+  let args =
+    let urls = Job.StringMap.to_list job.outputs |> List.map ~f:snd in
+    [ "nix"
+    ; "--experimental-features"
+    ; "nix-command flakes"
+    ; "copy"
+    ; "--log-format"
+    ; "raw"
+    ; "--to"
+    ; copy_to
+    ]
+    @ urls
+  in
+  Logs.debug (fun m -> m "run `%s`" (String.concat ~sep:" " args));
   match Eio.Process.run proc_mgr args with
   | () -> Ok ()
   | exception (Eio.Exn.Io _ as exn) -> Error exn
