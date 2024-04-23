@@ -28,12 +28,24 @@
       packages = {
         default =
           let
-            path = pkgs.lib.makeBinPath (with pkgs; [
+            inherit (pkgs)
+              lib
+              makeWrapper
+              ocamlPackages
+              stdenv;
+            path = lib.makeBinPath (with pkgs; [
               nix-eval-jobs
               nix-eval-jobs.nix
             ]);
+            # Needed for x86_64-darwin
+            buildDunePackage =
+              if stdenv.isDarwin && not stdenv.isAarch64
+              then
+                ocamlPackages.buildDunePackage.override
+                  { stdenv = pkgs.overrideSDK stdenv "11.0"; }
+              else ocamlPackages.buildDunePackage;
           in
-          with pkgs.ocamlPackages; buildDunePackage {
+          buildDunePackage {
             pname = "nix-ci-build";
             version = "n/a";
             src = with nix-filter.lib; filter {
@@ -45,8 +57,8 @@
                 "nix-ci-build.opam"
               ];
             };
-            nativeBuildInputs = with pkgs; [ makeWrapper ];
-            propagatedBuildInputs = [
+            nativeBuildInputs = [ makeWrapper ];
+            propagatedBuildInputs = with ocamlPackages; [
               cmdliner
               eio_main
               logs

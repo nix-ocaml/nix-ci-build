@@ -169,6 +169,7 @@ end
 
 let () =
   Random.self_init ();
+  (* TODO: make logging a CLI flag too. *)
   Nix_ci_build.Logging.setup_logging Info;
   let open Cmdliner in
   exit (Cmd.eval CLI.t)
