@@ -1,17 +1,10 @@
 module Logging = Logging
 module Stream = Stream
 module Logs = (val Logging.setup __FILE__)
-(* open Eio.Std *)
 
-(* 1. invoke nix-eval-jobs and stream stdout
- * 2. delegate each job to a `nix-build` invocation
- * 3. collect nix-build result, print logs if failed to build
- * 4. collect build statistics, write to github build summary?
-
- * TODO:
-   - limit number of jobs (both for `nix-eval-jobs` and our build queue)
-   - add uploading with `nix copy`
-   -
+(* TODO:
+ * - add uploading with `nix copy`
+ * -
  *)
 
 let parse_out t ~sw ?cwd ?stdin ?stderr ?is_success ?env ?executable args =
@@ -81,12 +74,13 @@ module Config = struct
 
   type t =
     { flake : string
+    ; max_jobs : int
     ; skip_cached : bool
     ; build_summary_output : output
     }
 end
 
-let nix_eval_jobs proc_mgr ~sw { Config.flake; skip_cached; _ } =
+let nix_eval_jobs proc_mgr ~sw { Config.flake; skip_cached; max_jobs; _ } =
   let gc_root_dir = create_temp_dir () in
   let args =
     let base =
@@ -94,10 +88,10 @@ let nix_eval_jobs proc_mgr ~sw { Config.flake; skip_cached; _ } =
       ; "--gc-roots-dir"
       ; gc_root_dir
       ; "--force-recurse"
+      ; "--workers"
+      ; string_of_int max_jobs
       ; (* "--max-memory-size"; *)
         (* str(opts.eval_max_memory_size); *)
-        (* "--workers"; *)
-        (* str(opts.eval_workers); *)
         "--flake"
       ; flake
       ]

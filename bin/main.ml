@@ -7,7 +7,8 @@ module StringSet = Set.Make (String)
 (* TODO: it'd be really cool if we knew how to avoid building a derivation if
    one of its dependents is a failed job *)
 type t =
-  { mutable seen_drv_paths : StringSet.t
+  { config : Nix_ci_build.Config.t
+  ; mutable seen_drv_paths : StringSet.t
   ; builds : Job.t Stream.t * (Job.t option -> unit)
   ; mutable all_jobs : int
   ; mutable cached_jobs : int
@@ -15,8 +16,9 @@ type t =
   ; mutable failed_jobs : Job.t list
   }
 
-let make () =
-  { seen_drv_paths = StringSet.empty
+let make config =
+  { config
+  ; seen_drv_paths = StringSet.empty
   ; builds = Stream.create 128
   ; all_jobs = 0
   ; cached_jobs = 0
@@ -35,25 +37,31 @@ let eval_fiber ~sw t (jobs, finished_p) () =
   push_to_builds None;
   Promise.await_exn finished_p
 
-let build_fiber t ~sw ~process_mgr () =
+let build_fiber t ~sw ~domain_mgr ~process_mgr () =
+  let pool =
+    Eio.Executor_pool.create ~sw ~domain_count:t.config.max_jobs domain_mgr
+  in
   let build_stream, _ = t.builds in
   Stream.iter_p ~sw build_stream ~f:(fun (job : Job.t) ->
     let drv_path = job.drvPath in
-    Logs.info (fun m -> m "building %s" job.attr);
     let seen = StringSet.mem drv_path t.seen_drv_paths in
     if not seen then t.all_jobs <- t.all_jobs + 1;
     if job.isCached then t.cached_jobs <- t.cached_jobs + 1;
     t.seen_drv_paths <- StringSet.add drv_path t.seen_drv_paths;
-    if (not seen) && not job.isCached
-    then
-      match Nix_ci_build.nix_build process_mgr job with
+    if not seen
+    then (
+      if job.isCached
+      then Logs.info (fun m -> m "skipping %s (cached)" job.attr)
+      else Logs.info (fun m -> m "building %s" job.attr);
+      let task () = Nix_ci_build.nix_build process_mgr job in
+      match Eio.Executor_pool.submit_exn pool ~weight:0.25 task with
       | Ok _ ->
         (* TODO: put this in an upload queue *)
         t.successful_jobs <- t.successful_jobs + 1;
         Logs.info (fun m -> m "%s built successfully" job.attr)
       | Error _ ->
         (* TODO: capture stderr and add it to the build summary too. *)
-        t.failed_jobs <- job :: t.failed_jobs)
+        t.failed_jobs <- job :: t.failed_jobs))
 
 let dump_build_summary (stdenv : Eio_unix.Stdenv.base) ~sw t =
   let sink =
@@ -115,11 +123,12 @@ Failed builds: %d
 
 let main config stdenv =
   Switch.run (fun sw ->
-    let process_mgr = stdenv#process_mgr in
+    let process_mgr = Eio.Stdenv.process_mgr stdenv
+    and domain_mgr = Eio.Stdenv.domain_mgr stdenv in
     let jobs = Nix_ci_build.nix_eval_jobs process_mgr ~sw config in
-    let t = make () in
+    let t = make config in
     let eval_fiber = eval_fiber ~sw t jobs
-    and build_fiber = build_fiber t ~sw ~process_mgr in
+    and build_fiber = build_fiber t ~sw ~domain_mgr ~process_mgr in
     Fiber.both eval_fiber build_fiber;
     dump_build_summary stdenv ~sw t;
     `Ok ())
@@ -154,11 +163,23 @@ module CLI = struct
     let docv = "flake-url" in
     Arg.(value & opt (some string) None & info [ "f"; "flake" ] ~doc ~docv)
 
-  let parse flake build_summary_output =
-    let flake = Option.get flake in
-    { Nix_ci_build.Config.flake; skip_cached = true; build_summary_output }
+  let max_jobs =
+    let doc = "Max number of eval workers / build jobs" in
+    let docv = "jobs" in
+    Arg.(
+      value
+      & opt int (Domain.recommended_domain_count ())
+      & info [ "j"; "jobs" ] ~doc ~docv)
 
-  let default_cmd = Term.(const parse $ flake $ output)
+  let parse flake max_jobs build_summary_output =
+    let flake = Option.get flake in
+    { Nix_ci_build.Config.flake
+    ; skip_cached = true
+    ; max_jobs
+    ; build_summary_output
+    }
+
+  let default_cmd = Term.(const parse $ flake $ max_jobs $ output)
 
   let t =
     let open Cmdliner in
