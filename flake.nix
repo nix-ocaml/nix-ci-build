@@ -19,7 +19,7 @@
     flake-utils.lib.eachDefaultSystem (system:
     let
       pkgs = nixpkgs.legacyPackages."${system}".extend (self: super: {
-        ocamlPackages = super.ocaml-ng.ocamlPackages_5_1;
+        ocamlPackages = super.ocaml-ng.ocamlPackages_5_2;
         nix-eval-jobs =
           nixpkgs-for-eval-jobs.legacyPackages."${system}".nix-eval-jobs;
       });
@@ -45,7 +45,7 @@
                 "nix-ci-build.opam"
               ];
             };
-
+            nativeBuildInputs = with pkgs; [ makeWrapper ];
             propagatedBuildInputs = [
               cmdliner
               eio_main
@@ -53,6 +53,11 @@
               fmt
               ppx_yojson_conv
             ];
+
+            postInstall = ''
+              wrapProgram "$out/bin/nix-ci-build" \
+                --prefix PATH : ${path}
+            '';
           };
       };
     });
