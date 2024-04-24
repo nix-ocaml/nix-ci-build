@@ -171,7 +171,13 @@ let main config stdenv =
     and upload_fiber = upload_fiber t ~process_mgr in
     Fiber.all [ eval_fiber; build_fiber; upload_fiber ];
     dump_build_summary stdenv ~sw t;
-    `Ok ())
+    match t.failed_jobs with
+    | [] -> `Ok ()
+    | _ :: _ ->
+      `Error
+        ( false
+        , "Some jobs weren't successful. Consult the build summary for more \
+           details." ))
 
 let main config = Eio_main.run (main config)
 
@@ -225,13 +231,14 @@ module CLI = struct
     ; build_summary_output
     }
 
-  let default_cmd = Term.(const parse $ flake $ max_jobs $ copy_to $ output)
-
   let t =
     let open Cmdliner in
     let doc = "nix-ci-build TODO" in
     let info = Cmd.info "nix-ci-build" ~doc in
-    Cmd.v info Term.(ret (const main $ default_cmd))
+    Cmd.v
+      info
+      Term.(
+        ret (const main $ (const parse $ flake $ max_jobs $ copy_to $ output)))
 end
 
 let () =
