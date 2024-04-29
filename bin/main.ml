@@ -14,7 +14,7 @@ type t =
   ; mutable all_jobs : int
   ; mutable cached_jobs : int
   ; mutable successful_jobs : int
-  ; mutable failed_jobs : Job.t list
+  ; mutable failed_jobs : (Job.t * string) list
   }
 
 let make config =
@@ -80,10 +80,10 @@ let build_fiber t ~domain_mgr ~process_mgr () =
             let push_to_uploads = snd t.uploads in
             push_to_uploads (Some job);
             Logs.info (fun m -> m "%s built successfully" job.attr)
-          | Error _ ->
+          | Error (_, build_logs) ->
             (* TODO: capture stderr and add it to the build summary too. *)
             Mutex.protect seen_mutex (fun () ->
-              t.failed_jobs <- job :: t.failed_jobs)));
+              t.failed_jobs <- (job, build_logs) :: t.failed_jobs)));
   let push_to_uploads = snd t.uploads in
   push_to_uploads None
 
@@ -142,7 +142,7 @@ Failed builds: %d
       n_failed_jobs
   in
   Eio.Flow.copy_string header sink;
-  List.iter t.failed_jobs ~f:(fun (job : Job.t) ->
+  List.iter t.failed_jobs ~f:(fun ((job : Job.t), build_logs) ->
     let detail =
       Format.sprintf
         {|
@@ -151,12 +151,11 @@ Failed builds: %d
 <details>
   <summary>Build error:</summary>
   last 50 lines:
-  <pre>
-   ... # TODO build log lines
-  </pre>
+  <pre>%s</pre>
 </details>
 |}
         job.attr
+        build_logs
     in
     Eio.Flow.copy_string detail sink)
 

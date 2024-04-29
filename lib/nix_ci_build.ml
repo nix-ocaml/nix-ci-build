@@ -2,26 +2,10 @@ module Logging = Logging
 module Stream = Stream
 module Logs = (val Logging.setup __FILE__)
 
-(* TODO:
- * - add uploading with `nix copy`
- * -
- *)
-
-let parse_out t ~sw ?cwd ?stdin ?stderr ?is_success ?env ?executable args =
+let parse_out t ~sw args =
   let r, w = Eio.Process.pipe t ~sw in
   try
-    let child =
-      Eio.Process.spawn
-        ~sw
-        t
-        ?cwd
-        ?stdin
-        ~stdout:w
-        ?stderr
-        ?env
-        ?executable
-        args
-    in
+    let child = Eio.Process.spawn ~sw t ~stdout:w args in
     Eio.Flow.close w;
     let stream =
       let buf = Eio.Buf_read.of_flow r ~initial_size:256 ~max_size:max_int in
@@ -33,8 +17,7 @@ let parse_out t ~sw ?cwd ?stdin ?stderr ?is_success ?env ?executable args =
           None)
     in
     let finished_p =
-      Eio.Fiber.fork_promise ~sw (fun () ->
-        Eio.Process.await_exn ?is_success child)
+      Eio.Fiber.fork_promise ~sw (fun () -> Eio.Process.await_exn child)
     in
     (* TODO: return a record here. *)
     stream, finished_p
@@ -142,20 +125,15 @@ end
 
 let nix_build proc_mgr (job : Job.t) =
   let args =
-    [ "nix-build"
-    ; job.drvPath
-    ; "--keep-going"
-    ; "--no-link"
-    ; "--no-build-output"
-    ; "--quiet"
-    ]
+    [ "nix-build"; job.drvPath; "--keep-going"; "--no-link"; "--quiet" ]
   in
+  let build_logs_buf = Buffer.create 1024 in
+  let logs_sink = Eio.Flow.buffer_sink build_logs_buf in
   Logs.debug (fun m -> m "run `%s`" (String.concat ~sep:" " args));
-  (* let null = Eio.Path.(open_out ~sw ~create:`Never (fs / Filename.null))
-     in *)
-  match Eio.Process.run proc_mgr args with
+  match Eio.Process.run proc_mgr ~stdout:logs_sink ~stderr:logs_sink args with
   | () -> Ok ()
-  | exception (Eio.Exn.Io _ as exn) -> Error exn
+  | exception (Eio.Exn.Io _ as exn) ->
+    Error (exn, Buffer.contents build_logs_buf)
 
 let nix_copy proc_mgr ~copy_to (job : Job.t) =
   let args =
