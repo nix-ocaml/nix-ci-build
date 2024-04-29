@@ -133,7 +133,12 @@ let nix_build proc_mgr (job : Job.t) =
   match Eio.Process.run proc_mgr ~stdout:logs_sink ~stderr:logs_sink args with
   | () -> Ok ()
   | exception (Eio.Exn.Io _ as exn) ->
-    Error (exn, Buffer.contents build_logs_buf)
+    (* Whenever a build fails, also print its build logs on stderr - this allows
+       us to go and fix builds without having to wait for the job to finish. *)
+    let build_logs = Buffer.contents build_logs_buf in
+    Printf.fprintf stderr "%s" build_logs;
+    flush stderr;
+    Error (exn, build_logs)
 
 let nix_copy proc_mgr ~copy_to (job : Job.t) =
   let args =
