@@ -7,12 +7,14 @@
     url = "github:nix-ocaml/nix-overlays/anmonteiro/fix-ocaml-src";
     inputs.flake-utils.follows = "flake-utils";
   };
+  inputs.nix-eval-jobs.url = "github:nix-community/nix-eval-jobs";
 
   outputs =
     { self
     , nixpkgs
     , flake-utils
     , nix-filter
+    , nix-eval-jobs
     }:
     flake-utils.lib.eachDefaultSystem
       (system:
@@ -24,11 +26,12 @@
           lib
           makeWrapper
           ocamlPackages
-          stdenv;
-        path = lib.makeBinPath (with pkgs; [
-          nix-eval-jobs
-          nix-eval-jobs.nix
-        ]);
+          stdenv
+          nixVersions;
+        path = lib.makeBinPath [
+          nix-eval-jobs.outputs.packages."${system}".default
+          nixVersions.nix_2_22
+        ];
         # Needed for x86_64-darwin
         buildDunePackage =
           if stdenv.isDarwin && !stdenv.isAarch64
