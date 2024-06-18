@@ -186,7 +186,9 @@ let main config stdenv =
         , "Some jobs weren't successful. Consult the build summary for more \
            details." ))
 
-let main config = Eio_main.run (main config)
+let main config verbose =
+  Nix_ci_build.Logging.setup_logging (if verbose then Debug else Info);
+  Eio_main.run (main config)
 
 module CLI = struct
   module Config = Nix_ci_build.Config
@@ -229,14 +231,13 @@ module CLI = struct
     let docv = "URL" in
     Arg.(value & opt (some string) None & info [ "copy-to" ] ~doc ~docv)
 
+  let verbose =
+    let doc = "Make logging more verbose" in
+    Arg.(value & flag & info [ "v"; "verbose" ] ~doc)
+
   let parse flake max_jobs copy_to build_summary_output =
     let flake = Option.get flake in
-    { Nix_ci_build.Config.flake
-    ; skip_cached = true
-    ; max_jobs
-    ; copy_to
-    ; build_summary_output
-    }
+    { Nix_ci_build.Config.flake; max_jobs; copy_to; build_summary_output }
 
   let t =
     let open Cmdliner in
@@ -245,12 +246,13 @@ module CLI = struct
     Cmd.v
       info
       Term.(
-        ret (const main $ (const parse $ flake $ max_jobs $ copy_to $ output)))
+        ret
+          (const main
+          $ (const parse $ flake $ max_jobs $ copy_to $ output)
+          $ verbose))
 end
 
 let () =
   Random.self_init ();
-  (* TODO: make logging a CLI flag too. *)
-  Nix_ci_build.Logging.setup_logging Info;
   let open Cmdliner in
   exit (Cmd.eval CLI.t)

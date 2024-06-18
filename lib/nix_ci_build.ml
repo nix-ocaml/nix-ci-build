@@ -56,30 +56,26 @@ module Config = struct
   type t =
     { flake : string
     ; max_jobs : int
-    ; skip_cached : bool
     ; build_summary_output : output
     ; copy_to : string option
     }
 end
 
-let nix_eval_jobs proc_mgr ~sw { Config.flake; skip_cached; max_jobs; _ } =
+let nix_eval_jobs proc_mgr ~sw { Config.flake; max_jobs; _ } =
   let gc_root_dir = create_temp_dir () in
   let args =
-    let base =
-      [ "nix-eval-jobs"
-      ; "--gc-roots-dir"
-      ; gc_root_dir
-      ; "--force-recurse"
-      ; "--check-cache-status"
-      ; "--workers"
-      ; string_of_int max_jobs
-      ; (* "--max-memory-size"; *)
-        (* str(opts.eval_max_memory_size); *)
-        "--flake"
-      ; flake
-      ]
-    in
-    if skip_cached then base @ [ "--check-cache-status" ] else base
+    [ "nix-eval-jobs"
+    ; "--gc-roots-dir"
+    ; gc_root_dir
+    ; "--force-recurse"
+    ; "--check-cache-status"
+    ; "--workers"
+    ; string_of_int max_jobs
+    ; (* "--max-memory-size"; *)
+      (* str(opts.eval_max_memory_size); *)
+      "--flake"
+    ; flake
+    ]
   in
   Logs.debug (fun m -> m "run `%s`" (String.concat ~sep:" " args));
   (* TODO: suppress stderr for evaluation if successful. *)
