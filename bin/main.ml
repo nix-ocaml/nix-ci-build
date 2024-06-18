@@ -33,6 +33,7 @@ let eval_fiber ~sw t (jobs, finished_p) () =
   Stream.iter_p
     ~sw
     ~f:(fun job ->
+      Logs.debug (fun m -> m "job eval: %s" job);
       let job : Job.t = job |> Yojson.Safe.from_string |> Job.t_of_yojson in
       push_to_builds (Some job))
     jobs;
