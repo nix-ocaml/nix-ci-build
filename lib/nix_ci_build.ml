@@ -70,6 +70,7 @@ let nix_eval_jobs proc_mgr ~sw { Config.flake; skip_cached; max_jobs; _ } =
       ; "--gc-roots-dir"
       ; gc_root_dir
       ; "--force-recurse"
+      ; "--check-cache-status"
       ; "--workers"
       ; string_of_int max_jobs
       ; (* "--max-memory-size"; *)
@@ -115,7 +116,7 @@ module Job = struct
     ; attrPath : string list
     ; drvPath : string
     ; inputDrvs : string list StringMap.t
-    ; isCached : bool
+    ; cacheStatus : string
     ; name : string
     ; outputs : string StringMap.t
     ; system : string

@@ -51,17 +51,25 @@ let build_fiber t ~domain_mgr ~process_mgr () =
     let seen_mutex = Mutex.create () in
     Stream.iter_p ~sw build_stream ~f:(fun (job : Job.t) ->
       let drv_path = job.drvPath in
-      let seen =
+      let seen, cached =
         Mutex.protect seen_mutex (fun () ->
           let seen = StringSet.mem drv_path t.seen_drv_paths in
           if not seen then t.all_jobs <- t.all_jobs + 1;
-          if job.isCached then t.cached_jobs <- t.cached_jobs + 1;
-          t.seen_drv_paths <- StringSet.add drv_path t.seen_drv_paths;
-          seen)
+          let cached =
+            match job.cacheStatus with
+            | "local" | "cached" ->
+              t.cached_jobs <- t.cached_jobs + 1;
+              true
+            | "notBuild" ->
+              t.seen_drv_paths <- StringSet.add drv_path t.seen_drv_paths;
+              false
+            | _ -> assert false
+          in
+          seen, cached)
       in
       if not seen
       then
-        if job.isCached
+        if cached
         then Logs.info (fun m -> m "skipping %s (cached)" job.attr)
         else
           let task () =
