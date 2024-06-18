@@ -4,7 +4,7 @@
   inputs.nix-filter.url = "github:numtide/nix-filter";
   inputs.flake-utils.url = "github:numtide/flake-utils";
   inputs.nixpkgs = {
-    url = "github:nix-ocaml/nix-overlays/anmonteiro/fix-ocaml-src";
+    url = "github:nix-ocaml/nix-overlays";
     inputs.flake-utils.follows = "flake-utils";
   };
   inputs.nix-eval-jobs.url = "github:nix-community/nix-eval-jobs";
