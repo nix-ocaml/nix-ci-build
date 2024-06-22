@@ -7,7 +7,7 @@
     url = "github:nix-ocaml/nix-overlays";
     inputs.flake-utils.follows = "flake-utils";
   };
-  inputs.nix-eval-jobs-src.url = "github:nix-community/nix-eval-jobs?rev=d0b436132958c3e272df9f08e0cbe75e86527582";
+  inputs.nix-eval-jobs-src.url = "github:nix-community/nix-eval-jobs";
 
   outputs = { self, nixpkgs, flake-utils, nix-filter, nix-eval-jobs-src }:
     flake-utils.lib.eachDefaultSystem
