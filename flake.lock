@@ -3,7 +3,7 @@
     "flake-parts": {
       "inputs": {
         "nixpkgs-lib": [
-          "nix-eval-jobs",
+          "nix-eval-jobs-src",
           "nixpkgs"
         ]
       },
@@ -39,7 +39,7 @@
         "type": "github"
       }
     },
-    "nix-eval-jobs": {
+    "nix-eval-jobs-src": {
       "inputs": {
         "flake-parts": "flake-parts",
         "nix-github-actions": "nix-github-actions",
@@ -47,16 +47,17 @@
         "treefmt-nix": "treefmt-nix"
       },
       "locked": {
-        "lastModified": 1717698186,
-        "narHash": "sha256-e3/cvm7bAn0RsTBcPfHwuYOi2lwoO4jpTn4nmMSvHfU=",
+        "lastModified": 1719038577,
+        "narHash": "sha256-BrzrRCC6NosGgJUXa3B0M4BM+2wKsAvZk7wZ7I2IDGE=",
         "owner": "nix-community",
         "repo": "nix-eval-jobs",
-        "rev": "b6169e08e76e10b673d1b54f944cddb1e7cbea97",
+        "rev": "d0b436132958c3e272df9f08e0cbe75e86527582",
         "type": "github"
       },
       "original": {
         "owner": "nix-community",
         "repo": "nix-eval-jobs",
+        "rev": "d0b436132958c3e272df9f08e0cbe75e86527582",
         "type": "github"
       }
     },
@@ -78,7 +79,7 @@
     "nix-github-actions": {
       "inputs": {
         "nixpkgs": [
-          "nix-eval-jobs",
+          "nix-eval-jobs-src",
           "nixpkgs"
         ]
       },
@@ -152,7 +153,7 @@
     "root": {
       "inputs": {
         "flake-utils": "flake-utils",
-        "nix-eval-jobs": "nix-eval-jobs",
+        "nix-eval-jobs-src": "nix-eval-jobs-src",
         "nix-filter": "nix-filter",
         "nixpkgs": "nixpkgs_2"
       }
@@ -175,7 +176,7 @@
     "treefmt-nix": {
       "inputs": {
         "nixpkgs": [
-          "nix-eval-jobs",
+          "nix-eval-jobs-src",
           "nixpkgs"
         ]
       },
