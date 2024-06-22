@@ -61,7 +61,7 @@ let build_fiber t ~domain_mgr ~process_mgr () =
             | "local" | "cached" ->
               t.cached_jobs <- t.cached_jobs + 1;
               true
-            | "notBuild" ->
+            | "notBuilt" ->
               t.seen_drv_paths <- StringSet.add drv_path t.seen_drv_paths;
               false
             | _ -> assert false
