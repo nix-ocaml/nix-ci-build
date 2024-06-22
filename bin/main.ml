@@ -168,15 +168,18 @@ Failed builds: %d
     in
     Eio.Flow.copy_string detail sink)
 
-let main config stdenv =
+let main config ~dry_run stdenv =
   Switch.run (fun sw ->
     let process_mgr = Eio.Stdenv.process_mgr stdenv
     and domain_mgr = Eio.Stdenv.domain_mgr stdenv in
     let t = make config in
     let jobs = Nix_ci_build.nix_eval_jobs process_mgr ~sw config in
     let eval_fiber = eval_fiber ~sw t jobs
-    and build_fiber = build_fiber t ~domain_mgr ~process_mgr
-    and upload_fiber = upload_fiber t ~process_mgr in
+    and build_fiber =
+      if dry_run then Fun.const () else build_fiber t ~domain_mgr ~process_mgr
+    and upload_fiber =
+      if dry_run then Fun.const () else upload_fiber t ~process_mgr
+    in
     Fiber.all [ eval_fiber; build_fiber; upload_fiber ];
     dump_build_summary stdenv ~sw t;
     match t.failed_jobs with
@@ -187,9 +190,9 @@ let main config stdenv =
         , "Some jobs weren't successful. Consult the build summary for more \
            details." ))
 
-let main config verbose =
+let main config dry_run verbose =
   Nix_ci_build.Logging.setup_logging (if verbose then Debug else Info);
-  Eio_main.run (main config)
+  Eio_main.run (main ~dry_run config)
 
 module CLI = struct
   module Config = Nix_ci_build.Config
@@ -213,11 +216,14 @@ module CLI = struct
     let docv = "file" in
     Arg.(value & opt output_conv Stdout & info [ "o"; "output" ] ~doc ~docv)
 
-  (* `../nix-overlays#hydraJobs.aarch64-darwin.build_x` *)
+  let dry_run =
+    let doc = "Don't build or upload" in
+    Arg.(value & flag & info [ "dry-run" ] ~doc)
+
   let flake =
     let doc = "Flake url to evaluate/build" in
     let docv = "flake-url" in
-    Arg.(value & opt (some string) None & info [ "f"; "flake" ] ~doc ~docv)
+    Arg.(required & opt (some string) None & info [ "f"; "flake" ] ~doc ~docv)
 
   let max_jobs =
     let doc = "Max number of eval workers / build jobs" in
@@ -237,7 +243,6 @@ module CLI = struct
     Arg.(value & flag & info [ "v"; "verbose" ] ~doc)
 
   let parse flake max_jobs copy_to build_summary_output =
-    let flake = Option.get flake in
     { Nix_ci_build.Config.flake; max_jobs; copy_to; build_summary_output }
 
   let t =
@@ -250,6 +255,7 @@ module CLI = struct
         ret
           (const main
           $ (const parse $ flake $ max_jobs $ copy_to $ output)
+          $ dry_run
           $ verbose))
 end
 
