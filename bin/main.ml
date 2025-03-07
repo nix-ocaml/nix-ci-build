@@ -263,3 +263,4 @@ let () =
   Random.self_init ();
   let open Cmdliner in
   exit (Cmd.eval CLI.t)
+

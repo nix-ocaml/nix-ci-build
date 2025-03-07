@@ -111,7 +111,7 @@ module Job = struct
     { attr : string
     ; attrPath : string list
     ; drvPath : string
-    ; inputDrvs : string list StringMap.t
+    ; inputDrvs : string list StringMap.t [@default StringMap.empty]
     ; cacheStatus : string
     ; name : string
     ; outputs : string StringMap.t
