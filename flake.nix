@@ -20,40 +20,41 @@
           inherit (pkgs) lib system makeWrapper ocamlPackages stdenv;
           nix-eval-jobs = nix-eval-jobs-src.outputs.packages.${system}.default;
           path = lib.makeBinPath [ nix-eval-jobs ];
-          # Needed for x86_64-darwin
-          buildDunePackage =
-            if stdenv.isDarwin && !stdenv.isAarch64 then
-              ocamlPackages.buildDunePackage.override
-                { stdenv = pkgs.overrideSDK stdenv "11.0"; }
-            else
-              ocamlPackages.buildDunePackage;
         in
         {
-          default = buildDunePackage {
-            pname = "nix-ci-build";
-            version = "n/a";
-            src = let fs = lib.fileset; in fs.toSource {
-              root = ./.;
-              fileset = fs.unions [
-                ./bin
-                ./lib
-                ./dune-project
-                ./nix-ci-build.opam
+          default =
+            let
+              stdenv' =
+                if stdenv.isDarwin && !stdenv.isAarch64
+                then pkgs.overrideSDK stdenv "11.0"
+                else stdenv;
+            in
+            ocamlPackages.buildDunePackage {
+              stdenv = stdenv';
+              pname = "nix-ci-build";
+              version = "n/a";
+              src = let fs = lib.fileset; in fs.toSource {
+                root = ./.;
+                fileset = fs.unions [
+                  ./bin
+                  ./lib
+                  ./dune-project
+                  ./nix-ci-build.opam
+                ];
+              };
+              nativeBuildInputs = [ makeWrapper ];
+              buildInputs = [ nix-eval-jobs ];
+              propagatedBuildInputs = with ocamlPackages; [
+                cmdliner
+                eio_main
+                logs
+                fmt
+                ppx_yojson_conv
               ];
+              postInstall = ''
+                wrapProgram "$out/bin/nix-ci-build" --prefix PATH : ${path}
+              '';
             };
-            nativeBuildInputs = [ makeWrapper ];
-            buildInputs = [ nix-eval-jobs ];
-            propagatedBuildInputs = with ocamlPackages; [
-              cmdliner
-              eio_main
-              logs
-              fmt
-              ppx_yojson_conv
-            ];
-            postInstall = ''
-              wrapProgram "$out/bin/nix-ci-build" --prefix PATH : ${path}
-            '';
-          };
         });
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
