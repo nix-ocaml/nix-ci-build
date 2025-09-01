@@ -49,7 +49,7 @@
                 eio_main
                 logs
                 fmt
-                ppx_yojson_conv
+                ppx_deriving_yojson
               ];
               postInstall = ''
                 wrapProgram "$out/bin/nix-ci-build" --prefix PATH : ${path}
