@@ -23,14 +23,7 @@
         in
         {
           default =
-            let
-              stdenv' =
-                if stdenv.isDarwin && !stdenv.isAarch64
-                then pkgs.overrideSDK stdenv "11.0"
-                else stdenv;
-            in
             ocamlPackages.buildDunePackage {
-              stdenv = stdenv';
               pname = "nix-ci-build";
               version = "n/a";
               src = let fs = lib.fileset; in fs.toSource {
