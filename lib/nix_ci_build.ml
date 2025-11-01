@@ -88,22 +88,24 @@ module Job = struct
     let find_opt k t =
       match find k t with v -> Some v | exception Not_found -> None
 
-    let to_yojson a_to_yojson t =
+    let yojson_of_t a_to_yojson t =
       let items =
         List.map ~f:(fun (key, v) -> key, a_to_yojson v) (bindings t)
       in
       `Assoc items
 
-    let of_yojson a_of_yojson = function
+    let t_of_yojson a_of_yojson = function
       | `Assoc items ->
         let rec f map = function
           | [] -> map
-          | (name, json) :: xs -> f (add name (a_of_yojson json |> Result.get_ok) map) xs
+          | (name, json) :: xs -> f (add name (a_of_yojson json) map) xs
         in
-        f empty items |> Result.ok
-      | `Null -> Ok empty
+        f empty items
+      | `Null -> empty
       | _ -> failwith "expected an object"
   end
+
+  open Ppx_yojson_conv_lib.Yojson_conv
 
   type t =
     { attr : string
@@ -115,7 +117,7 @@ module Job = struct
     ; outputs : string StringMap.t
     ; system : string
     }
-    [@@deriving yojson { strict = false }]
+  [@@deriving yojson] [@@yojson.allow_extra_fields]
 end
 
 let nix_build proc_mgr (job : Job.t) =
