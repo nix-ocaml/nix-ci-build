@@ -128,7 +128,9 @@ let nix_build proc_mgr (job : Job.t) =
   let logs_sink = Eio.Flow.buffer_sink build_logs_buf in
   Logs.debug (fun m -> m "run `%s`" (String.concat ~sep:" " args));
   let env =
-    ("GC_INITIAL_HEAP_SIZE", "2G") :: Unix.environment ()
+    let env = (Unix.environment () |> Array.to_list) in
+    let env = "GC_INITIAL_HEAP_SIZE=2G" :: env in
+    Array.of_list env
   in
   match Eio.Process.run proc_mgr ~env ~stdout:logs_sink ~stderr:logs_sink args with
   | () -> Ok ()
