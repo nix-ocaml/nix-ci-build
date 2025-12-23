@@ -127,7 +127,10 @@ let nix_build proc_mgr (job : Job.t) =
   let build_logs_buf = Buffer.create 1024 in
   let logs_sink = Eio.Flow.buffer_sink build_logs_buf in
   Logs.debug (fun m -> m "run `%s`" (String.concat ~sep:" " args));
-  match Eio.Process.run proc_mgr ~stdout:logs_sink ~stderr:logs_sink args with
+  let env =
+    ("GC_INITIAL_HEAP_SIZE", "2G") :: Unix.environment ()
+  in
+  match Eio.Process.run proc_mgr ~env ~stdout:logs_sink ~stderr:logs_sink args with
   | () -> Ok ()
   | exception (Eio.Exn.Io _ as exn) ->
     (* Whenever a build fails, also print its build logs on stderr - this allows
