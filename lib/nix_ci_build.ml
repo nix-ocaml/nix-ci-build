@@ -122,7 +122,7 @@ end
 
 let nix_build proc_mgr (job : Job.t) =
   let args =
-    [ "nix-build"; job.drvPath; "--keep-going"; "--no-link"; "--quiet" ]
+    [ "nix-build"; job.drvPath; "--keep-going"; "--no-link"; "--quiet"; "-j"; "2" ]
   in
   let build_logs_buf = Buffer.create 1024 in
   let logs_sink = Eio.Flow.buffer_sink build_logs_buf in
