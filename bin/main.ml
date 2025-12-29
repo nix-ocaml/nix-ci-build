@@ -8,6 +8,7 @@ module StringSet = Set.Make (String)
    one of its dependents is a failed job *)
 type t =
   { config : Nix_ci_build.Config.t
+  ; force_upload : bool
   ; mutable seen_drv_paths : StringSet.t
   ; builds : Job.t Stream.t * (Job.t option -> unit)
   ; uploads : Job.t Stream.t * (Job.t option -> unit)
@@ -17,8 +18,9 @@ type t =
   ; mutable failed_jobs : (Job.t * string) list
   }
 
-let make config =
+let make ~force_upload config =
   { config
+  ; force_upload
   ; seen_drv_paths = StringSet.empty
   ; builds = Stream.create 128
   ; uploads = Stream.create 128
@@ -57,11 +59,11 @@ let build_fiber t ~domain_mgr ~process_mgr () =
           let seen = StringSet.mem drv_path t.seen_drv_paths in
           if not seen then t.all_jobs <- t.all_jobs + 1;
           let cached =
-            match job.cacheStatus with
-            | "local" | "cached" ->
+            match t.force_upload, job.cacheStatus with
+            | false, ("local" | "cached") ->
               t.cached_jobs <- t.cached_jobs + 1;
               true
-            | "notBuilt" ->
+            | true, ("local" | "cached") | _, "notBuilt" ->
               t.seen_drv_paths <- StringSet.add drv_path t.seen_drv_paths;
               false
             | _ -> assert false
@@ -168,11 +170,11 @@ Failed builds: %d
     in
     Eio.Flow.copy_string detail sink)
 
-let main config ~dry_run stdenv =
+let main config ~force_upload ~dry_run stdenv =
   Switch.run (fun sw ->
     let process_mgr = Eio.Stdenv.process_mgr stdenv
     and domain_mgr = Eio.Stdenv.domain_mgr stdenv in
-    let t = make config in
+    let t = make ~force_upload config in
     let jobs = Nix_ci_build.nix_eval_jobs process_mgr ~sw config in
     let eval_fiber = eval_fiber ~sw t jobs
     and build_fiber =
@@ -190,9 +192,9 @@ let main config ~dry_run stdenv =
         , "Some jobs weren't successful. Consult the build summary for more \
            details." ))
 
-let main config dry_run verbose =
+let main config force_upload dry_run verbose =
   Nix_ci_build.Logging.setup_logging (if verbose then Debug else Info);
-  Eio_main.run (main ~dry_run config)
+  Eio_main.run (main ~force_upload ~dry_run config)
 
 module CLI = struct
   module Config = Nix_ci_build.Config
@@ -215,6 +217,10 @@ module CLI = struct
     let doc = "Write build summary to file instead of stdout" in
     let docv = "file" in
     Arg.(value & opt output_conv Stdout & info [ "o"; "output" ] ~doc ~docv)
+
+  let force_upload =
+    let doc = "Force uploading derivations" in
+    Arg.(value & flag & info [ "force-upload" ] ~doc)
 
   let dry_run =
     let doc = "Don't build or upload" in
@@ -255,6 +261,7 @@ module CLI = struct
         ret
           (const main
           $ (const parse $ flake $ max_jobs $ copy_to $ output)
+          $ force_upload
           $ dry_run
           $ verbose))
 end
@@ -263,4 +270,3 @@ let () =
   Random.self_init ();
   let open Cmdliner in
   exit (Cmd.eval CLI.t)
-
