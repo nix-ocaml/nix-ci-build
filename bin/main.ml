@@ -45,7 +45,20 @@ let eval_fiber ~sw t (jobs, finished_p) () =
     let bt = Printexc.get_raw_backtrace () in
     Eio.Exn.reraise_with_context ex bt "Evaluating jobs"
 
-let build_fiber t ~domain_mgr ~process_mgr () =
+let rec await_build_with_heartbeat ~clock ~job_attr build_promise =
+  match
+    Fiber.first
+      (fun () -> `Done (Promise.await_exn build_promise))
+      (fun () ->
+         Eio.Time.sleep clock 60.0;
+         `Tick)
+  with
+  | `Done result -> result
+  | `Tick ->
+    Logs.info (fun m -> m "still building %s" job_attr);
+    await_build_with_heartbeat ~clock ~job_attr build_promise
+
+let build_fiber t ~domain_mgr ~process_mgr ~clock () =
   Switch.run (fun sw ->
     let build_stream, _ = t.builds in
     let pool =
@@ -80,10 +93,14 @@ let build_fiber t ~domain_mgr ~process_mgr () =
             Nix_ci_build.nix_build process_mgr job
           in
           match
-            Eio.Executor_pool.submit_exn
-              pool (* 2 jobs per core *)
-              ~weight:0.5
-              task
+            let build_promise =
+              Fiber.fork_promise ~sw (fun () ->
+                Eio.Executor_pool.submit_exn
+                  pool (* 2 jobs per core *)
+                  ~weight:0.5
+                  task)
+            in
+            await_build_with_heartbeat ~clock ~job_attr:job.attr build_promise
           with
           | Ok () ->
             Mutex.protect seen_mutex (fun () ->
@@ -173,12 +190,15 @@ Failed builds: %d
 let main config ~force_upload ~dry_run stdenv =
   Switch.run (fun sw ->
     let process_mgr = Eio.Stdenv.process_mgr stdenv
-    and domain_mgr = Eio.Stdenv.domain_mgr stdenv in
+    and domain_mgr = Eio.Stdenv.domain_mgr stdenv
+    and clock = Eio.Stdenv.clock stdenv in
     let t = make ~force_upload config in
     let jobs = Nix_ci_build.nix_eval_jobs process_mgr ~sw config in
     let eval_fiber = eval_fiber ~sw t jobs
     and build_fiber =
-      if dry_run then Fun.const () else build_fiber t ~domain_mgr ~process_mgr
+      if dry_run
+      then Fun.const ()
+      else build_fiber t ~domain_mgr ~process_mgr ~clock
     and upload_fiber =
       if dry_run then Fun.const () else upload_fiber t ~process_mgr
     in
