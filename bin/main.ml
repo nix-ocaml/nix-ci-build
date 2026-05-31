@@ -50,7 +50,7 @@ let rec await_build_with_heartbeat ~clock ~job_attr build_promise =
     Fiber.first
       (fun () -> `Done (Promise.await_exn build_promise))
       (fun () ->
-         Eio.Time.sleep clock 60.0;
+         Eio.Time.sleep clock (60.0 * 5.0);
          `Tick)
   with
   | `Done result -> result
