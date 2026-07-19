@@ -56,12 +56,13 @@ module Config = struct
   type t =
     { flake : string
     ; max_jobs : int
+    ; http_connections : int
     ; build_summary_output : output
     ; copy_to : string option
     }
 end
 
-let nix_eval_jobs proc_mgr ~sw { Config.flake; max_jobs; _ } =
+let nix_eval_jobs proc_mgr ~sw { Config.flake; max_jobs; http_connections; _ } =
   let gc_root_dir = create_temp_dir () in
   let args =
     [ "nix-eval-jobs"
@@ -71,6 +72,9 @@ let nix_eval_jobs proc_mgr ~sw { Config.flake; max_jobs; _ } =
     ; "--check-cache-status"
     ; "--workers"
     ; string_of_int max_jobs
+    ; "--option"
+    ; "http-connections"
+    ; string_of_int http_connections
     ; (* "--max-memory-size"; *)
       (* str(opts.eval_max_memory_size); *)
       "--flake"

@@ -266,6 +266,11 @@ module CLI = struct
       & opt int (Domain.recommended_domain_count ())
       & info [ "j"; "jobs" ] ~doc ~docv)
 
+  let http_connections =
+    let doc = "Max number of concurrent cache requests made by nix-eval-jobs" in
+    let docv = "connections" in
+    Arg.(value & opt int 4 & info [ "http-connections" ] ~doc ~docv)
+
   let copy_to =
     let doc = "Copy build results to the given URL" in
     let docv = "URL" in
@@ -275,8 +280,13 @@ module CLI = struct
     let doc = "Make logging more verbose" in
     Arg.(value & flag & info [ "v"; "verbose" ] ~doc)
 
-  let parse flake max_jobs copy_to build_summary_output =
-    { Nix_ci_build.Config.flake; max_jobs; copy_to; build_summary_output }
+  let parse flake max_jobs http_connections copy_to build_summary_output =
+    { Nix_ci_build.Config.flake
+    ; max_jobs
+    ; http_connections
+    ; copy_to
+    ; build_summary_output
+    }
 
   let t =
     let open Cmdliner in
@@ -287,7 +297,12 @@ module CLI = struct
       Term.(
         ret
           (const main
-          $ (const parse $ flake $ max_jobs $ copy_to $ output)
+          $ (const parse
+            $ flake
+            $ max_jobs
+            $ http_connections
+            $ copy_to
+            $ output)
           $ dry_run
           $ verbose))
 end
