@@ -269,7 +269,7 @@ module CLI = struct
   let http_connections =
     let doc = "Max number of concurrent cache requests made by nix-eval-jobs" in
     let docv = "connections" in
-    Arg.(value & opt int 20 & info [ "http-connections" ] ~doc ~docv)
+    Arg.(value & opt int 4 & info [ "http-connections" ] ~doc ~docv)
 
   let copy_to =
     let doc = "Copy build results to the given URL" in
