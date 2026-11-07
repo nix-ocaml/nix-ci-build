@@ -20,6 +20,7 @@ type t =
   ; mutable cached_jobs : int
   ; mutable successful_jobs : int
   ; mutable failed_jobs : (Job.t * string) list
+  ; mutable failed_uploads : (Job.t * string) list
   }
 
 let make config =
@@ -31,6 +32,7 @@ let make config =
   ; cached_jobs = 0
   ; successful_jobs = 0
   ; failed_jobs = []
+  ; failed_uploads = []
   }
 
 let eval_fiber ~sw t (jobs, finished_p) () =
@@ -137,7 +139,10 @@ let upload_fiber t ~process_mgr () =
       Stream.iter upload_stream ~f:(fun (job : Job.t) ->
         match Nix_ci_build.nix_copy process_mgr ~copy_to job with
         | Ok () -> ()
-        | Error _ -> ()));
+        | Error exn ->
+          let error = Fmt.str "%a" Eio.Exn.pp exn in
+          Logs.err (fun m -> m "uploading %s failed: %s" job.attr error);
+          t.failed_uploads <- (job, error) :: t.failed_uploads));
     let push_to_uploads = snd t.uploads in
     push_to_uploads None
 
@@ -172,6 +177,7 @@ let dump_build_summary (stdenv : Eio_unix.Stdenv.base) ~sw t =
 Total Jobs: %d
 Successful builds: %d (of which %d were cached)
 Failed builds: %d
+Failed uploads: %d
 
 ## Failed Build Details
     |}
@@ -179,6 +185,7 @@ Failed builds: %d
       (t.successful_jobs + t.cached_jobs)
       t.cached_jobs
       n_failed_jobs
+      (List.length t.failed_uploads)
   in
   Eio.Flow.copy_string header sink;
   List.iter t.failed_jobs ~f:(fun ((job : Job.t), build_logs) ->
@@ -196,7 +203,15 @@ Failed builds: %d
         job.attr
         build_logs
     in
-    Eio.Flow.copy_string detail sink)
+    Eio.Flow.copy_string detail sink);
+  if t.failed_uploads <> []
+  then (
+    Eio.Flow.copy_string "\n## Failed Upload Details\n" sink;
+    List.iter t.failed_uploads ~f:(fun ((job : Job.t), error) ->
+      let detail =
+        Format.sprintf "\n### ❌ %s\n\n```\n%s\n```\n" job.attr error
+      in
+      Eio.Flow.copy_string detail sink))
 
 let main config ~dry_run stdenv =
   Switch.run (fun sw ->
@@ -215,9 +230,9 @@ let main config ~dry_run stdenv =
     in
     Fiber.all [ eval_fiber; build_fiber; upload_fiber ];
     dump_build_summary stdenv ~sw t;
-    match t.failed_jobs with
-    | [] -> `Ok ()
-    | _ :: _ ->
+    match t.failed_jobs, t.failed_uploads with
+    | [], [] -> `Ok ()
+    | _ ->
       `Error
         ( false
         , "Some jobs weren't successful. Consult the build summary for more \

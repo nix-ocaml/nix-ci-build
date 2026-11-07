@@ -122,7 +122,15 @@ end
 
 let nix_build proc_mgr (job : Job.t) =
   let args =
-    [ "nix-build"; job.drvPath; "--keep-going"; "--no-link"; "--quiet" ]
+    [ "nix"
+    ; "--experimental-features"
+    ; "nix-command flakes"
+    ; "build"
+    ; job.drvPath ^ "^*"
+    ; "--keep-going"
+    ; "--no-link"
+    ; "--quiet"
+    ]
   in
   let build_logs_buf = Buffer.create 1024 in
   let logs_sink = Eio.Flow.buffer_sink build_logs_buf in
@@ -139,7 +147,6 @@ let nix_build proc_mgr (job : Job.t) =
 
 let nix_copy proc_mgr ~copy_to (job : Job.t) =
   let args =
-    let urls = Job.StringMap.to_list job.outputs |> List.map ~f:snd in
     [ "nix"
     ; "--experimental-features"
     ; "nix-command flakes"
@@ -148,8 +155,10 @@ let nix_copy proc_mgr ~copy_to (job : Job.t) =
     ; "raw"
     ; "--to"
     ; copy_to
+    ; (* Realise all outputs before copying, including ones missing locally
+         and from substituters. Bare output paths cannot be rebuilt. *)
+      job.drvPath ^ "^*"
     ]
-    @ urls
   in
   Logs.debug (fun m -> m "run `%s`" (String.concat ~sep:" " args));
   match Eio.Process.run proc_mgr args with
