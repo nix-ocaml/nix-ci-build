@@ -9,6 +9,7 @@ type config =
   ; compare : string option
   ; history : string option
   ; heartbeat : float
+  ; cache_refresh : float
   ; batch_size : int
   ; retries : int
   }
@@ -40,6 +41,8 @@ type activity =
   ; mutable active_started : float option
   ; mutable building : bool
   ; mutable active : int
+  ; mutable active_builds : int
+  ; mutable active_downloads : int
   ; log : string
   ; mutable tail : string list
   }
@@ -52,12 +55,31 @@ type upload =
   ; log : string
   }
 
+type cache_import =
+  { drv_path : string
+  ; name : string
+  ; paths : string list
+  ; source : string
+  ; mutable state : string
+  ; started : float
+  ; mutable seconds : float
+  ; mutable error : string option
+  ; log : string
+  }
+
+type cache_check =
+  { mutable next_check : float
+  ; mutable misses : int
+  ; mutable failures : int
+  }
+
 type state =
   { config : config
   ; report : Report.t
   ; jobs : (string, job) Hashtbl.t
   ; activities : (string, activity) Hashtbl.t
   ; uploads : (string, upload) Hashtbl.t
+  ; cache_reuse : (string, cache_import) Hashtbl.t
   ; waits : (string, string * string list * string * float) Hashtbl.t
   ; available : (string, Plan.availability) Hashtbl.t
   ; mutable availability_epoch : int
@@ -121,6 +143,8 @@ let event t kind fields =
         ; "upload-queued"
         ; "upload-retry"
         ; "retry"
+        ; "cache-import-start"
+        ; "cache-import-finished"
         ]
   then
     let json = `Assoc fields in
@@ -301,6 +325,26 @@ let snapshot t =
           ] )
     ; "jobs", `List (List.map (roots t) ~f:(job_json t))
     ; "derivations", `List derivations
+    ; ( "cacheReuse"
+      , `List
+          (values t.cache_reuse
+          |> List.sort ~cmp:(fun a b -> String.compare a.drv_path b.drv_path)
+          |> List.map ~f:(fun i ->
+            `Assoc
+              [ "drvPath", `String i.drv_path
+              ; "name", `String i.name
+              ; "paths", Json.strs i.paths
+              ; "source", `String i.source
+              ; "state", `String i.state
+              ; ( "seconds"
+                , `Float
+                    (if i.state = "importing"
+                     then now () -. i.started
+                     else i.seconds) )
+              ; "error", Json.optional Json.str i.error
+              ; "logPath", `String i.log
+              ; "neededBy", Json.strs (needed_by t i.drv_path)
+              ])) )
     ; ( "waits"
       , `List
           (Hashtbl.to_seq t.waits
@@ -626,7 +670,14 @@ let evaluate t process_mgr =
               Plan.merge
                 t.graph
                 (Plan.of_nodes
-                   [ { Plan.drv_path = drv; name; system; inputs; outputs } ]);
+                   [ { Plan.drv_path = drv
+                     ; name
+                     ; system
+                     ; inputs
+                     ; outputs
+                     ; allow_substitutes = true
+                     }
+                   ]);
             let job =
               { edge
               ; attrs = [ attr ]
@@ -696,6 +747,7 @@ let get_activity t drv =
           ; name = Filename.basename drv
           ; system = ""
           ; inputs = []
+          ; allow_substitutes = false
           ; outputs =
               (if String.ends_with ~suffix:".drv" drv
                then []
@@ -715,6 +767,8 @@ let get_activity t drv =
       ; active_started = None
       ; building = false
       ; active = 0
+      ; active_builds = 0
+      ; active_downloads = 0
       ; log = "logs/" ^ Filename.basename drv ^ ".log"
       ; tail = []
       }
@@ -874,6 +928,8 @@ let run_build t process_mgr clock batch =
                if a.started = None then a.started <- Some (now ());
                if a.active = 0 then a.active_started <- Some (now ());
                a.active <- a.active + 1;
+               if kind = 105 then a.active_builds <- a.active_builds + 1;
+               if kind = 108 then a.active_downloads <- a.active_downloads + 1;
                a.building <- a.building || kind = 105;
                a.state <-
                  (if kind = 105
@@ -912,6 +968,9 @@ let run_build t process_mgr clock batch =
              then a.download_seconds <- a.download_seconds +. elapsed
              else a.wait_seconds <- a.wait_seconds +. elapsed;
              a.active <- max 0 (a.active - 1);
+             if kind = 105 then a.active_builds <- max 0 (a.active_builds - 1);
+             if kind = 108
+             then a.active_downloads <- max 0 (a.active_downloads - 1);
              if a.active = 0
              then (
                a.seconds <- a.seconds +. duration a.active_started None;
@@ -1264,6 +1323,320 @@ let scheduler t process_mgr clock stores =
     loop ());
   t.builds_done <- true
 
+let cache_follower t process_mgr clock stores =
+  if t.config.cache_refresh > 0. && stores <> []
+  then (
+    let interval = t.config.cache_refresh in
+    let checks = Hashtbl.create 128 in
+    let active = ref 0
+    and serial = ref 0 in
+    let jobs_by_attr = Hashtbl.create 128 in
+    List.iter (roots t) ~f:(fun j ->
+      List.iter j.attrs ~f:(fun attr -> Hashtbl.replace jobs_by_attr attr j));
+    let live (j : job) = j.state = "queued" || j.state = "submitted" in
+    let needed drv =
+      List.exists (needed_by t drv) ~f:(fun attr ->
+        Option.fold ~none:false ~some:live (Hashtbl.find_opt jobs_by_attr attr))
+    in
+    let busy drv =
+      match Hashtbl.find_opt t.activities drv with
+      | Some a -> a.active_builds > 0 || a.active_downloads > 0
+      | None -> false
+    in
+    let check_for drv =
+      match Hashtbl.find_opt checks drv with
+      | Some check -> check
+      | None ->
+        let check = { next_check = 0.; misses = 0; failures = 0 } in
+        Hashtbl.add checks drv check;
+        check
+    in
+    let backoff check =
+      let factor = 2. ** float_of_int (min 3 check.misses) in
+      check.next_check <- now () +. max interval (min 300. (interval *. factor));
+      check.misses <- min 3 (check.misses + 1)
+    in
+    let bounded seconds action =
+      Eio.Fiber.first
+        (fun () -> `Result (action ()))
+        (fun () ->
+           Eio.Time.sleep clock seconds;
+           `Timeout)
+    in
+    let rec chunks size xs =
+      let rec take n taken = function
+        | rest when n = 0 -> List.rev taken, rest
+        | [] -> List.rev taken, []
+        | x :: rest -> take (n - 1) (x :: taken) rest
+      in
+      match xs with
+      | [] -> []
+      | _ ->
+        let batch, rest = take size [] xs in
+        batch :: chunks size rest
+    in
+    let local_paths paths =
+      List.iter (chunks 128 paths) ~f:(fun paths ->
+        match bounded 30. (fun () -> refresh_local t process_mgr paths) with
+        | `Result () -> ()
+        | `Timeout ->
+          warning t "Dependency cache refresh: local query timed out")
+    in
+    let import ~sw (node : Plan.node) source paths =
+      let drv = node.drv_path in
+      let check = check_for drv in
+      incr serial;
+      let i =
+        { drv_path = drv
+        ; name = node.name
+        ; paths
+        ; source
+        ; state = "importing"
+        ; started = now ()
+        ; seconds = 0.
+        ; error = None
+        ; log =
+            Printf.sprintf
+              "logs/cache-import-%s-%d.log"
+              (Filename.basename drv)
+              !serial
+        }
+      in
+      Hashtbl.replace t.cache_reuse drv i;
+      incr active;
+      event
+        t
+        "cache-import-start"
+        [ "drvPath", `String drv
+        ; "source", `String source
+        ; "paths", Json.strs paths
+        ; "logPath", `String i.log
+        ];
+      checkpoint t;
+      Eio.Fiber.fork ~sw (fun () ->
+        Fun.protect
+          ~finally:(fun () ->
+            if i.state = "importing" then i.state <- "cancelled";
+            i.seconds <- now () -. i.started;
+            decr active;
+            changed t;
+            event
+              t
+              "cache-import-finished"
+              [ "drvPath", `String drv
+              ; "state", `String i.state
+              ; "seconds", `Float i.seconds
+              ; "error", Json.optional Json.str i.error
+              ; "logPath", `String i.log
+              ];
+            checkpoint t)
+          (fun () ->
+             let failed message =
+               i.state <- "failed";
+               i.error <- Some (Json.clip 4096 message);
+               check.failures <- check.failures + 1;
+               backoff check;
+               warning
+                 t
+                 ("Optional cache import for " ^ node.name ^ ": " ^ message)
+             in
+             try
+               let result =
+                 Eio.Fiber.first
+                   (fun () ->
+                      bounded 120. (fun () ->
+                        Backend.copy_from
+                          process_mgr
+                          ~log_path:(full_log t i.log)
+                          ~source
+                          paths))
+                   (fun () ->
+                      let rec watch () =
+                        if busy drv || not (needed drv)
+                        then `Stopped
+                        else (
+                          Eio.Time.sleep clock 0.1;
+                          watch ())
+                      in
+                      watch ())
+               in
+               match result with
+               | `Stopped ->
+                 i.state <- "cancelled";
+                 i.error <-
+                   Some "Dependency is already active or no longer needed"
+               | `Timeout -> failed "Import timed out after 120 seconds"
+               | `Result result ->
+                 let edge = { Plan.drv_path = drv; outputs = [ "*" ] } in
+                 local_paths (root_paths t edge);
+                 if Backend.successful result && complete_outputs t edge local
+                 then (
+                   (* Keep queued consumers' imported outputs alive until their
+                      build requests can establish their own temporary roots. *)
+                   List.iter paths ~f:(fun path ->
+                     match
+                       bounded 30. (fun () ->
+                         Backend.pin
+                           process_mgr
+                           ~root:
+                             (Filename.concat
+                                t.gc_dir
+                                ("cache-" ^ Filename.basename path))
+                           path)
+                     with
+                     | `Result () -> ()
+                     | `Timeout ->
+                       warning
+                         t
+                         "Dependency cache import: GC root registration timed \
+                          out");
+                   i.state <- "imported";
+                   check.misses <- 0)
+                 else if Backend.successful result
+                 then
+                   failed
+                     "Copy finished without all derivation outputs being valid \
+                      locally"
+                 else failed (Backend.error result)
+             with
+             | Eio.Cancel.Cancelled _ as exn -> raise exn
+             | exn -> failed (Printexc.to_string exn)))
+    in
+    let poll ~sw () =
+      let pending = List.filter (roots t) ~f:live in
+      let plan =
+        Plan.compute
+          t.graph
+          ~roots:(List.map pending ~f:(fun j -> j.edge))
+          ~availability:(availability t)
+      in
+      let candidates =
+        List.filter plan.builds ~f:(fun (n : Plan.node) ->
+          let check = check_for n.drv_path in
+          check.next_check <= now ()
+          && check.failures < 3
+          && n.allow_substitutes
+          && (not (busy n.drv_path))
+          && (not (Hashtbl.mem t.failures n.drv_path))
+          && n.outputs <> []
+          && List.for_all n.outputs ~f:(fun (_, p) -> p <> None)
+          &&
+          match Hashtbl.find_opt t.cache_reuse n.drv_path with
+          | Some i -> i.state <> "importing"
+          | None -> true)
+        |> List.sort ~cmp:(fun (a : Plan.node) (b : Plan.node) ->
+          let order =
+            Float.compare
+              (check_for a.drv_path).next_check
+              (check_for b.drv_path).next_check
+          in
+          if order = 0 then String.compare a.drv_path b.drv_path else order)
+      in
+      let candidates =
+        let rec take n = function
+          | _ when n = 0 -> []
+          | [] -> []
+          | x :: xs -> x :: take (n - 1) xs
+        in
+        take 64 candidates
+      in
+      if candidates <> []
+      then (
+        (* A failed import must not immediately retry via a later substituter in
+           this same pass, bypassing its newly scheduled cooldown. *)
+        let attempted = Hashtbl.create 64 in
+        List.iter candidates ~f:(fun (n : Plan.node) ->
+          backoff (check_for n.drv_path));
+        let all_paths =
+          List.concat_map candidates ~f:(fun (n : Plan.node) ->
+            List.filter_map n.outputs ~f:snd)
+          |> List.sort_uniq ~cmp:String.compare
+        in
+        local_paths all_paths;
+        event
+          t
+          "cache-refresh"
+          [ "derivations", `Int (List.length candidates)
+          ; "paths", `Int (List.length all_paths)
+          ];
+        List.iter stores ~f:(fun source ->
+          if !active < 2
+          then (
+            let candidates =
+              List.filter candidates ~f:(fun (n : Plan.node) ->
+                needed n.drv_path
+                && (not (Hashtbl.mem attempted n.drv_path))
+                && (not (busy n.drv_path))
+                && (not
+                      (complete_outputs
+                         t
+                         { Plan.drv_path = n.drv_path; outputs = [ "*" ] }
+                         local))
+                &&
+                match Hashtbl.find_opt t.cache_reuse n.drv_path with
+                | Some i -> i.state <> "importing"
+                | None -> true)
+            in
+            let paths =
+              List.concat_map candidates ~f:(fun (n : Plan.node) ->
+                List.filter_map n.outputs ~f:snd)
+              |> List.sort_uniq ~cmp:String.compare
+              |> List.filter ~f:(fun path -> not (local (availability t path)))
+            in
+            let found = Hashtbl.create (List.length paths) in
+            List.iter (chunks 128 paths) ~f:(fun paths ->
+              match
+                bounded 30. (fun () ->
+                  Backend.path_info process_mgr ~store:source ~fresh:true paths)
+              with
+              | `Timeout ->
+                warning t ("Dependency cache refresh timed out for " ^ source)
+              | `Result (infos, error) ->
+                Option.iter (warning t) error;
+                List.iter infos ~f:(fun (path, _) ->
+                  Hashtbl.replace found path ()));
+            List.iter candidates ~f:(fun (n : Plan.node) ->
+              let paths =
+                List.filter_map n.outputs ~f:snd
+                |> List.filter ~f:(fun path ->
+                  not (local (availability t path)))
+              in
+              if
+                !active < 2
+                && paths <> []
+                && needed n.drv_path
+                && (not (busy n.drv_path))
+                && (not (Hashtbl.mem attempted n.drv_path))
+                && (check_for n.drv_path).failures < 3
+                && List.for_all paths ~f:(Hashtbl.mem found)
+              then (
+                Hashtbl.add attempted n.drv_path ();
+                import ~sw n source paths)))))
+    in
+    (* The follower owns only optional queries/imports. Ending the build phase
+       cancels these children without delaying uploads or cancelling a
+       builder. *)
+    Eio.Fiber.first
+      (fun () ->
+         Eio.Switch.run (fun sw ->
+           let rec loop () =
+             Eio.Time.sleep clock interval;
+             (try if !active < 2 then poll ~sw () with
+             | Eio.Cancel.Cancelled _ as exn -> raise exn
+             | exn ->
+               warning t ("Dependency cache refresh: " ^ Printexc.to_string exn));
+             loop ()
+           in
+           loop ()))
+      (fun () ->
+         let rec wait () =
+           if not t.builds_done
+           then (
+             Eio.Time.sleep clock 0.1;
+             wait ())
+         in
+         wait ()))
+
 let uploader t process_mgr clock =
   let process_candidate drv =
     Hashtbl.remove t.candidates drv;
@@ -1317,7 +1690,8 @@ let uploader t process_mgr clock =
   Eio.Switch.run (fun sw ->
     let rec loop () =
       let queued =
-        values t.uploads |> List.filter ~f:(fun u -> u.state = "queued")
+        values t.uploads
+        |> List.filter ~f:(fun (u : upload) -> u.state = "queued")
       in
       (if List.length queued < 64
        then
@@ -1325,7 +1699,8 @@ let uploader t process_mgr clock =
          | Seq.Nil -> ()
          | Seq.Cons (drv, _) -> process_candidate drv);
       let queued =
-        values t.uploads |> List.filter ~f:(fun u -> u.state = "queued")
+        values t.uploads
+        |> List.filter ~f:(fun (u : upload) -> u.state = "queued")
       in
       (match queued, t.config.copy_to with
       | u :: _, Some destination when !active < 2 ->
@@ -1427,6 +1802,7 @@ let run config env =
     ; jobs = Hashtbl.create 128
     ; activities = Hashtbl.create 128
     ; uploads = Hashtbl.create 128
+    ; cache_reuse = Hashtbl.create 128
     ; waits = Hashtbl.create 16
     ; available = Hashtbl.create 256
     ; availability_epoch = 0
@@ -1501,9 +1877,11 @@ let run config env =
                     then t.status <- "planned"
                     else (
                       t.status <- "building";
-                      Eio.Fiber.both
-                        (fun () -> scheduler t process_mgr clock stores)
-                        (fun () -> uploader t process_mgr clock);
+                      Eio.Fiber.all
+                        [ (fun () -> scheduler t process_mgr clock stores)
+                        ; (fun () -> uploader t process_mgr clock)
+                        ; (fun () -> cache_follower t process_mgr clock stores)
+                        ];
                       t.status <- "success"))
                  (fun () ->
                     let rec loop () =
@@ -1556,7 +1934,8 @@ let run config env =
          t.status <> "cancelled"
          && (t.eval_errors <> []
             || Hashtbl.length t.failures <> 0
-            || List.exists (values t.uploads) ~f:(fun u -> u.state = "failed"))
+            || List.exists (values t.uploads) ~f:(fun (u : upload) ->
+              u.state = "failed"))
        then t.status <- "failed";
        t.context <- ("finishedAt", `Float (now ())) :: t.context;
        event t "finished" [ "status", `String t.status ];

@@ -31,6 +31,26 @@ Ready requests are prioritized using shared missing dependencies, estimated
 critical-path duration, and time spent waiting. Nix still owns realization of
 each derivation and shares dependency work between requests.
 
+## Reusing newly cached dependencies
+
+During a build, `--cache-refresh SECONDS` periodically checks whether missing
+dependencies have appeared in the configured Nix substituters. It defaults to
+30 seconds; use `--cache-refresh 0` to disable these checks. This can pick up
+outputs published by another runner after the initial plan was created,
+without coordinating the runners or adding flake dependencies.
+
+Lookups refresh negative cache results so an earlier miss does not hide a
+newly published output. An import starts only when every declared output is
+already local or available from the selected cache. Two background workers
+import eligible dependencies; polling and retry backoff are bounded to limit
+cache traffic. Derivations that disable substitution or have unknown output
+paths are skipped.
+
+An import failure is a warning and normal builds continue. A background import
+is cancelled when Nix starts building or downloading that dependency, or when
+the main builds finish. Compiler builds are never cancelled to pursue a cache import.
+`--dry-run` does not import outputs.
+
 ## Understanding progress
 
 Progress distinguishes the package requests submitted to Nix from the
@@ -49,14 +69,20 @@ continues. Evaluation errors, download failures, build failures, upload
 failures, and unfinished or cancelled requests remain distinguishable in the
 report.
 
+The heartbeat also reports completed and active dependency cache imports and
+import warnings. Import details identify the dependency, its consumers, cache
+source, output paths, and transfer time. Counts reflect the latest import state
+for each dependency; events retain earlier attempts. These describe observed
+imports and do not measure avoided builds or time saved.
+
 ## Reports
 
 The report directory contains:
 
 | File | Contents |
 | --- | --- |
-| `events.jsonl` | Chronological JSON events, flushed as work happens. |
-| `results.json` | Current snapshot: context, package states, dependency activity, timings, uploads, and root failures. |
+| `events.jsonl` | Chronological JSON events, flushed as work happens, including `cache-refresh`, `cache-import-start`, and `cache-import-finished`. |
+| `results.json` | Current snapshot: context, package states, dependency activity, timings, uploads, root failures, and dependency imports in `cacheReuse`. |
 | `plan.json` | The evaluated build plan, including dependency and cache information. |
 | `explanation.json` | Dependency paths and missing work for `--explain ATTRIBUTE`. |
 | `summary.md` | A bounded Markdown report for GitHub's job summary. |
@@ -112,7 +138,8 @@ finishes; repeatedly writing the file does not create a live dashboard. See
 
 ## Planning and previous runs
 
-`--dry-run` evaluates and writes the plan without building or uploading.
+`--dry-run` evaluates and writes the plan without building, uploading, or
+importing newly cached dependencies.
 `--explain ATTRIBUTE` explains the selected attribute's dependencies and cache
 requirements. `--compare FILE` compares the current plan with a previous
 `plan.json` or `results.json`, including derivations whose paths changed and

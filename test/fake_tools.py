@@ -39,7 +39,9 @@ def state():
 
 
 def record(kind, **fields):
-    item = {"kind": kind, "time": time.monotonic(), "pid": os.getpid(), **fields}
+    # Older macOS Python versions use a process-relative monotonic epoch.
+    # These records are compared across several independent fixture processes.
+    item = {"kind": kind, "time": time.time(), "pid": os.getpid(), **fields}
     with (DIRECTORY / "trace.jsonl").open("a") as trace:
         fcntl.flock(trace, fcntl.LOCK_EX)
         trace.write(json.dumps(item) + "\n")
@@ -148,6 +150,13 @@ def path_info(args):
     paths = paths_from_args(args)
     store = option(args, "--store")
     record("path_info", paths=paths, store=store)
+    query_barrier = CONFIG.get("query_barriers", {}).get(store)
+    if query_barrier and "narinfo-cache-negative-ttl" in sys.argv:
+        publication = query_barrier["after_publication"]
+        with state() as current:
+            published = publication["path"] in current["remote"].get(publication["store"], [])
+        if published:
+            barrier(query_barrier["name"])
     with state() as current:
         available = set(current["local"] if store is None else current["remote"].get(store, []))
     if "--all" in args:
@@ -202,34 +211,71 @@ def next_activity():
         return current["activity"]
 
 
+@contextlib.contextmanager
+def output_locks(outputs):
+    """Local builds and imports contend for the same output-path locks."""
+    with contextlib.ExitStack() as stack:
+        for output in sorted(set(outputs)):
+            lock = stack.enter_context((DIRECTORY / (Path(output).name + ".output.lock")).open("a"))
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def barrier(name):
+    if name is None:
+        return
+    record("barrier_waiting", name=name)
+    deadline = time.monotonic() + 25
+    while not (DIRECTORY / ("release-" + name)).exists():
+        if time.monotonic() >= deadline:
+            raise RuntimeError("fixture barrier timed out: " + name)
+        time.sleep(0.01)
+    record("barrier_released", name=name)
+
+
 def realize(drv):
     node = NODES[drv]
     outputs = list(node["outputs"].values())
-    lock_name = Path(drv).name + ".lock"
-    with (DIRECTORY / lock_name).open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        with state() as current:
-            valid = all(output in current["local"] for output in outputs)
-            cached = all(output in current["remote"].get(REMOTE, []) for output in outputs)
-        if valid:
-            return True
-        if cached:
+    # Nix tries substitutes before realizing inputs. A running request does not
+    # keep asking the remote cache once it has committed to the build path.
+    with state() as current:
+        valid = all(output in current["local"] for output in outputs)
+        cached_source = next((source for source in CONFIG.get("substituters", [REMOTE]) if all(
+            output in current["remote"].get(source, []) for output in outputs
+        )), None) if node.get("env", {}).get("allowSubstitutes", "1") == "1" else None
+    if valid:
+        return True
+    if cached_source:
+        with output_locks(outputs):
+            with state() as current:
+                if all(output in current["local"] for output in outputs):
+                    return True
             activity = next_activity()
             emit({"action": "start", "id": activity, "level": 3, "type": 108,
-                  "text": "copying path", "fields": [outputs[0], REMOTE], "parent": 0})
+                  "text": "copying path", "fields": [outputs[0], cached_source], "parent": 0})
+            barrier(node.get("download_barrier"))
             time.sleep(node.get("download_delay", 0))
             with state() as current:
                 current["local"] = sorted(set(current["local"] + outputs))
             record("substituted", drv=drv, outputs=outputs)
             emit({"action": "stop", "id": activity})
             return True
-        failed_dependencies = 0
-        for dependency in node.get("inputDrvs", {}):
-            if not realize(dependency):
-                failed_dependencies += 1
-        if failed_dependencies:
-            message("error: %d dependencies of derivation '%s' failed to build" % (failed_dependencies, drv))
-            return False
+    record("substitution_miss", drv=drv)
+    failed_dependencies = 0
+    for dependency in node.get("inputDrvs", {}):
+        if not realize(dependency):
+            failed_dependencies += 1
+    if failed_dependencies:
+        message("error: %d dependencies of derivation '%s' failed to build" % (failed_dependencies, drv))
+        return False
+    # Output locks are acquired after inputs are ready. An external cache import
+    # can make these outputs valid while this request waits for its inputs.
+    with output_locks(outputs):
+        with state() as current:
+            valid = all(output in current["local"] for output in outputs)
+        if valid:
+            record("build_avoided", drv=drv, outputs=outputs)
+            return True
         with state() as current:
             attempt = current["attempts"].get(drv, 0) + 1
             current["attempts"][drv] = attempt
@@ -240,6 +286,7 @@ def realize(drv):
         emit({"action": "result", "id": activity, "type": 104, "fields": ["buildPhase"]})
         for line in node.get("log", ["fixture build output for " + node["name"]]):
             emit({"action": "result", "id": activity, "type": 101, "fields": [line]})
+        barrier(node.get("barrier"))
         time.sleep(node.get("delay", 0.01))
         behavior = node.get("behavior", "success")
         failed = behavior == "fail" or (behavior == "transient" and attempt <= node.get("fail_attempts", 1))
@@ -302,8 +349,11 @@ def build(args):
 def copy(args):
     paths = paths_from_args(args)
     if any("^" in path or path.endswith(".drv") for path in paths):
-        print("fixture: uploading must never realize a derivation", file=sys.stderr)
+        print("fixture: copying must never realize a derivation", file=sys.stderr)
         return 97
+    source = option(args, "--from")
+    if source is not None:
+        return import_paths(source, paths)
     destination = option(args, "--to")
     with state() as current:
         missing = [path for path in paths if path not in current["local"]]
@@ -319,6 +369,36 @@ def copy(args):
         current["copied"].extend(paths)
         current["remote"][destination] = sorted(set(current["remote"].get(destination, []) + paths))
     record("copy_finished", paths=paths, destination=destination)
+    return 0
+
+
+def import_paths(source, paths):
+    options = CONFIG.get("import", {})
+    with state() as current:
+        missing = [path for path in paths if path not in current["remote"].get(source, [])]
+        current["import_attempts"] = current.get("import_attempts", 0) + 1
+        attempt = current["import_attempts"]
+    record("import_started", paths=paths, source=source, attempt=attempt)
+    if missing:
+        print("error: fixture import requested unavailable cache outputs", file=sys.stderr)
+        return 96
+    barrier(options.get("before_lock_barrier"))
+    if options.get("behavior") == "hang_before_lock":
+        time.sleep(25)
+    with output_locks(paths):
+        barrier(options.get("barrier"))
+        time.sleep(options.get("delay", 0))
+        if options.get("behavior") == "fail":
+            error = options.get("error", "error: HTTP error 504 importing fixture output")
+            if options.get("tag_attempts"):
+                error += " (attempt %d)" % attempt
+            print(error, file=sys.stderr)
+            record("import_failed", paths=paths, source=source)
+            return 1
+        with state() as current:
+            current["local"] = sorted(set(current["local"] + paths))
+            current["imported"] = sorted(set(current.get("imported", []) + paths))
+        record("import_finished", paths=paths, source=source)
     return 0
 
 
@@ -359,10 +439,11 @@ def main():
         print("fixture: unsupported nix-store command: %r" % args, file=sys.stderr)
         return 95
     if args[:2] == ["config", "show"] or args[:1] == ["show-config"]:
+        substituters = CONFIG.get("substituters", [REMOTE])
         if "--json" in args:
-            print(json.dumps({"substituters": {"value": [REMOTE]}, "experimental-features": {"value": ["nix-command", "flakes"]}}))
+            print(json.dumps({"substituters": {"value": substituters}, "experimental-features": {"value": ["nix-command", "flakes"]}}))
         else:
-            print(REMOTE)
+            print(" ".join(substituters))
         return 0
     if args[:2] == ["derivation", "show"] or args[:1] == ["show-derivation"]:
         return derivations(args)
