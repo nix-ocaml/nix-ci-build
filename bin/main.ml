@@ -1,313 +1,190 @@
-open Eio.Std
-module Logs = (val Nix_ci_build.Logging.setup __FILE__)
-module Stream = Nix_ci_build.Stream
-module Job = Nix_ci_build.Job
-module StringSet = Set.Make (String)
+open Cmdliner
 
-type job_action =
-  | Build
-  | Skip_cached
-  | Upload_local
-
-(* TODO: it'd be really cool if we knew how to avoid building a derivation if
-   one of its dependents is a failed job *)
-type t =
-  { config : Nix_ci_build.Config.t
-  ; mutable seen_drv_paths : StringSet.t
-  ; builds : Job.t Stream.t * (Job.t option -> unit)
-  ; uploads : Job.t Stream.t * (Job.t option -> unit)
-  ; mutable all_jobs : int
-  ; mutable cached_jobs : int
-  ; mutable successful_jobs : int
-  ; mutable failed_jobs : (Job.t * string) list
-  ; mutable failed_uploads : (Job.t * string) list
-  }
-
-let make config =
-  { config
-  ; seen_drv_paths = StringSet.empty
-  ; builds = Stream.create 128
-  ; uploads = Stream.create 128
-  ; all_jobs = 0
-  ; cached_jobs = 0
-  ; successful_jobs = 0
-  ; failed_jobs = []
-  ; failed_uploads = []
-  }
-
-let eval_fiber ~sw t (jobs, finished_p) () =
-  let push_to_builds = snd t.builds in
-  Stream.iter_p
-    ~sw
-    ~f:(fun job ->
-      Logs.debug (fun m -> m "job eval: %s" job);
-      let job : Job.t = job |> Yojson.Safe.from_string |> Job.t_of_yojson in
-      push_to_builds (Some job))
-    jobs;
-  match Promise.await_exn finished_p with
-  | () -> push_to_builds None
-  | exception (Eio.Exn.Io _ as ex) ->
-    let bt = Printexc.get_raw_backtrace () in
-    Eio.Exn.reraise_with_context ex bt "Evaluating jobs"
-
-let rec await_build_with_heartbeat ~clock ~job_attr build_promise =
-  match
-    Fiber.first
-      (fun () -> `Done (Promise.await_exn build_promise))
-      (fun () ->
-         Eio.Time.sleep clock (60.0 *. 5.0);
-         `Tick)
-  with
-  | `Done result -> result
-  | `Tick ->
-    Logs.info (fun m -> m "still building %s" job_attr);
-    await_build_with_heartbeat ~clock ~job_attr build_promise
-
-let build_fiber t ~domain_mgr ~process_mgr ~clock () =
-  Switch.run (fun sw ->
-    let build_stream, _ = t.builds in
-    let pool =
-      Eio.Executor_pool.create ~sw ~domain_count:t.config.max_jobs domain_mgr
-    in
-    let seen_mutex = Mutex.create () in
-    Stream.iter_p ~sw build_stream ~f:(fun (job : Job.t) ->
-      let drv_path = job.drvPath in
-      let seen, action =
-        Mutex.protect seen_mutex (fun () ->
-          let seen = StringSet.mem drv_path t.seen_drv_paths in
-          if not seen then t.all_jobs <- t.all_jobs + 1;
-          let action =
-            match t.config.copy_to, job.cacheStatus with
-            | Some _, "local" ->
-              t.cached_jobs <- t.cached_jobs + 1;
-              t.seen_drv_paths <- StringSet.add drv_path t.seen_drv_paths;
-              Upload_local
-            | _, ("local" | "cached") ->
-              t.cached_jobs <- t.cached_jobs + 1;
-              Skip_cached
-            | _, "notBuilt" ->
-              t.seen_drv_paths <- StringSet.add drv_path t.seen_drv_paths;
-              Build
-            | _ -> assert false
-          in
-          seen, action)
-      in
-      if not seen
-      then
-        match action with
-        | Skip_cached -> Logs.info (fun m -> m "skipping %s (cached)" job.attr)
-        | Upload_local ->
-          let push_to_uploads = snd t.uploads in
-          push_to_uploads (Some job);
-          Logs.info (fun m -> m "uploading %s (local)" job.attr)
-        | Build ->
-          let task () =
-            Logs.info (fun m -> m "building %s" job.attr);
-            Nix_ci_build.nix_build process_mgr job
-          in
-          (match
-             let build_promise =
-               Fiber.fork_promise ~sw (fun () ->
-                 Eio.Executor_pool.submit_exn
-                   pool (* 2 jobs per core *)
-                   ~weight:0.5
-                   task)
-             in
-             await_build_with_heartbeat ~clock ~job_attr:job.attr build_promise
-           with
-          | Ok () ->
-            Mutex.protect seen_mutex (fun () ->
-              t.successful_jobs <- t.successful_jobs + 1);
-            let push_to_uploads = snd t.uploads in
-            push_to_uploads (Some job);
-            Logs.info (fun m -> m "%s built successfully" job.attr)
-          | Error (_, build_logs) ->
-            (* TODO: capture stderr and add it to the build summary too. *)
-            Mutex.protect seen_mutex (fun () ->
-              t.failed_jobs <- (job, build_logs) :: t.failed_jobs))));
-  let push_to_uploads = snd t.uploads in
-  push_to_uploads None
-
-let upload_fiber t ~process_mgr () =
-  match t.config.copy_to with
-  | None ->
-    let push_to_uploads = snd t.uploads in
-    push_to_uploads None
-  | Some copy_to ->
-    let upload_stream, _ = t.uploads in
-    Switch.run (fun _sw ->
-      Stream.iter upload_stream ~f:(fun (job : Job.t) ->
-        match Nix_ci_build.nix_copy process_mgr ~copy_to job with
-        | Ok () -> ()
-        | Error exn ->
-          let error = Fmt.str "%a" Eio.Exn.pp exn in
-          Logs.err (fun m -> m "uploading %s failed: %s" job.attr error);
-          t.failed_uploads <- (job, error) :: t.failed_uploads));
-    let push_to_uploads = snd t.uploads in
-    push_to_uploads None
-
-let dump_build_summary (stdenv : Eio_unix.Stdenv.base) ~sw t =
-  let sink =
-    (* TODO: take this filename as a CLI argument *)
-    match Sys.getenv "GITHUB_STEP_SUMMARY" with
-    | filename ->
-      let path =
-        if Filename.is_relative filename
-        then
-          let cwd = Eio.Stdenv.cwd stdenv in
-          Eio.Path.(cwd / filename)
-        else
-          let fs = Eio.Stdenv.fs stdenv in
-          Eio.Path.(fs / filename)
-      in
-      let p =
-        Eio.Path.open_out ~sw ~append:true ~create:(`If_missing 0o700) path
-      in
-      (p :> [ `Close | `Flow | `W ] r)
-    | exception Not_found ->
-      let stdout = Eio.Stdenv.stdout stdenv in
-      (stdout :> [ `Close | `Flow | `W ] r)
-  in
-
-  let header =
-    let n_failed_jobs = List.length t.failed_jobs in
-    Format.sprintf
-      {|## Overview
-
-Total Jobs: %d
-Successful builds: %d (of which %d were cached)
-Failed builds: %d
-Failed uploads: %d
-
-## Failed Build Details
-    |}
-      t.all_jobs
-      (t.successful_jobs + t.cached_jobs)
-      t.cached_jobs
-      n_failed_jobs
-      (List.length t.failed_uploads)
-  in
-  Eio.Flow.copy_string header sink;
-  List.iter t.failed_jobs ~f:(fun ((job : Job.t), build_logs) ->
-    let detail =
-      Format.sprintf
-        {|
-### ❌ %s
-
-<details>
-  <summary>Build error:</summary>
-  last 50 lines:
-  <pre>%s</pre>
-</details>
-|}
-        job.attr
-        build_logs
-    in
-    Eio.Flow.copy_string detail sink);
-  if t.failed_uploads <> []
+let main
+      flake
+      jobs
+      copy_to
+      output
+      report_dir
+      dry_run
+      explain
+      compare
+      history
+      heartbeat
+      batch_size
+      retries
+      _verbose
+  =
+  if
+    jobs < 1
+    || batch_size < 1
+    || retries < 0
+    || heartbeat <= 0.
+    || not (Float.is_finite heartbeat)
   then (
-    Eio.Flow.copy_string "\n## Failed Upload Details\n" sink;
-    List.iter t.failed_uploads ~f:(fun ((job : Job.t), error) ->
-      let detail =
-        Format.sprintf "\n### ❌ %s\n\n```\n%s\n```\n" job.attr error
-      in
-      Eio.Flow.copy_string detail sink))
-
-let main config ~dry_run stdenv =
-  Switch.run (fun sw ->
-    let process_mgr = Eio.Stdenv.process_mgr stdenv
-    and domain_mgr = Eio.Stdenv.domain_mgr stdenv
-    and clock = Eio.Stdenv.clock stdenv in
-    let t = make config in
-    let jobs = Nix_ci_build.nix_eval_jobs process_mgr ~sw config in
-    let eval_fiber = eval_fiber ~sw t jobs
-    and build_fiber =
-      if dry_run
-      then Fun.const ()
-      else build_fiber t ~domain_mgr ~process_mgr ~clock
-    and upload_fiber =
-      if dry_run then Fun.const () else upload_fiber t ~process_mgr
+    prerr_endline
+      "jobs, batch-size and heartbeat must be positive; retries must be \
+       nonnegative";
+    2)
+  else
+    let config =
+      { Nix_ci_build.Engine.flake
+      ; jobs
+      ; copy_to
+      ; output
+      ; report_dir
+      ; dry_run
+      ; explain
+      ; compare
+      ; history
+      ; heartbeat
+      ; batch_size
+      ; retries
+      }
     in
-    Fiber.all [ eval_fiber; build_fiber; upload_fiber ];
-    dump_build_summary stdenv ~sw t;
-    match t.failed_jobs, t.failed_uploads with
-    | [], [] -> `Ok ()
-    | _ ->
-      `Error
-        ( false
-        , "Some jobs weren't successful. Consult the build summary for more \
-           details." ))
+    Eio_main.run (Nix_ci_build.Engine.run config)
 
-let main config dry_run verbose =
-  Nix_ci_build.Logging.setup_logging (if verbose then Debug else Info);
-  Eio_main.run (main ~dry_run config)
-
-module CLI = struct
-  module Config = Nix_ci_build.Config
-  open Cmdliner
-
-  let output =
-    let output_conv =
-      let parse s =
-        let output = Config.Filename s in
-        Ok output
-      in
-      let print formatter output =
-        let s =
-          match output with Config.Stdout -> "<stdout>" | Filename f -> f
-        in
-        Format.fprintf formatter "%s" s
-      in
-      Arg.conv ~docv:"output" (parse, print)
-    in
-    let doc = "Write build summary to file instead of stdout" in
-    let docv = "file" in
-    Arg.(value & opt output_conv Stdout & info [ "o"; "output" ] ~doc ~docv)
-
-  let dry_run =
-    let doc = "Don't build or upload" in
-    Arg.(value & flag & info [ "dry-run" ] ~doc)
-
+let command =
   let flake =
-    let doc = "Flake url to evaluate/build" in
-    let docv = "flake-url" in
-    Arg.(required & opt (some string) None & info [ "f"; "flake" ] ~doc ~docv)
-
-  let max_jobs =
-    let doc = "Max number of eval workers / build jobs" in
-    let docv = "jobs" in
+    Arg.(
+      required
+      & opt (some string) None
+      & info
+          [ "f"; "flake" ]
+          ~docv:"FLAKE#ATTR"
+          ~doc:"Package set to evaluate and build.")
+  in
+  let jobs =
     Arg.(
       value
       & opt int (Domain.recommended_domain_count ())
-      & info [ "j"; "jobs" ] ~doc ~docv)
-
+      & info
+          [ "j"; "jobs" ]
+          ~doc:
+            "Evaluation workers; admits up to twice this many Nix build \
+             requests.")
+  in
   let copy_to =
-    let doc = "Copy build results to the given URL" in
-    let docv = "URL" in
-    Arg.(value & opt (some string) None & info [ "copy-to" ] ~doc ~docv)
-
+    Arg.(
+      value
+      & opt (some string) None
+      & info
+          [ "copy-to" ]
+          ~docv:"URL"
+          ~doc:
+            "Copy realized outputs, including build dependencies, to this \
+             store.")
+  in
+  let output =
+    Arg.(
+      value
+      & opt (some string) None
+      & info
+          [ "o"; "output" ]
+          ~docv:"FILE"
+          ~doc:"Summary destination; defaults to GITHUB_STEP_SUMMARY or stdout.")
+  in
+  let report_dir =
+    Arg.(
+      value
+      & opt string "nix-ci-build-report"
+      & info
+          [ "report-dir" ]
+          ~docv:"DIR"
+          ~doc:"Directory for durable plans, results, events and full logs.")
+  in
+  let dry_run =
+    Arg.(
+      value
+      & flag
+      & info
+          [ "dry-run" ]
+          ~doc:"Evaluate and report the plan without building or uploading.")
+  in
+  let explain =
+    Arg.(
+      value
+      & opt (some string) None
+      & info
+          [ "explain" ]
+          ~docv:"ATTR"
+          ~doc:"Explain missing dependencies for an attribute; implies dry-run.")
+  in
+  let compare =
+    Arg.(
+      value
+      & opt (some string) None
+      & info
+          [ "compare" ]
+          ~docv:"JSON"
+          ~doc:"Compare the plan with an earlier plan.json or results.json.")
+  in
+  let history =
+    Arg.(
+      value
+      & opt (some string) None
+      & info
+          [ "history" ]
+          ~docv:"JSON"
+          ~doc:
+            "Use earlier results.json timings to prioritize the critical path.")
+  in
+  let heartbeat =
+    Arg.(
+      value
+      & opt float 30.
+      & info
+          [ "heartbeat" ]
+          ~docv:"SECONDS"
+          ~doc:"Interval for aggregate live progress and report checkpoints.")
+  in
+  let batch_size =
+    Arg.(
+      value
+      & opt int 1
+      & info
+          [ "batch-size" ]
+          ~docv:"N"
+          ~doc:"Submit up to N related roots together; defaults to one.")
+  in
+  let retries =
+    Arg.(
+      value
+      & opt int 2
+      & info
+          [ "retries" ]
+          ~docv:"N"
+          ~doc:
+            "Maximum retries for recognized transient download/upload errors.")
+  in
   let verbose =
-    let doc = "Make logging more verbose" in
-    Arg.(value & flag & info [ "v"; "verbose" ] ~doc)
+    Arg.(
+      value
+      & flag
+      & info
+          [ "v"; "verbose" ]
+          ~doc:
+            "Retained for command-line compatibility; full logs are always \
+             saved.")
+  in
+  Cmd.v
+    (Cmd.info
+       "nix-ci-build"
+       ~doc:"Plan, build and report Nix package sets in CI")
+    Term.(
+      const main
+      $ flake
+      $ jobs
+      $ copy_to
+      $ output
+      $ report_dir
+      $ dry_run
+      $ explain
+      $ compare
+      $ history
+      $ heartbeat
+      $ batch_size
+      $ retries
+      $ verbose)
 
-  let parse flake max_jobs copy_to build_summary_output =
-    { Nix_ci_build.Config.flake; max_jobs; copy_to; build_summary_output }
-
-  let t =
-    let open Cmdliner in
-    let doc = "nix-ci-build TODO" in
-    let info = Cmd.info "nix-ci-build" ~doc in
-    Cmd.v
-      info
-      Term.(
-        ret
-          (const main
-          $ (const parse $ flake $ max_jobs $ copy_to $ output)
-          $ dry_run
-          $ verbose))
-end
-
-let () =
-  Random.self_init ();
-  let open Cmdliner in
-  exit (Cmd.eval CLI.t)
+let () = exit (Cmd.eval' command)

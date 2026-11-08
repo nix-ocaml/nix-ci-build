@@ -1,0 +1,5 @@
+/_build/
+/result
+/nix-ci-build-report/
+/test-reports/
+__pycache__/

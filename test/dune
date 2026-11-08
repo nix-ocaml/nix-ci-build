@@ -1,0 +1,20 @@
+(test
+ (name plan_test)
+ (modules plan_test)
+ (libraries nix-ci-build yojson))
+
+(test
+ (name activity_test)
+ (modules activity_test)
+ (libraries nix-ci-build yojson))
+
+(test
+ (name report_test)
+ (modules report_test)
+ (libraries nix-ci-build yojson unix)
+ (flags :standard -open StdLabels))
+
+(rule
+ (alias runtest)
+ (deps integration.py fake_tools.py)
+ (action (run %{bin:python3} -B %{dep:integration.py} %{exe:../bin/main.exe})))
