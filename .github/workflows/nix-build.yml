@@ -18,3 +18,23 @@ jobs:
           extra-trusted-public-keys = ocaml.nix-cache.com-1:/xI2h2+56rwFfKyyFVbkJSeGqSIYMC/Je+7XXqGKDIY=
     - name: "Run nix-build"
       run: nix build -L .#
+    - name: "Run tests and save reports"
+      if: ${{ !cancelled() }}
+      env:
+        NIX_CI_TEST_REPORTS: ${{ github.workspace }}/test-reports
+      run: nix develop -c dune runtest --force
+    - name: "Upload test reports"
+      id: reports
+      if: always()
+      timeout-minutes: 3
+      uses: actions/upload-artifact@v7
+      with:
+        name: nix-ci-build-reports-${{ runner.os }}-${{ github.run_attempt }}
+        path: test-reports/
+        if-no-files-found: warn
+        retention-days: 14
+    - name: "Link test reports"
+      if: ${{ always() && steps.reports.outputs.artifact-url != '' }}
+      env:
+        REPORT_URL: ${{ steps.reports.outputs.artifact-url }}
+      run: printf '\n[Full logs and results](%s)\n' "$REPORT_URL" >> "$GITHUB_STEP_SUMMARY"

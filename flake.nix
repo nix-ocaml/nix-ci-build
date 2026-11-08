@@ -52,18 +52,21 @@
                 fileset = fs.unions [
                   ./bin
                   ./lib
+                  ./test
                   ./dune-project
                   ./nix-ci-build.opam
                 ];
               };
             nativeBuildInputs = [ makeWrapper ];
+            nativeCheckInputs = [ pkgs.python3 ];
+            doCheck = true;
             buildInputs = [ nix-eval-jobs ];
             propagatedBuildInputs = with ocamlPackages; [
               cmdliner
               eio_main
               logs
               fmt
-              ppx_yojson_conv
+              yojson
             ];
             postInstall = ''
               wrapProgram "$out/bin/nix-ci-build" --prefix PATH : ${path}
@@ -74,10 +77,13 @@
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           inputsFrom = [ self.packages.${pkgs.stdenv.hostPlatform.system}.default ];
-          nativeBuildInputs = with pkgs.ocamlPackages; [
+          nativeBuildInputs = [
+            pkgs.python3
+          ]
+          ++ (with pkgs.ocamlPackages; [
             merlin
             ocamlformat
-          ];
+          ]);
         };
       });
     };
