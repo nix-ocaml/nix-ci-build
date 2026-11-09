@@ -130,8 +130,18 @@ def derivations(args):
             "builder": "/bin/sh",
             "args": [],
         }
+    record("derivation_query", roots=roots, returned=sorted(result))
     print(json.dumps(result))
     return 0
+
+
+def references_for_path(path):
+    node = NODES.get(OUTPUT_TO_DRV.get(path), {})
+    return node.get("references", [
+        output
+        for dependency in node.get("inputDrvs", {})
+        for output in NODES[dependency]["outputs"].values()
+    ])
 
 
 def path_info(args):
@@ -143,8 +153,14 @@ def path_info(args):
     if "--all" in args:
         paths = sorted(available)
     if "--recursive" in args or "-r" in args:
-        nodes = closure(OUTPUT_TO_DRV[p] for p in paths if p in OUTPUT_TO_DRV)
-        paths = list(dict.fromkeys(paths + [p for d in sorted(nodes) for p in NODES[d]["outputs"].values()]))
+        pending = list(dict.fromkeys(paths))
+        seen = set(pending)
+        for path in pending:
+            for reference in references_for_path(path):
+                if reference not in seen:
+                    seen.add(reference)
+                    pending.append(reference)
+        paths = pending
     result = {}
     missing = False
     for path in paths:
@@ -154,18 +170,13 @@ def path_info(args):
             continue
         drv = OUTPUT_TO_DRV.get(path)
         node = NODES.get(drv, {})
-        references = [
-            output
-            for dependency in node.get("inputDrvs", {})
-            for output in NODES[dependency]["outputs"].values()
-        ]
         result[path] = {
             "path": path,
             "deriver": drv,
             "narHash": "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
             "narSize": node.get("narSize", 1024),
             "downloadSize": node.get("downloadSize", 512),
-            "references": references,
+            "references": references_for_path(path),
             "valid": True,
             "registrationTime": 0,
             "ultimate": False,
@@ -326,7 +337,7 @@ def evaluate():
 def main():
     tool = globals().get("TOOL_NAME", Path(sys.argv[0]).name)
     args = stripped_args(sys.argv[1:])
-    record("command", tool=tool, args=args)
+    record("command", tool=tool, args=args, rawArgs=sys.argv[1:])
     if args == ["--version"]:
         print("nix-eval-jobs 2.35.0" if tool == "nix-eval-jobs" else "nix (Nix) 2.35.3")
         return 0

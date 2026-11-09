@@ -231,25 +231,27 @@ let index_graph t =
         path));
   (* One traversal per requested derivation, not one traversal per displayed
      dependency per checkpoint. Attribute aliases share the traversal. *)
-  List.iter (roots t) ~f:(fun j ->
-    let seen = Hashtbl.create 32
-    and pending = Stack.create () in
-    Stack.push j.edge.drv_path pending;
-    while not (Stack.is_empty pending) do
-      let drv = Stack.pop pending in
-      if not (Hashtbl.mem seen drv)
-      then (
-        Hashtbl.add seen drv ();
-        let attrs =
-          Option.value (Hashtbl.find_opt t.attribution drv) ~default:[]
-        in
-        Hashtbl.replace t.attribution drv (j.attrs @ attrs);
-        match Plan.find t.graph drv with
-        | None -> ()
-        | Some node ->
-          List.iter node.inputs ~f:(fun (edge : Plan.edge) ->
-            if edge.outputs <> [] then Stack.push edge.drv_path pending))
-    done);
+  List.iter
+    (List.filter (roots t) ~f:(fun (j : job) -> j.state <> "cached"))
+    ~f:(fun j ->
+      let seen = Hashtbl.create 32
+      and pending = Stack.create () in
+      Stack.push j.edge.drv_path pending;
+      while not (Stack.is_empty pending) do
+        let drv = Stack.pop pending in
+        if not (Hashtbl.mem seen drv)
+        then (
+          Hashtbl.add seen drv ();
+          let attrs =
+            Option.value (Hashtbl.find_opt t.attribution drv) ~default:[]
+          in
+          Hashtbl.replace t.attribution drv (j.attrs @ attrs);
+          match Plan.find t.graph drv with
+          | None -> ()
+          | Some node ->
+            List.iter node.inputs ~f:(fun (edge : Plan.edge) ->
+              if edge.outputs <> [] then Stack.push edge.drv_path pending))
+      done);
   Hashtbl.iter
     (fun drv attrs ->
        Hashtbl.replace
@@ -363,6 +365,22 @@ let transition t (j : job) state =
     ];
   checkpoint t
 
+let skip_cached t (j : job) ~is_local =
+  j.cache <- (if is_local then "local" else "cached");
+  if is_local && t.config.copy_to <> None
+  then Hashtbl.replace t.candidates j.edge.drv_path ();
+  transition t j "cached"
+
+let pending_roots t =
+  roots t
+  |> List.filter_map ~f:(fun (j : job) ->
+    if j.state = "queued" then Some j.edge else None)
+
+let skip_available_roots t =
+  List.iter (roots t) ~f:(fun (j : job) ->
+    if j.state = "queued" && complete_outputs t j.edge cached
+    then skip_cached t j ~is_local:(complete_outputs t j.edge local))
+
 let refresh_local t process_mgr paths =
   let paths = List.sort_uniq ~cmp:String.compare paths in
   let infos, error = Backend.path_info process_mgr paths in
@@ -401,6 +419,26 @@ let probe t process_mgr stores ~fresh paths =
     then set_availability t p (Hashtbl.find observed p))
 
 let make_plan t process_mgr stores =
+  (* The evaluator already checked every output of cached roots. Only inspect
+     roots that still need work, in one batch, before expanding any graphs. *)
+  probe
+    t
+    process_mgr
+    stores
+    ~fresh:false
+    (List.concat_map (pending_roots t) ~f:(root_paths t));
+  skip_available_roots t;
+  let work_roots = pending_roots t in
+  (if work_roots <> []
+   then
+     let graph =
+       Backend.graph
+         process_mgr
+         (List.map work_roots ~f:(fun (e : Plan.edge) -> e.drv_path))
+     in
+     (* Keep the evaluator's shallow nodes for skipped roots and its output
+        paths for fixed-output forms omitted by derivation-show JSON. *)
+     t.graph <- Plan.merge t.graph graph);
   let visited = Hashtbl.create 128 in
   let rec walk edges =
     let edges =
@@ -419,7 +457,8 @@ let make_plan t process_mgr stores =
         process_mgr
         stores
         ~fresh:false
-        (List.concat_map edges ~f:(root_paths t));
+        (List.concat_map edges ~f:(root_paths t)
+        |> List.filter ~f:(fun path -> not (Hashtbl.mem t.available path)));
       let next =
         List.concat_map edges ~f:(fun e ->
           if complete_outputs t e cached
@@ -431,30 +470,47 @@ let make_plan t process_mgr stores =
       in
       walk next)
   in
-  walk t.roots;
+  walk work_roots;
+  skip_available_roots t;
+  if work_roots <> [] then index_graph t;
+  let work_roots = pending_roots t in
   let references_seen = Hashtbl.create 128 in
-  let rec references () =
+  let rec references paths =
     let paths =
-      Hashtbl.to_seq_values t.available
-      |> List.of_seq
-      |> List.concat_map ~f:(function Plan.Cached i -> i.references | _ -> [])
+      paths
       |> List.sort_uniq ~cmp:String.compare
       |> List.filter ~f:(fun p ->
         if Hashtbl.mem references_seen p
         then false
         else (
           Hashtbl.add references_seen p ();
-          not (cached (availability t p))))
+          true))
     in
     if paths <> []
     then (
-      probe t process_mgr stores ~fresh:false paths;
-      references ())
+      probe
+        t
+        process_mgr
+        stores
+        ~fresh:false
+        (List.filter paths ~f:(fun path -> not (Hashtbl.mem t.available path)));
+      references
+        (List.concat_map paths ~f:(fun path ->
+           match availability t path with
+           | Plan.Cached info -> info.references
+           | Local | Missing -> [])))
   in
-  references ();
+  (* Cached requests are skipped, so their runtime closure is not downloaded.
+     Follow references only from substitutes needed by the remaining builds. *)
+  let required =
+    Plan.compute t.graph ~roots:work_roots ~availability:(availability t)
+  in
+  references
+    (List.map required.downloads ~f:(fun (d : Plan.download) -> d.path));
   let plan =
-    Plan.compute t.graph ~roots:t.roots ~availability:(availability t)
+    Plan.compute t.graph ~roots:work_roots ~availability:(availability t)
   in
+  let plan = { plan with roots = t.roots } in
   t.plan <- Plan.to_yojson plan;
   Json.atomic_write (Filename.concat t.config.report_dir "plan.json") t.plan;
   Option.iter
@@ -496,8 +552,12 @@ let make_plan t process_mgr stores =
        | None -> failwith ("Unknown attribute for --explain: " ^ attr)
        | Some j ->
          let p =
-           Plan.compute t.graph ~roots:[ j.edge ] ~availability:(availability t)
+           Plan.compute
+             t.graph
+             ~roots:(if j.state = "cached" then [] else [ j.edge ])
+             ~availability:(availability t)
          in
+         let p = { p with roots = [ j.edge ] } in
          let paths =
            List.filter_map p.builds ~f:(fun (n : Plan.node) ->
              Option.map
@@ -582,7 +642,20 @@ let evaluate t process_mgr =
               }
             in
             Hashtbl.add t.jobs drv job;
-            event t "evaluated" [ "drvPath", `String drv; "attr", `String attr ])
+            event t "evaluated" [ "drvPath", `String drv; "attr", `String attr ];
+            if
+              (job.cache = "local" || job.cache = "cached")
+              && complete_outputs t edge (fun _ -> true)
+            then (
+              let is_local = job.cache = "local" in
+              if is_local
+              then
+                List.iter (root_paths t edge) ~f:(fun path ->
+                  set_availability t path Plan.Local);
+              (* Do not invent remote reference metadata here: a cached root can
+                 also be needed by an uncached root, in which case its real
+                 metadata must be probed while planning that build. *)
+              skip_cached t job ~is_local))
     | exception Yojson.Json_error error ->
       add_error
         "<evaluation>"
@@ -609,33 +682,7 @@ let evaluate t process_mgr =
   t.eval_complete <- Backend.successful result;
   if not t.eval_complete then add_error "<evaluation>" (Backend.error result);
   t.roots <- List.map (roots t) ~f:(fun j -> j.edge);
-  checkpoint t;
-  if t.roots <> []
-  then (
-    let evaluated = t.graph in
-    t.graph <-
-      Backend.graph
-        process_mgr
-        (List.map t.roots ~f:(fun (e : Plan.edge) -> e.drv_path));
-    (* Evaluator paths also cover fixed-output forms lacking paths in the
-       JSON. *)
-    let nodes =
-      Plan.nodes t.graph
-      |> List.map ~f:(fun (n : Plan.node) ->
-        match Plan.find evaluated n.drv_path with
-        | None -> n
-        | Some root ->
-          { n with
-            outputs =
-              List.map n.outputs ~f:(fun (name, path) ->
-                ( name
-                , match path with
-                  | Some _ -> path
-                  | None -> Option.join (List.assoc_opt name root.outputs) ))
-          })
-    in
-    t.graph <- Plan.of_nodes nodes;
-    index_graph t)
+  checkpoint t
 
 let get_activity t drv =
   match Hashtbl.find_opt t.activities drv with
@@ -704,13 +751,14 @@ let mark_failure t ~kind ~message ~log ~excerpt drv =
     a.state <- "failed";
     let affected =
       roots t
-      |> List.filter ~f:(fun j ->
-        Plan.explain
-          t.graph
-          ~availability:(availability t)
-          ~root:j.edge
-          ~target:drv
-        <> None)
+      |> List.filter ~f:(fun (j : job) ->
+        j.state <> "cached"
+        && Plan.explain
+             t.graph
+             ~availability:(availability t)
+             ~root:j.edge
+             ~target:drv
+           <> None)
       |> List.concat_map ~f:(fun j -> j.attrs)
     in
     let failure =
@@ -1179,13 +1227,7 @@ let scheduler t process_mgr clock stores =
               List.filter batch ~f:(fun j ->
                 if complete_outputs t j.edge cached
                 then (
-                  j.cache <-
-                    (if complete_outputs t j.edge local
-                     then "local"
-                     else "cached");
-                  if complete_outputs t j.edge local
-                  then Hashtbl.replace t.candidates j.edge.drv_path ();
-                  transition t j "cached";
+                  skip_cached t j ~is_local:(complete_outputs t j.edge local);
                   false)
                 else
                   match
@@ -1446,7 +1488,11 @@ let run config env =
                     t.status <- "planning";
                     checkpoint t;
                     let planning_started = now () in
-                    let stores = Backend.substituters process_mgr in
+                    let stores =
+                      if pending_roots t = []
+                      then []
+                      else Backend.substituters process_mgr
+                    in
                     make_plan t process_mgr stores;
                     t.context <-
                       ("planningSeconds", `Float (now () -. planning_started))
