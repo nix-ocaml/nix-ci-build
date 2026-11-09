@@ -65,7 +65,13 @@ let job ?(cache_status = "notBuilt") ?failure ?(queue = 0.) attr drv state =
      ]
     @ match failure with None -> [] | Some value -> [ "failure", value ])
 
-let snapshot ?(status = "failure") ?(roots = []) ?(errors = []) jobs =
+let snapshot
+      ?(status = "failure")
+      ?(roots = [])
+      ?(errors = [])
+      ?(cache_reuse = [])
+      jobs
+  =
   `Assoc
     [ "schemaVersion", `Int 1
     ; "status", `String status
@@ -82,6 +88,7 @@ let snapshot ?(status = "failure") ?(roots = []) ?(errors = []) jobs =
     ; "rootFailures", `List roots
     ; "derivations", `List []
     ; "uploads", `List []
+    ; "cacheReuse", `List cache_reuse
     ; "futureField", `Assoc [ "ignored", `Bool true ]
     ]
 
@@ -357,6 +364,162 @@ let test_unknown_producer_downloads () =
     (not (contains progress "second-runtime-output"))
     "completed downloads should not be reported as active"
 
+let cache_import ?(error = "") name state =
+  `Assoc
+    [ "drvPath", `String ("/nix/store/" ^ name ^ ".drv")
+    ; "name", `String name
+    ; ( "paths"
+      , `List
+          [ `String ("/nix/store/" ^ name ^ "-out")
+          ; `String ("/nix/store/" ^ name ^ "-dev")
+          ] )
+    ; "source", `String "https://cache.example/<cache>|name"
+    ; "state", `String state
+    ; "seconds", `Float 65.
+    ; "error", `String error
+    ; "logPath", `String ("logs/cache-import-" ^ name ^ ".log")
+    ; "neededBy", `List [ `String "piaf"; `String "caqti" ]
+    ]
+
+let test_cache_imports () =
+  let report =
+    snapshot
+      ~status:"success"
+      ~cache_reuse:
+        [ cache_import "ocaml" "imported"
+        ; cache_import "curl" "importing"
+        ; cache_import
+            ~error:"\027[31mHTTP <timeout> | retry\027[0m\n::error::untrusted"
+            "libpq"
+            "failed"
+        ; cache_import "rustc" "cancelled"
+        ]
+      [ job "piaf" "/nix/store/piaf.drv" "built" ]
+  in
+  let summary = Report.render_summary report in
+  check
+    (contains
+       summary
+       "**1 imported**, **1 active**, **1 warnings**, **1 cancelled**")
+    "dependency imports should count each state independently";
+  check
+    (contains
+       summary
+       "**0 root failures**, **0 evaluation errors**, **0 upload failures**")
+    "opportunistic import warnings must not become build or upload failures";
+  check
+    (contains summary "Status: <code>success</code>")
+    "import warnings must preserve the engine's successful build status";
+  check
+    (contains summary "warning (import failed)")
+    "failed imports must be explicitly labelled warnings";
+  check
+    (contains
+       summary
+       "HTTP &lt;timeout&gt; &#124; retry&#10;::error::untrusted")
+    "import errors must be escaped and terminal colors removed";
+  check
+    (contains summary "https://cache.example/&lt;cache&gt;&#124;name")
+    "cache source metadata must be escaped";
+  check
+    (contains summary "/nix/store/ocaml-out"
+    && contains summary "/nix/store/ocaml-dev")
+    "multi-output imports must preserve their required output paths";
+  check
+    (contains
+       summary
+       "Log in report artifact: <code>logs/cache-import-libpq.log")
+    "import failures must point to their captured logs";
+  check
+    (not (contains summary "nix build"))
+    "opportunistic imports must not be presented as failed build reproductions";
+  let progress = String.concat ~sep:"\n" (Report.render_progress report) in
+  check
+    (contains progress "cache imports 1 (1 active, 1 warnings)")
+    "heartbeat must distinguish completed imports, active imports and warnings";
+  check
+    (contains progress "cache import curl (1m05s) → piaf, caqti")
+    "active imports should identify the dependency, elapsed time and consumers";
+  check
+    ((not (contains progress "cache import ocaml"))
+    && not (contains progress "cache import rustc"))
+    "completed and cancelled imports must not appear as active";
+  let cancelled =
+    snapshot
+      ~status:"cancelled"
+      ~cache_reuse:
+        [ cache_import ~error:"Dependency is already active" "rustc" "cancelled"
+        ]
+      []
+  in
+  check
+    (contains
+       (Report.render_summary cancelled)
+       "**0 imported**, **0 active**, **0 warnings**, **1 cancelled**")
+    "partial cancelled snapshots must retain cancelled import counts";
+  check
+    (contains
+       (Report.render_summary cancelled)
+       "Note: <code>Dependency is already active</code>")
+    "normal import cancellation reasons must not be labelled warnings";
+  check
+    (contains
+       (String.concat ~sep:"\n" (Report.render_progress (`Assoc [])))
+       "cache imports 0 (0 active, 0 warnings)")
+    "older snapshots without cacheReuse must remain readable"
+
+let test_cache_import_limits () =
+  let imports =
+    List.init ~len:80 ~f:(fun index ->
+      `Assoc
+        [ "drvPath", `String (Printf.sprintf "/nix/store/import-%03d.drv" index)
+        ; "state", `String "importing"
+        ; "source", `String (String.make 10000 '<')
+        ; "error", `String (String.make 10000 '|')
+        ; ( "paths"
+          , `List
+              (List.init ~len:100 ~f:(fun n ->
+                 `String (Printf.sprintf "/nix/store/output-%03d" n))) )
+        ; ( "neededBy"
+          , `List
+              (List.init ~len:100 ~f:(fun n ->
+                 `String (Printf.sprintf "package-%03d" n))) )
+        ])
+  in
+  let report =
+    snapshot
+      ~cache_reuse:
+        (imports
+        @ [ cache_import ~error:"timeout" "late-import-warning" "failed" ])
+      []
+  in
+  let summary = Report.render_summary report in
+  check
+    (String.length summary < 1024 * 1024)
+    "large import histories must remain below GitHub's summary limit";
+  check
+    (contains
+       summary
+       "Additional dependency imports are recorded in results.json")
+    "bounded import tables must point to complete machine-readable results";
+  check
+    (contains summary "import-000.drv"
+    && not (contains summary "import-079.drv"))
+    "unnamed imports should use their derivation paths within the table limit";
+  check
+    (contains summary "late-import-warning")
+    "import warnings should remain visible ahead of ordinary bounded details";
+  check
+    (contains summary "95 more" && not (contains summary "package-099"))
+    "large consumer and output lists should be bounded within each import";
+  let progress = String.concat ~sep:"\n" (Report.render_progress report) in
+  check
+    (contains progress "cache imports 0 (80 active, 1 warnings)")
+    "heartbeat aggregate counts must include imports omitted from detail lines";
+  check
+    (occurrences progress "  cache import " = 2)
+    "heartbeat import detail lines must stay bounded"
+
 let test_files () =
   with_directory (fun directory ->
     let report_directory = Filename.concat directory "nested/report" in
@@ -454,5 +617,7 @@ let () =
   test_activity ();
   test_lock_waits ();
   test_unknown_producer_downloads ();
+  test_cache_imports ();
+  test_cache_import_limits ();
   test_files ();
   print_endline "report tests passed"

@@ -21,6 +21,9 @@ let number = function
 let count name json = int_of_float (number (field name json))
 let state json = text "state" json
 
+let count_state name records =
+  List.length (List.filter records ~f:(fun record -> state record = name))
+
 let strings values =
   List.filter_map ~f:(function `String s -> Some s | _ -> None) values
 
@@ -326,6 +329,7 @@ let render_summary snapshot =
   let failures = roots snapshot in
   let eval_errors = items "errors" evaluation in
   let uploads = items "uploads" snapshot in
+  let cache_reuse = items "cacheReuse" snapshot in
   let failed_uploads =
     List.filter uploads ~f:(fun item -> state item = "failed")
   in
@@ -371,6 +375,17 @@ let render_summary snapshot =
        (List.length failures)
        (List.length eval_errors)
        (List.length failed_uploads));
+  if cache_reuse <> []
+  then
+    add
+      (Printf.sprintf
+         "\n\
+          Dependency cache imports: **%d imported**, **%d active**, **%d \
+          warnings**, **%d cancelled**.\n"
+         (count_state "imported" cache_reuse)
+         (count_state "importing" cache_reuse)
+         (count_state "failed" cache_reuse)
+         (count_state "cancelled" cache_reuse));
   let error = text "error" snapshot in
   if error <> "" then add ("\nRun error: " ^ code error ^ "\n");
   add
@@ -476,6 +491,63 @@ let render_summary snapshot =
         ; elapsed "seconds" upload
         ; code (text "error" upload)
         ]));
+  if cache_reuse <> []
+  then (
+    section "Opportunistic dependency imports";
+    add
+      "\n\
+       Import failures are warnings; normal builds continue. Counts and \
+       timings describe cache imports, not measured build savings.\n";
+    table [ "Dependency"; "State"; "Time"; "Needed by"; "Details" ];
+    let priority imported =
+      match state imported with
+      | "failed" -> 0
+      | "importing" -> 1
+      | "imported" -> 2
+      | _ -> 3
+    in
+    let visible =
+      List.stable_sort cache_reuse ~cmp:(fun a b ->
+        Int.compare (priority a) (priority b))
+      |> take 30
+    in
+    List.iter visible ~f:(fun imported ->
+      let paths = strings (items "paths" imported) in
+      let needed = unique (strings (items "neededBy" imported)) in
+      let compact values =
+        String.concat ~sep:", " (List.map (take 5 values) ~f:code)
+        ^
+        if List.length values > 5
+        then Printf.sprintf ", … (%d more)" (List.length values - 5)
+        else ""
+      in
+      let details =
+        [ (if text "source" imported = ""
+           then ""
+           else "Source: " ^ code (text "source" imported))
+        ; (if paths = [] then "" else "Import paths: " ^ compact paths)
+        ; (if text "error" imported = ""
+           then ""
+           else
+             (if state imported = "failed" then "Warning: " else "Note: ")
+             ^ code (text "error" imported))
+        ; log_reference context (text "logPath" imported)
+        ]
+        |> List.filter ~f:(fun detail -> detail <> "")
+        |> String.concat ~sep:"<br>"
+      in
+      row
+        [ code (activity_name imported)
+        ; code
+            (if state imported = "failed"
+             then "warning (import failed)"
+             else state imported)
+        ; elapsed "seconds" imported
+        ; compact needed
+        ; details
+        ]);
+    if List.length cache_reuse > 30
+    then add "\nAdditional dependency imports are recorded in results.json.\n");
   let blocked = List.filter jobs ~f:(fun job -> state job = "blocked") in
   if blocked <> []
   then (
@@ -637,6 +709,7 @@ let render_progress snapshot =
   in
   let evaluation = field "evaluation" snapshot in
   let uploads = items "uploads" snapshot in
+  let cache_reuse = items "cacheReuse" snapshot in
   let waits = items "waits" snapshot in
   let uploads_in name =
     List.length (List.filter uploads ~f:(fun upload -> state upload = name))
@@ -645,7 +718,8 @@ let render_progress snapshot =
     Printf.sprintf
       "evaluated %d attrs / %d derivations%s | cached %d | built %d | requests \
        %d | queued %d | failed %d | blocked %d | Nix lock waits: %d | uploads \
-       %d/%d (%d active, %d failed)"
+       %d/%d (%d active, %d failed) | cache imports %d (%d active, %d \
+       warnings)"
       (max
          (count "attrs" evaluation)
          (List.length (unique (List.concat_map jobs ~f:attrs))))
@@ -662,6 +736,9 @@ let render_progress snapshot =
       (List.length uploads)
       (uploads_in "uploading")
       (uploads_in "failed")
+      (count_state "imported" cache_reuse)
+      (count_state "importing" cache_reuse)
+      (count_state "failed" cache_reuse)
   in
   let active =
     List.filter (items "derivations" snapshot) ~f:(fun drv ->
@@ -709,7 +786,24 @@ let render_progress snapshot =
         (elapsed "seconds" wait)
         (shorten ~limit:80 (clean_terminal (text "requestId" wait))))
   in
-  (head :: lines) @ more @ wait_lines
+  let import_lines =
+    List.filter cache_reuse ~f:(fun imported -> state imported = "importing")
+    |> take 2
+    |> List.map ~f:(fun imported ->
+      let needed = strings (items "neededBy" imported) in
+      Printf.sprintf
+        "  cache import %s (%s)%s"
+        (shorten ~limit:160 (clean_terminal (activity_name imported)))
+        (elapsed "seconds" imported)
+        (if needed = []
+         then ""
+         else
+           " → "
+           ^ shorten
+               ~limit:200
+               (clean_terminal (String.concat ~sep:", " (take 3 needed)))))
+  in
+  (head :: lines) @ more @ wait_lines @ import_lines
 
 let workflow_escape ~property value =
   let output = Buffer.create (String.length value) in

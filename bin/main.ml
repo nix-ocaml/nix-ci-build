@@ -11,6 +11,7 @@ let main
       compare
       history
       heartbeat
+      cache_refresh
       batch_size
       retries
       _verbose
@@ -20,11 +21,13 @@ let main
     || batch_size < 1
     || retries < 0
     || heartbeat <= 0.
-    || not (Float.is_finite heartbeat)
+    || (not (Float.is_finite heartbeat))
+    || cache_refresh < 0.
+    || not (Float.is_finite cache_refresh)
   then (
     prerr_endline
       "jobs, batch-size and heartbeat must be positive; retries must be \
-       nonnegative";
+       nonnegative; cache-refresh must be finite and nonnegative";
     2)
   else
     let config =
@@ -38,6 +41,7 @@ let main
       ; compare
       ; history
       ; heartbeat
+      ; cache_refresh
       ; batch_size
       ; retries
       }
@@ -147,6 +151,17 @@ let command =
           ~docv:"N"
           ~doc:"Submit up to N related roots together; defaults to one.")
   in
+  let cache_refresh =
+    Arg.(
+      value
+      & opt float 30.
+      & info
+          [ "cache-refresh" ]
+          ~docv:"SECONDS"
+          ~doc:
+            "Refresh missing dependencies in configured caches while building; \
+             defaults to 30 seconds, or 0 to disable opportunistic imports.")
+  in
   let retries =
     Arg.(
       value
@@ -183,6 +198,7 @@ let command =
       $ compare
       $ history
       $ heartbeat
+      $ cache_refresh
       $ batch_size
       $ retries
       $ verbose)

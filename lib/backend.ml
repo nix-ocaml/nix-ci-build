@@ -245,6 +245,27 @@ let copy process_mgr ?(append = false) ~log_path ~destination path =
     ~log_path
     (nix [ "copy"; "--log-format"; "raw"; "--to"; destination; path ])
 
+let copy_from process_mgr ~log_path ~source paths =
+  (* Bare output paths cannot start a builder. A fresh lookup also avoids a
+     previous negative narinfo result hiding outputs published by another CI
+     runner since evaluation. Signature verification remains Nix's default. *)
+  run
+    process_mgr
+    ~input:(String.concat ~sep:"\n" paths ^ "\n")
+    ~capture:false
+    ~log_path
+    (nix
+       [ "copy"
+       ; "--log-format"
+       ; "raw"
+       ; "--from"
+       ; source
+       ; "--stdin"
+       ; "--option"
+       ; "narinfo-cache-negative-ttl"
+       ; "0"
+       ])
+
 let pin process_mgr ~root path =
   let r =
     run

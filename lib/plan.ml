@@ -10,6 +10,7 @@ type node =
   { drv_path : string
   ; name : string
   ; system : string
+  ; allow_substitutes : bool
   ; inputs : edge list
   ; outputs : (string * string option) list
   }
@@ -75,6 +76,7 @@ let merge left right =
          ; inputs = (if right.inputs = [] then left.inputs else right.inputs)
          ; name = (if right.name = "" then left.name else right.name)
          ; system = (if right.system = "" then left.system else right.system)
+         ; allow_substitutes = left.allow_substitutes && right.allow_substitutes
          })
     left
     right
@@ -123,9 +125,37 @@ let parse_node (drv_path, value) =
   let fields = object_fields drv_path value in
   let env = optional_object (drv_path ^ ".env") (field "env" fields) in
   let structured =
-    optional_object
-      (drv_path ^ ".structuredAttrs")
-      (field "structuredAttrs" fields)
+    match field "structuredAttrs" fields with
+    | Some value when value <> `Null ->
+      Some (object_fields (drv_path ^ ".structuredAttrs") value)
+    | _ ->
+      (match
+         optional_string (drv_path ^ ".env.__json") (field "__json" env)
+       with
+      | None -> None
+      | Some json ->
+        let context = drv_path ^ ".env.__json" in
+        let value =
+          try Yojson.Safe.from_string json with
+          | Yojson.Json_error message -> invalid context message
+        in
+        Some (object_fields context value))
+  in
+  let allow_substitutes =
+    match structured with
+    | Some fields ->
+      (match field "allowSubstitutes" fields with
+      | None -> true
+      | Some (`Bool value) -> value
+      | Some _ -> invalid (drv_path ^ ".allowSubstitutes") "expected a boolean")
+    | None ->
+      (match
+         optional_string
+           (drv_path ^ ".env.allowSubstitutes")
+           (field "allowSubstitutes" env)
+       with
+      | None -> true
+      | Some value -> value = "1")
   in
   let name =
     match optional_string (drv_path ^ ".name") (field "name" fields) with
@@ -166,7 +196,7 @@ let parse_node (drv_path, value) =
             in
             (match fallback env with
             | Some _ as path -> path
-            | None -> fallback structured)
+            | None -> fallback (Option.value structured ~default:[]))
           | path -> path
         in
         name, Option.map normalize_path path)
@@ -204,7 +234,7 @@ let parse_node (drv_path, value) =
       in
       normalize_edge { drv_path = input; outputs })
   in
-  { drv_path; name; system; inputs; outputs }
+  { drv_path; name; system; allow_substitutes; inputs; outputs }
 
 let of_yojson json =
   try
@@ -544,6 +574,7 @@ let to_yojson plan =
                [ "drvPath", `String node.drv_path
                ; "name", `String node.name
                ; "system", `String node.system
+               ; "allowSubstitutes", `Bool node.allow_substitutes
                ; "inputs", `List (List.map node.inputs ~f:edge_json)
                ; ( "outputs"
                  , `Assoc

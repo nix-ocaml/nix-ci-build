@@ -9,6 +9,7 @@ type node =
   { drv_path : string
   ; name : string
   ; system : string
+  ; allow_substitutes : bool
   ; inputs : edge list
   ; outputs : (string * string option) list
   }

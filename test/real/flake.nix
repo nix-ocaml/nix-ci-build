@@ -67,12 +67,47 @@
               dependencyConsumer = mk "dependency-consumer" ''
                 printf '%s\n' '${dependencyMulti}' > "$out"
               '' { };
+              # The test publishes reuseMulti only after this input has started
+              # building. Its FIFO keeps the consumer's Nix request alive while
+              # the dependency waits, without occupying a CPU with a busy loop.
+              reuseGate =
+                mk "reuse-gate"
+                  ''
+                    printf 'waiting\n' > "$startedMarker"
+                    IFS= read -r released < "$gate"
+                    printf 'gate complete\n' > "$out"
+                  ''
+                  {
+                    gate = "FIXTURE_REUSE_GATE";
+                    startedMarker = "FIXTURE_REUSE_STARTED";
+                  };
+              reuseMulti =
+                mk "reuse-multi"
+                  ''
+                    printf 'built\n' >> "$buildMarker"
+                    printf 'runtime dependency\n' > "$out"
+                    printf 'development dependency\n' > "$dev"
+                  ''
+                  {
+                    dependency = reuseGate;
+                    buildMarker = "FIXTURE_REUSE_BUILT";
+                    outputs = [
+                      "out"
+                      "dev"
+                    ];
+                    allowSubstitutes = true;
+                  };
+              reuseConsumer = mk "reuse-consumer" ''
+                printf '%s\n' '${reuseMulti}' > "$out"
+              '' { };
             in
             {
               success = { inherit left right multi; };
               failure = { inherit broken blocked independent; };
               cache = { inherit dependencyConsumer; };
               preparation = { inherit dependencyMulti; };
+              reuse = { inherit reuseConsumer; };
+              reusePreparation = { inherit reuseGate reuseMulti; };
               uploadFailure = { inherit independent; };
             };
         })

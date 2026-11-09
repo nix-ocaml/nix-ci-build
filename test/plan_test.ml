@@ -7,13 +7,19 @@ let out name = "/nix/store/" ^ name
 let edge ?(outputs = [ "out" ]) name : Plan.edge =
   { drv_path = drv name; outputs }
 
-let node ?(inputs = []) ?outputs name : Plan.node =
+let node ?(inputs = []) ?outputs ?(allow_substitutes = true) name : Plan.node =
   let outputs =
     match outputs with
     | None -> [ "out", Some (out name) ]
     | Some outputs -> outputs
   in
-  { drv_path = drv name; name; system = "x86_64-linux"; inputs; outputs }
+  { drv_path = drv name
+  ; name
+  ; system = "x86_64-linux"
+  ; allow_substitutes
+  ; inputs
+  ; outputs
+  }
 
 let cached ?(references = []) ?download_size ?nar_size () =
   Plan.Cached { references; download_size; nar_size }
@@ -302,6 +308,74 @@ let test_json_formats () =
     | Ok _ -> false)
     "unsupported dynamic dependencies must not silently disappear"
 
+let test_substitution_policy () =
+  let policy fields =
+    let json =
+      `Assoc [ drv "root", `Assoc (("outputs", `Assoc []) :: fields) ]
+    in
+    match Plan.of_yojson json with
+    | Error message -> failwith message
+    | Ok graph -> (Option.get (Plan.find graph (drv "root"))).allow_substitutes
+  in
+  check (policy []) "substitution should default to enabled";
+  check
+    (policy [ "env", `Assoc [ "preferLocalBuild", `String "1" ] ])
+    "preferring local builds must not disable substitution";
+  List.iter
+    (fun (value, expected) ->
+       check
+         (policy [ "env", `Assoc [ "allowSubstitutes", `String value ] ]
+         = expected)
+         "legacy substitution booleans must match Nix's string conversion")
+    [ "", false; "1", true; "true", false ];
+  List.iter
+    (fun value ->
+       check
+         (policy
+            [ "structuredAttrs", `Assoc [ "allowSubstitutes", `Bool value ] ]
+         = value)
+         "structured substitution booleans must be preserved";
+       check
+         (policy
+            [ ( "env"
+              , `Assoc
+                  [ ( "__json"
+                    , `String
+                        (Yojson.Safe.to_string
+                           (`Assoc [ "allowSubstitutes", `Bool value ])) )
+                  ] )
+            ]
+         = value)
+         "legacy __json structured attributes must be parsed")
+    [ false; true ];
+  check
+    (policy
+       [ "structuredAttrs", `Assoc []
+       ; "env", `Assoc [ "allowSubstitutes", `String "" ]
+       ])
+    "structured attributes take precedence over legacy environment settings";
+  let merged =
+    Plan.merge
+      (Plan.of_nodes [ node "root" ~allow_substitutes:false ])
+      (Plan.of_nodes [ node "root" ])
+  in
+  check
+    (not (Option.get (Plan.find merged (drv "root"))).allow_substitutes)
+    "an incomplete evaluator node must not enable forbidden substitution";
+  List.iter
+    (fun fields ->
+       check
+         (match
+            Plan.of_yojson
+              (`Assoc [ drv "root", `Assoc (("outputs", `Assoc []) :: fields) ])
+          with
+         | Error _ -> true
+         | Ok _ -> false)
+         "malformed structured substitution policy must not default to enabled")
+    [ [ "structuredAttrs", `Assoc [ "allowSubstitutes", `String "1" ] ]
+    ; [ "env", `Assoc [ "__json", `String "{" ] ]
+    ]
+
 let test_incomplete_and_cyclic_graph () =
   let graph = Plan.of_nodes [ node "root" ~inputs:[ edge "absent" ] ] in
   let plan = Plan.compute graph ~roots:[ edge "root" ] ~availability:missing in
@@ -427,6 +501,7 @@ let () =
   test_failure_ancestry ();
   test_priority_and_aging ();
   test_json_formats ();
+  test_substitution_policy ();
   test_incomplete_and_cyclic_graph ();
   test_reused_ranking_plans ();
   test_snapshot_and_merge ();
