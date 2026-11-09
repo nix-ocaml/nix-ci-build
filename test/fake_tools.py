@@ -373,7 +373,9 @@ def copy(args):
 
 
 def import_paths(source, paths):
-    options = CONFIG.get("import", {})
+    options = dict(CONFIG.get("import", {}))
+    for path in paths:
+        options.update(CONFIG.get("import_by_path", {}).get(path, {}))
     with state() as current:
         missing = [path for path in paths if path not in current["remote"].get(source, [])]
         current["import_attempts"] = current.get("import_attempts", 0) + 1

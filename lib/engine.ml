@@ -1334,9 +1334,42 @@ let cache_follower t process_mgr clock stores =
     List.iter (roots t) ~f:(fun j ->
       List.iter j.attrs ~f:(fun attr -> Hashtbl.replace jobs_by_attr attr j));
     let live (j : job) = j.state = "queued" || j.state = "submitted" in
+    let requirements = ref None in
+    let current_plan () =
+      match !requirements with
+      | Some (generation, plan, required) when generation = t.generation ->
+        plan, required
+      | _ ->
+        let roots =
+          List.filter (roots t) ~f:live |> List.map ~f:(fun j -> j.edge)
+        in
+        let plan = Plan.compute t.graph ~roots ~availability:(availability t) in
+        let required = Hashtbl.create 128 in
+        let add (edge : Plan.edge) =
+          if edge.outputs <> [] then Hashtbl.replace required edge.drv_path ()
+        in
+        List.iter roots ~f:add;
+        (* Keep direct inputs even once their requested output is local: an
+           in-flight import must still finish the derivation's other outputs.
+           Inputs below a now-local ancestor disappear from this pruned plan. *)
+        List.iter plan.builds ~f:(fun (node : Plan.node) ->
+          List.iter node.inputs ~f:add);
+        requirements := Some (t.generation, plan, required);
+        plan, required
+    in
     let needed drv =
+      let _, required = current_plan () in
+      Hashtbl.mem required drv
+    in
+    let needed_by_submitted drv =
+      (* Existing Nix requests may still await input goals below an imported
+         ancestor. Only queued consumers can safely use the newly pruned plan to
+         abandon an in-flight import. *)
       List.exists (needed_by t drv) ~f:(fun attr ->
-        Option.fold ~none:false ~some:live (Hashtbl.find_opt jobs_by_attr attr))
+        Option.fold
+          ~none:false
+          ~some:(fun (j : job) -> j.state = "submitted")
+          (Hashtbl.find_opt jobs_by_attr attr))
     in
     let busy drv =
       match Hashtbl.find_opt t.activities drv with
@@ -1452,7 +1485,8 @@ let cache_follower t process_mgr clock stores =
                           paths))
                    (fun () ->
                       let rec watch () =
-                        if busy drv || not (needed drv)
+                        if
+                          busy drv || not (needed drv || needed_by_submitted drv)
                         then `Stopped
                         else (
                           Eio.Time.sleep clock 0.1;
@@ -1503,13 +1537,7 @@ let cache_follower t process_mgr clock stores =
              | exn -> failed (Printexc.to_string exn)))
     in
     let poll ~sw () =
-      let pending = List.filter (roots t) ~f:live in
-      let plan =
-        Plan.compute
-          t.graph
-          ~roots:(List.map pending ~f:(fun j -> j.edge))
-          ~availability:(availability t)
-      in
+      let plan, _ = current_plan () in
       let candidates =
         List.filter plan.builds ~f:(fun (n : Plan.node) ->
           let check = check_for n.drv_path in

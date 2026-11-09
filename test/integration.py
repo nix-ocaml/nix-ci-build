@@ -310,6 +310,54 @@ class Integration(unittest.TestCase):
         self.assertIn("cache-import-start", kinds)
         self.assertIn("cache-import-finished", kinds)
 
+    def test_cache_reuse_only_imports_cached_roots_needed_by_active_work(self):
+        f = self.fixture
+        blocker = f.node("blocker", barrier="blocker")
+        target = f.job("packages.cached-target", f.node("cached-target", [blocker]), cache="cached")
+        unused = f.node("unused-dependency", behavior="fail")
+        skipped = f.job("packages.skipped", f.node("skipped", [unused], references=[]), cache="cached")
+        # Resolving this output discovers the unused branch, but verifying the
+        # cached root must exclude that branch from later follower polls.
+        f.config["jobs"][-1]["outputs"] = {"out": None}
+        f.cached = [f.output(skipped)]
+        witness = f.node("waiting-witness")
+        app = f.job("packages.app", f.node("app", [target, witness]))
+        with self.running_fixture("--cache-refresh", "0.05") as (process, log):
+            self.wait_for_build(process, blocker)
+            before = len(f.trace())
+            # The target's evaluator hit cannot stand in for metadata when
+            # another live root needs the target as a dependency.
+            f.publish([f.output(target), f.output(unused)])
+            imported = self.observe_snapshot(process, lambda snapshot: any(
+                entry["drvPath"] == target and entry["state"] == "imported"
+                for entry in self.imports(snapshot)
+            ))
+            self.assert_cached(self.jobs_by_attr(imported)["packages.cached-target"])
+            self.assert_cached(self.jobs_by_attr(imported)["packages.skipped"])
+            entry = next(entry for entry in self.imports(imported) if entry["drvPath"] == target)
+            self.assertEqual(entry["neededBy"], ["packages.app"])
+            after_import = len(f.trace())
+            self.observe_trace(process, lambda events: sum(
+                event["kind"] == "path_info" and event["store"] == REMOTE
+                and f.output(witness) in event["paths"] for event in events[after_import:]
+            ) >= 2)
+            queries = [event for event in f.trace()[before:] if event["kind"] == "path_info"]
+            self.assertFalse(any(f.output(unused) in event["paths"] for event in queries), queries)
+            self.assertEqual(f.state()["import_attempts"], 1)
+            f.release("blocker")
+            snapshot = self.finish_successfully(process, log)
+        self.assertEqual(f.state()["attempts"], {blocker: 1, witness: 1, app: 1})
+        self.assertEqual(f.state()["imported"], [f.output(target)])
+        self.assertEqual([entry["drvPath"] for entry in self.imports(snapshot)], [target])
+        jobs = self.jobs_by_attr(snapshot)
+        self.assert_cached(jobs["packages.cached-target"])
+        self.assert_cached(jobs["packages.skipped"])
+        self.assert_built(jobs["packages.app"])
+        graph_queries = [event for event in f.trace() if event["kind"] == "derivation_query"]
+        self.assertEqual(len(graph_queries), 1)
+        self.assertEqual(set(graph_queries[0]["roots"]), {app, skipped})
+        self.assertIn(unused, graph_queries[0]["returned"])
+
     def test_cache_reuse_waits_for_every_output_before_importing(self):
         f = self.fixture
         outputs = {"out": store_path("target"), "dev": store_path("target-dev")}
@@ -550,6 +598,112 @@ class Integration(unittest.TestCase):
         entry = next(entry for entry in self.imports(snapshot) if entry["drvPath"] == target)
         self.assertEqual(entry["state"], "cancelled")
 
+    def test_cache_reuse_cancels_queued_import_pruned_by_an_imported_ancestor(self):
+        f = self.fixture
+        blocker = f.job("packages.blocker", f.node("blocker", barrier="blocker"))
+        # --jobs 1 admits two Nix requests, so occupy both admission slots.
+        second_blocker = f.job("packages.second-blocker", f.node("second-blocker", barrier="blocker"))
+        dependency = f.node("build-only-dependency", references=[])
+        ancestor = f.node("ancestor", [dependency], references=[])
+        app = f.job("packages.app", f.node("app", [ancestor]))
+        f.config["import_by_path"] = {f.output(dependency): {"behavior": "hang_before_lock"}}
+        history = f.directory / "history.json"
+        history.write_text(json.dumps({
+            "version": 1,
+            "derivations": [{"drvPath": drv, "seconds": 10000} for drv in (blocker, second_blocker)],
+            "jobs": [],
+        }))
+        with self.running_fixture("--cache-refresh", "0.05", "--history", str(history)) as (process, log):
+            self.wait_for_build(process, blocker)
+            held = self.wait_for_build(process, second_blocker)
+            self.assertEqual(self.jobs_by_attr(held)["packages.app"]["state"], "queued")
+            f.publish([f.output(dependency)])
+            self.observe_trace(process, lambda events: any(
+                event["kind"] == "import_started" and event["paths"] == [f.output(dependency)]
+                for event in events
+            ))
+            f.publish([f.output(ancestor)])
+            self.observe_snapshot(process, lambda snapshot: any(
+                entry["drvPath"] == ancestor and entry["state"] == "imported"
+                for entry in self.imports(snapshot)
+            ))
+            cancelled = self.observe_snapshot(process, lambda snapshot: any(
+                entry["drvPath"] == dependency and entry["state"] == "cancelled"
+                for entry in self.imports(snapshot)
+            ))
+            self.assertEqual(self.jobs_by_attr(cancelled)["packages.app"]["state"], "queued")
+            self.assertTrue(any(
+                node["drvPath"] == blocker and node["state"] == "building"
+                for node in cancelled["derivations"]
+            ))
+            self.assertNotIn(dependency, f.state()["attempts"])
+            f.release("blocker")
+            snapshot = self.finish_successfully(process, log)
+        self.assert_built(self.jobs_by_attr(snapshot)["packages.app"])
+        self.assertEqual(snapshot["rootFailures"], [])
+        self.assertEqual(f.state()["attempts"], {blocker: 1, second_blocker: 1, app: 1})
+        self.assertEqual(f.state()["imported"], [f.output(ancestor)])
+        imports = {entry["drvPath"]: entry for entry in self.imports(snapshot)}
+        self.assertEqual(imports[dependency]["state"], "cancelled")
+        self.assertEqual(imports[ancestor]["state"], "imported")
+        self.assertTrue(any(
+            event["type"] == "cache-import-finished" and event["drvPath"] == dependency
+            and event["state"] == "cancelled" for event in f.events()
+        ))
+
+    def test_cache_reuse_preserves_submitted_dependency_import_after_ancestor_import(self):
+        f = self.fixture
+        gate = f.node("gate", barrier="gate")
+        dependency = f.node("build-only-dependency", [gate], references=[])
+        ancestor = f.node("ancestor", [dependency], references=[])
+        app = f.job("packages.app", f.node("app", [ancestor]))
+        f.config["import_by_path"] = {f.output(dependency): {"barrier": "dependency-import"}}
+        with self.running_fixture("--cache-refresh", "0.05") as (process, log):
+            self.wait_for_build(process, gate)
+            f.publish([f.output(dependency)])
+            self.observe_trace(process, lambda events: any(
+                event["kind"] == "barrier_waiting" and event["name"] == "dependency-import"
+                for event in events
+            ))
+            f.publish([f.output(ancestor)])
+            self.observe_snapshot(process, lambda snapshot: any(
+                entry["drvPath"] == ancestor and entry["state"] == "imported"
+                for entry in self.imports(snapshot)
+            ))
+            # Nix already committed to this dependency walk. Give the import
+            # watcher several event-loop turns before releasing the useful copy.
+            log.flush()
+            log.seek(0)
+            heartbeats = log.read().count("evaluated ")
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                log.seek(0)
+                if log.read().count("evaluated ") >= heartbeats + 3:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("engine did not progress while the useful import was held")
+            held = f.snapshot()
+            self.assertEqual(self.jobs_by_attr(held)["packages.app"]["state"], "submitted")
+            entry = next(entry for entry in self.imports(held) if entry["drvPath"] == dependency)
+            self.assertEqual(entry["state"], "importing")
+            f.release("dependency-import")
+            imported = self.observe_snapshot(process, lambda snapshot: any(
+                entry["drvPath"] == dependency and entry["state"] == "imported"
+                for entry in self.imports(snapshot)
+            ))
+            self.assertEqual(self.jobs_by_attr(imported)["packages.app"]["state"], "submitted")
+            self.assertEqual(f.state()["attempts"], {gate: 1})
+            f.release("gate")
+            snapshot = self.finish_successfully(process, log)
+        self.assert_built(self.jobs_by_attr(snapshot)["packages.app"])
+        self.assertEqual(snapshot["rootFailures"], [])
+        self.assertEqual(f.state()["attempts"], {gate: 1, app: 1})
+        self.assertEqual(set(f.state()["imported"]), {f.output(ancestor), f.output(dependency)})
+        self.assertTrue(all(entry["state"] == "imported" for entry in self.imports(snapshot)))
+        finishes = [event for event in f.events() if event["type"] == "cache-import-finished" and event["drvPath"] == dependency]
+        self.assertEqual([event["state"] for event in finishes], ["imported"])
+
     def test_cache_reuse_bounds_concurrent_imports(self):
         f = self.fixture
         blocker = f.node("blocker", barrier="blocker")
@@ -647,7 +801,7 @@ class Integration(unittest.TestCase):
                 cache="cached",
             )
             f.cached.extend(outputs.values())
-        snapshot = self.success(f.run("--copy-to", DESTINATION))
+        snapshot = self.success(f.run("--copy-to", DESTINATION, "--cache-refresh", "0.05"))
         self.assertEqual(len(snapshot["jobs"]), 1000)
         self.assertTrue(snapshot["evaluation"]["complete"])
         for job in snapshot["jobs"]:
@@ -659,6 +813,11 @@ class Integration(unittest.TestCase):
             self.assertEqual(f.commands(command), [], command)
         self.assertEqual(f.state()["attempts"], {})
         self.assertEqual(snapshot["uploads"], [])
+        self.assertEqual(self.imports(snapshot), [])
+        self.assertFalse(any(
+            event["type"] == "cache-refresh" or event["type"].startswith("cache-import")
+            for event in f.events()
+        ))
 
     def test_stale_negative_cache_status_is_rechecked_in_batches_before_graph(self):
         f = self.fixture

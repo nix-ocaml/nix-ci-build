@@ -47,8 +47,11 @@ cache traffic. Derivations that disable substitution or have unknown output
 paths are skipped.
 
 An import failure is a warning and normal builds continue. A background import
-is cancelled when Nix starts building or downloading that dependency, or when
-the main builds finish. Compiler builds are never cancelled to pursue a cache import.
+is cancelled when Nix starts building or downloading that dependency, when it
+is no longer needed by queued or running requests, or when the main builds
+finish. New cache hits can prune imports for queued requests; imports needed
+by running requests continue because Nix may already be waiting on those inputs.
+Running builds are never cancelled to pursue a cache import.
 `--dry-run` does not import outputs.
 
 ## Understanding progress
