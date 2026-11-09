@@ -23,6 +23,10 @@ Evaluation completes before building begins. This lets the scheduler inspect the
 whole dependency graph, combine attribute aliases, and rank the work globally.
 Older versions began builds while evaluation was still running.
 
+Requests whose outputs are already local or cached are skipped during
+evaluation. Only requests that still need work expand their dependency graphs;
+the plan counts downloads needed for those builds, excluding skipped requests.
+
 Ready requests are prioritized using shared missing dependencies, estimated
 critical-path duration, and time spent waiting. Nix still owns realization of
 each derivation and shares dependency work between requests.

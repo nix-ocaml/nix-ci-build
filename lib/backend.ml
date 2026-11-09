@@ -191,7 +191,13 @@ let path_info process_mgr ?store ?(fresh = false) paths =
   then [], None
   else
     let options =
-      (match store with None -> [] | Some s -> [ "--store"; s ])
+      (match store with
+        | None ->
+          (* Even path-info's read-only installable resolution calls Nix's
+             substitution planner. A local validity check must not query remote
+             caches or walk the download closure of every missing output. *)
+          [ "--option"; "substituters"; "" ]
+        | Some s -> [ "--store"; s ])
       @ if fresh then [ "--option"; "narinfo-cache-negative-ttl"; "0" ] else []
     in
     let json, result =

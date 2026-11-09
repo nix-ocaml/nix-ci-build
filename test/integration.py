@@ -241,6 +241,178 @@ class Integration(unittest.TestCase):
         self.assert_built(jobs["packages.fresh"])
         self.assertEqual(f.state()["attempts"], {fresh: 1})
 
+    def test_large_cached_set_skips_graph_and_store_queries(self):
+        f = self.fixture
+        build_branch = f.node("unused-build-leaf", behavior="fail")
+        runtime_branch = f.node("unused-runtime-leaf", references=[])
+        for index in range(24):
+            build_branch = f.node("unused-build-%02d" % index, [build_branch])
+            runtime_branch = f.node(
+                "unused-runtime-%02d" % index,
+                references=[f.output(runtime_branch)],
+            )
+        for index in range(1000):
+            name = "cached-%04d" % index
+            outputs = {"out": store_path(name)}
+            if index % 3 == 0:
+                outputs["dev"] = store_path(name + "-dev")
+            f.job(
+                "packages." + name,
+                f.node(name, [build_branch], outputs=outputs,
+                       references=[f.output(runtime_branch)]),
+                cache="cached",
+            )
+            f.cached.extend(outputs.values())
+        snapshot = self.success(f.run("--copy-to", DESTINATION))
+        self.assertEqual(len(snapshot["jobs"]), 1000)
+        self.assertTrue(snapshot["evaluation"]["complete"])
+        for job in snapshot["jobs"]:
+            self.assert_cached(job)
+        self.assertEqual(len(snapshot["plan"]["roots"]), 1000)
+        for field in ("builds", "downloads", "unknown"):
+            self.assertEqual(snapshot["plan"][field], [], field)
+        for command in ("derivation", "path-info", "build", "copy"):
+            self.assertEqual(f.commands(command), [], command)
+        self.assertEqual(f.state()["attempts"], {})
+        self.assertEqual(snapshot["uploads"], [])
+
+    def test_stale_negative_cache_status_is_rechecked_in_batches_before_graph(self):
+        f = self.fixture
+        compiler = f.node("unused-compiler", behavior="fail")
+        outputs = set()
+        for index in range(160):
+            name = "now-cached-%03d" % index
+            node_outputs = {"out": store_path(name)}
+            if index % 7 == 0:
+                node_outputs["dev"] = store_path(name + "-dev")
+            f.job("packages." + name, f.node(name, [compiler], outputs=node_outputs))
+            outputs.update(node_outputs.values())
+            (f.local if index % 4 == 0 else f.cached).extend(node_outputs.values())
+        snapshot = self.success(f.run("--dry-run"))
+        for job in snapshot["jobs"]:
+            self.assert_cached(job)
+        for field in ("builds", "downloads", "unknown"):
+            self.assertEqual(snapshot["plan"][field], [], field)
+        queries = [event for event in f.trace() if event["kind"] == "path_info"]
+        local = [event for event in queries if event["store"] is None]
+        remote = [event for event in queries if event["store"] == REMOTE]
+        self.assertGreater(len(local), 0)
+        self.assertGreater(len(remote), 0)
+        self.assertLessEqual(len(local), 2, local)
+        self.assertLessEqual(len(remote), 2, remote)
+        self.assertEqual({path for event in local for path in event["paths"]}, outputs)
+        self.assertEqual({path for event in remote for path in event["paths"]}, set(f.cached))
+        self.assertEqual(f.commands("derivation"), [])
+        self.assertEqual(f.commands("build"), [])
+        self.assertEqual(f.commands("copy"), [])
+
+    def test_mixed_cached_roots_only_plan_required_dependencies_and_runtime_closure(self):
+        f = self.fixture
+        unused = f.node("unused-compiler", behavior="fail")
+        unused_runtime = f.node("unused-runtime", references=[])
+        skipped = f.job(
+            "packages.skipped", f.node("skipped", [unused], references=[f.output(unused_runtime)]),
+            cache="cached",
+        )
+        build_tool = f.node("compiler-build-tool", behavior="fail")
+        runtime_leaf = f.node("runtime-leaf", references=[], narSize=400, downloadSize=200)
+        runtime = f.node("runtime", references=[f.output(runtime_leaf)], narSize=1000, downloadSize=500)
+        dependency = f.job(
+            "packages.compiler",
+            f.node("compiler", [build_tool], references=[f.output(runtime)],
+                   outputs={"out": store_path("compiler"), "dev": store_path("compiler-dev")},
+                   narSize=4000, downloadSize=2000),
+            cache="cached",
+        )
+        local = f.node("local-input", references=[])
+        app = f.job("packages.app", f.node("app", [dependency, local]))
+        f.local = [f.output(local)]
+        f.cached = [
+            f.output(skipped), f.output(unused_runtime), f.output(dependency),
+            f.output(dependency, "dev"), f.output(runtime), f.output(runtime_leaf),
+        ]
+        snapshot = self.success(f.run("--dry-run"))
+        jobs = self.jobs_by_attr(snapshot)
+        self.assert_cached(jobs["packages.skipped"])
+        self.assert_cached(jobs["packages.compiler"])
+        self.assertNotIn(jobs["packages.app"]["state"], ("cached", "local", "substituted"))
+        graph_queries = [event for event in f.trace() if event["kind"] == "derivation_query"]
+        self.assertEqual(len(graph_queries), 1)
+        self.assertEqual(graph_queries[0]["roots"], [app])
+        self.assertEqual(set(graph_queries[0]["returned"]), {app, dependency, local, build_tool})
+        plan = snapshot["plan"]
+        self.assertEqual({node["drvPath"] for node in plan["builds"]}, {app})
+        downloads = {item["path"]: item for item in plan["downloads"]}
+        self.assertEqual(set(downloads), {f.output(dependency), f.output(runtime), f.output(runtime_leaf)})
+        self.assertEqual(downloads[f.output(dependency)]["downloadSize"], 2000)
+        self.assertEqual(downloads[f.output(runtime)]["narSize"], 1000)
+        self.assertEqual(downloads[f.output(runtime_leaf)]["downloadSize"], 200)
+        self.assertIn(f.output(local), plan["localOutputs"])
+        self.assertEqual(plan["unknown"], [])
+        queried = {path for event in f.trace() if event["kind"] == "path_info" for path in event["paths"]}
+        self.assertNotIn(f.output(skipped), queried)
+        self.assertNotIn(f.output(unused_runtime), queried)
+        local_queries = []
+        remote_queries = []
+        for command in f.commands("path-info"):
+            args = command["rawArgs"]
+            options = [args[index:index + 3] for index in range(len(args) - 2)]
+            if "--store" in args:
+                remote_queries.append(command)
+                self.assertEqual(args[args.index("--store") + 1], REMOTE)
+                self.assertNotIn(["--option", "substituters", ""], options)
+            else:
+                local_queries.append(command)
+                self.assertIn(["--option", "substituters", ""], options)
+        self.assertTrue(local_queries)
+        self.assertTrue(remote_queries)
+        self.assertEqual(f.commands("build"), [])
+        self.assertEqual(f.commands("copy"), [])
+
+    def test_partial_multioutput_cache_hit_still_requires_build(self):
+        f = self.fixture
+        compiler = f.node("compiler")
+        app = f.job("packages.app", f.node(
+            "app", [compiler], outputs={"out": store_path("app"), "dev": store_path("app-dev")},
+        ))
+        f.cached = [f.output(app)]
+        snapshot = self.success(f.run("--dry-run"))
+        self.assertEqual({node["drvPath"] for node in snapshot["plan"]["builds"]}, {app, compiler})
+        self.assertNotIn(self.jobs_by_attr(snapshot)["packages.app"]["state"], ("cached", "local", "substituted"))
+        self.assertTrue(f.commands("derivation"))
+
+    def test_cached_hint_with_unknown_output_path_does_not_skip_work(self):
+        f = self.fixture
+        app = f.job("packages.app", f.node(
+            "app", outputs={"out": store_path("app"), "dev": store_path("app-dev")},
+        ), cache="cached")
+        f.config["jobs"][0]["outputs"] = {"out": f.output(app), "dev": None}
+        f.cached = [f.output(app)]
+        snapshot = self.success(f.run("--dry-run"))
+        self.assertEqual({node["drvPath"] for node in snapshot["plan"]["builds"]}, {app})
+        self.assertNotIn(self.jobs_by_attr(snapshot)["packages.app"]["state"], ("cached", "local", "substituted"))
+        self.assertTrue(f.commands("derivation"))
+
+    def test_local_cached_root_outputs_are_uploaded_without_expanding_graph(self):
+        f = self.fixture
+        unused = f.node("unused-compiler", behavior="fail")
+        outputs = {"out": store_path("local"), "dev": store_path("local-dev")}
+        local = f.job("packages.local", f.node("local", [unused], outputs=outputs), cache="local")
+        remote = f.job("packages.remote", f.node("remote", [unused]), cache="cached")
+        f.local = list(outputs.values())
+        f.cached = [f.output(remote)]
+        snapshot = self.success(f.run("--copy-to", DESTINATION))
+        for job in snapshot["jobs"]:
+            self.assert_cached(job)
+        self.assertEqual(set(f.state()["copied"]), set(outputs.values()))
+        self.assertEqual(len(snapshot["uploads"]), 2)
+        self.assertTrue(all(upload["state"] == "uploaded" for upload in snapshot["uploads"]))
+        self.assertEqual(f.commands("derivation"), [])
+        self.assertEqual(f.commands("build"), [])
+        self.assertEqual(f.state()["attempts"], {})
+        for field in ("builds", "downloads", "unknown"):
+            self.assertEqual(snapshot["plan"][field], [], field)
+
     def test_plan_separates_downloads_from_builds(self):
         f = self.fixture
         downloaded = f.node("downloaded-compiler", narSize=4096, downloadSize=2048)
@@ -257,7 +429,7 @@ class Integration(unittest.TestCase):
 
     def test_cache_error_keeps_partial_hits_and_reports_warning(self):
         f = self.fixture
-        cached = f.job("packages.cached", f.node("cached"), cache="cached")
+        cached = f.job("packages.cached", f.node("cached"))
         missing = f.job("packages.missing", f.node("missing"))
         f.cached = [f.output(cached)]
         f.config["path_info_error"] = {
@@ -265,6 +437,7 @@ class Integration(unittest.TestCase):
             "message": "error: HTTP error 503 (Service Unavailable) querying fixture cache",
         }
         snapshot = self.success(f.run("--dry-run"))
+        self.assert_cached(self.jobs_by_attr(snapshot)["packages.cached"])
         self.assertEqual({node["drvPath"] for node in snapshot["plan"]["builds"]}, {missing})
         self.assertIn("503", "\n".join(snapshot["warnings"]))
 
@@ -499,6 +672,57 @@ class Integration(unittest.TestCase):
         self.assert_cached(self.jobs_by_attr(snapshot)["packages.cached"])
         self.assertEqual(len(snapshot["rootFailures"]), 1)
         self.assertEqual(snapshot["rootFailures"][0]["affected"], ["packages.broken"])
+        self.assertEqual(f.state()["attempts"], {compiler: 1})
+
+    def test_eval_cached_aliases_are_not_affected_without_store_metadata(self):
+        f = self.fixture
+        compiler = f.node("broken-compiler", behavior="fail")
+        f.job("packages.broken", f.node("broken", [compiler]))
+        cached = f.job("packages.cached", f.node("cached", [compiler]), cache="cached")
+        f.job("legacyPackages.cachedAlias", cached, cache="cached")
+        # The evaluator hit is trusted without querying its output. Failure
+        # attribution must therefore consult job state, not cache metadata.
+        snapshot = self.failure(f.run("--retries", "0"))
+        jobs = self.jobs_by_attr(snapshot)
+        self.assert_cached(jobs["packages.cached"])
+        self.assert_cached(jobs["legacyPackages.cachedAlias"])
+        self.assertEqual(
+            {attr for attr, job in jobs.items() if job["state"] == "blocked"},
+            {"packages.broken"},
+        )
+        self.assertEqual(len(snapshot["rootFailures"]), 1)
+        self.assertEqual(snapshot["rootFailures"][0]["drvPath"], compiler)
+        self.assertEqual(snapshot["rootFailures"][0]["affected"], ["packages.broken"])
+        queried = {path for event in f.trace() if event["kind"] == "path_info" for path in event["paths"]}
+        self.assertNotIn(f.output(cached), queried)
+        self.assertEqual(f.state()["attempts"], {compiler: 1})
+        events = [json.loads(line) for line in (f.report / "events.jsonl").read_text().splitlines()]
+        cached_states = [event["state"] for event in events if event["type"] == "job" and event["drvPath"] == cached]
+        self.assertTrue(cached_states)
+        self.assertEqual(set(cached_states), {"cached"})
+        self.assertEqual(
+            [event["failure"]["affected"] for event in events if event["type"] == "root-failure"],
+            [["packages.broken"]],
+        )
+
+    def test_graph_resolved_cached_root_is_excluded_from_dependency_needed_by(self):
+        f = self.fixture
+        compiler = f.node("broken-compiler", behavior="fail")
+        f.job("packages.broken", f.node("broken", [compiler]))
+        cached = f.job("packages.cached", f.node("cached", [compiler]), cache="cached")
+        # Evaluation cannot establish a complete cache hit until the graph
+        # supplies this output path and the store probe verifies it.
+        f.config["jobs"][-1]["outputs"] = {"out": None}
+        f.cached = [f.output(cached)]
+        snapshot = self.failure(f.run("--retries", "0"))
+        jobs = self.jobs_by_attr(snapshot)
+        self.assert_cached(jobs["packages.cached"])
+        self.assertEqual(jobs["packages.broken"]["state"], "blocked")
+        self.assertEqual(len(snapshot["rootFailures"]), 1)
+        self.assertEqual(snapshot["rootFailures"][0]["drvPath"], compiler)
+        self.assertEqual(snapshot["rootFailures"][0]["affected"], ["packages.broken"])
+        dependency = next(node for node in snapshot["derivations"] if node["drvPath"] == compiler)
+        self.assertEqual(dependency["neededBy"], ["packages.broken"])
         self.assertEqual(f.state()["attempts"], {compiler: 1})
 
     def test_successful_build_only_outputs_are_uploaded_when_parent_fails(self):
