@@ -146,6 +146,28 @@ def references_for_path(path):
     ])
 
 
+def check_validity(args):
+    paths = paths_from_args(args)
+    store = option(args, "--store")
+    record("validity_query", paths=paths, store=store, fresh="narinfo-cache-negative-ttl" in sys.argv)
+    failure = CONFIG.get("validity_error")
+    if failure and failure.get("store") == store:
+        if failure.get("stdout"):
+            print(failure["stdout"])
+        print(failure["message"], file=sys.stderr)
+        return failure.get("exit", 1)
+    with state() as current:
+        available = set(current["local"] if store is None else current["remote"].get(store, []))
+    invalid = [path for path in paths if path not in available]
+    if "--print-invalid" in args:
+        for path in invalid:
+            print(path)
+        return 0
+    if invalid:
+        print("error: path '%s' is not valid" % invalid[0], file=sys.stderr)
+    return 1 if invalid else 0
+
+
 def path_info(args):
     paths = paths_from_args(args)
     store = option(args, "--store")
@@ -193,17 +215,34 @@ def path_info(args):
             "registrationTime": 0,
             "ultimate": False,
         }
+    missing_output = CONFIG.get("path_info_missing_output") if missing else None
     if "--json" in args:
-        print(json.dumps(result))
+        if CONFIG.get("path_info_malformed_json"):
+            print('{"unfinished":')
+        elif missing_output == "partial":
+            # Exercise a valid but incomplete batch response.
+            hit = next(((path, info) for path, info in result.items() if info is not None), None)
+            print(json.dumps(dict([hit]) if hit is not None else {}))
+        elif missing_output != "none":
+            print(json.dumps(result))
     else:
         for path in paths:
             if path in available:
                 print(path)
     if missing:
-        print("error: path is not valid in the requested store", file=sys.stderr)
+        if missing_output:
+            print("don't know how to build these paths:", file=sys.stderr)
+            for path in paths:
+                if path not in available:
+                    print("  " + path, file=sys.stderr)
+        first_missing = next(path for path in paths if path not in available)
+        print("error: path '%s' is not valid" % first_missing, file=sys.stderr)
     failure = CONFIG.get("path_info_error")
-    if failure and failure.get("store") == store:
+    if (failure and failure.get("store") == store
+            and (not failure.get("fresh_only") or "narinfo-cache-negative-ttl" in sys.argv)
+            and ("paths" not in failure or set(failure["paths"]) == set(paths))):
         print(failure["message"], file=sys.stderr)
+        record("path_info_failed", paths=paths, store=store, exit=failure.get("exit", 1))
         return failure.get("exit", 1)
     return 1 if missing else 0
 
@@ -426,11 +465,20 @@ def main():
     args = stripped_args(sys.argv[1:])
     record("command", tool=tool, args=args, rawArgs=sys.argv[1:])
     if args == ["--version"]:
+        response = CONFIG.get("version_responses", {}).get(tool)
+        if response is not None:
+            if response.get("stdout"):
+                print(response["stdout"])
+            if response.get("stderr"):
+                print(response["stderr"], file=sys.stderr)
+            return response.get("exit", 0)
         print("nix-eval-jobs 2.35.0" if tool == "nix-eval-jobs" else "nix (Nix) 2.35.3")
         return 0
     if tool == "nix-eval-jobs":
         return evaluate()
     if tool == "nix-store":
+        if "--check-validity" in args:
+            return check_validity(args)
         if "--add-root" in args:
             paths = paths_from_args(args)
             with state() as current:

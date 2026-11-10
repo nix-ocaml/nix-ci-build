@@ -69,7 +69,8 @@
               yojson
             ];
             postInstall = ''
-              wrapProgram "$out/bin/nix-ci-build" --prefix PATH : ${path}
+              wrapProgram "$out/bin/nix-ci-build" --prefix PATH : ${path} \
+                --set NIX_CI_BUILD_NIX_EVAL_JOBS_VERSION ${lib.escapeShellArg nix-eval-jobs.version}
             '';
           };
         }

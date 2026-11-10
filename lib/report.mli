@@ -49,6 +49,8 @@ val render_summary : Yojson.Safe.t -> string
 (** Pure renderers, also used by the report tests. *)
 
 val render_progress : Yojson.Safe.t -> string list
+(** Progress counts unique requested derivations. Activity durations cover the
+    whole observed activity, independently of the displayed current phase. *)
 
 val render_event :
    ?verbose:bool

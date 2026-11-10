@@ -143,7 +143,7 @@ let test_grouping () =
   in
   let summary = Report.render_summary (snapshot ~roots:[ root ] jobs) in
   check
-    (contains summary "**4 attributes**, **3 unique derivations**")
+    (contains summary "**4 attributes**, **3 unique root derivations**")
     "attributes and unique derivations must differ";
   check
     (occurrences summary "### <code>tzdata</code>" = 1)
@@ -275,7 +275,7 @@ let test_activity () =
     (contains progress "requests 1")
     "request counters should reflect submitted work";
   check
-    (contains progress "FETCH   git (1m05s) → piaf")
+    (contains progress "FETCH   git (1m05s total activity) → piaf")
     "progress should expose actual dependency activity"
 
 let test_lock_waits () =
@@ -314,7 +314,7 @@ let test_lock_waits () =
     (contains progress "Nix lock waits: 2")
     "heartbeat must count waits, including multiple waits for one request";
   check
-    (contains progress "BUILD   piaf (12.0s)")
+    (contains progress "BUILD   piaf (12.0s total activity)")
     "one request can build and wait simultaneously";
   check
     (contains
@@ -391,7 +391,7 @@ let test_unknown_producer_downloads () =
     "unknown producer outputs must not invent derivation build commands";
   let progress = String.concat ~sep:"\n" (Report.render_progress report) in
   check
-    (contains progress "FETCH   runtime-library (2.5s)")
+    (contains progress "FETCH   runtime-library (2.5s total activity)")
     "active output downloads must appear in progress";
   check
     (not (contains progress "second-runtime-output"))
@@ -743,7 +743,9 @@ let test_ranked_progress () =
   in
   let lines = Report.render_progress report in
   check
-    (contains (List.nth lines 1) "long-build / buildPhase (2m00s)")
+    (contains
+       (List.nth lines 1)
+       "long-build (2m00s total activity) / phase buildPhase")
     "longest active build should lead the detail lines";
   check
     (contains (List.nth lines 2) "short-build")
@@ -910,6 +912,83 @@ let test_plan_and_summary_presentation () =
     (occurrences summary "<details>" = occurrences summary "</details>")
     "summary disclosure blocks must remain balanced"
 
+let test_count_units_and_activity_time () =
+  let report =
+    `Assoc
+      [ "status", `String "building"
+      ; ( "evaluation"
+        , `Assoc
+            [ "attrs", `Int 5
+            ; "complete", `Bool true
+            ; ( "errors"
+              , `List
+                  [ `Assoc
+                      [ "attr", `String "invalid-one"
+                      ; "error", `String "missing input"
+                      ]
+                  ; `Assoc
+                      [ "attr", `String "invalid-two"
+                      ; "error", `String "missing input"
+                      ]
+                  ] )
+            ] )
+      ; ( "jobs"
+        , `List
+            [ job
+                ~cache_status:"cached"
+                "shared"
+                "/nix/store/shared.drv"
+                "cached"
+            ; job
+                ~cache_status:"cached"
+                "shared-alias"
+                "/nix/store/shared.drv"
+                "cached"
+            ; job "compiler" "/nix/store/compiler.drv" "submitted"
+            ] )
+      ; ( "derivations"
+        , `List
+            [ `Assoc
+                [ "name", `String "compiler"
+                ; "state", `String "building"
+                ; "active", `Int 1
+                ; "seconds", `Float 52.1
+                ; "phase", `String "checkPhase"
+                ]
+            ] )
+      ]
+  in
+  with_report ~github_actions:false (fun renderer ->
+    let plan = capture_stdout (fun () -> Report.emit_plan renderer report) in
+    check
+      (contains
+         plan
+         "5 attributes evaluated · 2 unique root derivations (1 alias)")
+      "plans must distinguish attributes, unique roots and aliases without \
+       counting evaluation errors as aliases");
+  let progress = String.concat ~sep:"\n" (Report.render_progress report) in
+  check
+    (contains progress "1/2 root derivations complete")
+    "progress denominators must explicitly count deduplicated root derivations";
+  check
+    (contains progress "compiler (52.1s total activity) / phase checkPhase")
+    "activity duration must not appear to be the time spent in the current \
+     phase";
+  let summary = Report.render_summary report in
+  check
+    (contains
+       summary
+       "**5 attributes**, **2 unique root derivations** (**1 alias**)")
+    "summary counts and aliases must agree with the plan despite evaluation \
+     errors";
+  check
+    (contains summary "| Last phase | Total activity time |")
+    "summary phase metadata must be separate from total activity time";
+  check
+    (contains summary "| Package | Queue wait | Request time | Build time |"
+    && not (contains summary "Upload time"))
+    "request timings must omit the unpopulated upload-time column"
+
 let () =
   test_grouping ();
   test_workflow_commands ();
@@ -926,4 +1005,5 @@ let () =
   test_partial_evaluation_progress ();
   test_complete_groups_and_evaluation_errors ();
   test_plan_and_summary_presentation ();
+  test_count_units_and_activity_time ();
   print_endline "report tests passed"

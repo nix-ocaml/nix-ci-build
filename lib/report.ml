@@ -316,6 +316,29 @@ let deduplicate_jobs jobs =
         (`Assoc (("attrs", merged) :: List.remove_assoc "attrs" fields)));
   List.map (List.rev !order) ~f:(Hashtbl.find table)
 
+let alias_count jobs =
+  List.fold_left jobs ~init:0 ~f:(fun total job ->
+    total + max 0 (List.length (attrs job) - 1))
+
+let evaluation_counts snapshot jobs =
+  let evaluated =
+    max
+      (count "attrs" (field "evaluation" snapshot))
+      (List.length (unique (List.concat_map jobs ~f:attrs)))
+  in
+  let aliases = alias_count jobs in
+  Printf.sprintf
+    "%d attributes evaluated · %d unique root derivations%s"
+    evaluated
+    (List.length jobs)
+    (if aliases = 0
+     then ""
+     else
+       Printf.sprintf
+         " (%d %s)"
+         aliases
+         (if aliases = 1 then "alias" else "aliases"))
+
 let roots snapshot =
   let table = Hashtbl.create 16 in
   let order = ref [] in
@@ -474,11 +497,20 @@ let render_summary snapshot =
   let artifact = text "artifactUrl" context in
   if has_prefix "https://" artifact
   then add ("[Download full report and logs](<" ^ url artifact ^ ">)\n\n");
+  let aliases = alias_count jobs in
   add
     (Printf.sprintf
-       "Evaluated **%d attributes**, **%d unique derivations**. Evaluation %s.\n\n"
+       "Evaluated **%d attributes**, **%d unique root derivations**%s. \
+        Evaluation %s.\n\n"
        (max (count "attrs" evaluation) (List.length all_attrs))
        (List.length jobs)
+       (if aliases = 0
+        then ""
+        else
+          Printf.sprintf
+            " (**%d %s**)"
+            aliases
+            (if aliases = 1 then "alias" else "aliases"))
        (if field "complete" evaluation = `Bool true
         then "complete"
         else "incomplete"));
@@ -679,9 +711,16 @@ let render_summary snapshot =
     section "Slowest observed builds and downloads";
     add
       "\n\
-       Observed Nix activity time, including any downloads; package request \
-       time is reported separately.\n";
-    table [ "Derivation or output"; "Kind"; "State"; "Phase"; "Time" ];
+       Times cover the full observed activity, including any downloads; the \
+       last phase is shown for context. Package request time is reported \
+       separately.\n";
+    table
+      [ "Derivation or output"
+      ; "Kind"
+      ; "State"
+      ; "Last phase"
+      ; "Total activity time"
+      ];
     List.iter slow ~f:(fun drv ->
       row
         [ code (activity_name drv)
@@ -698,15 +737,13 @@ let render_summary snapshot =
         "\n\
          Request time can include Nix scheduling, dependency builds, and \
          downloads; it is not compilation time.\n";
-      table
-        [ "Package"; "Queue wait"; "Request time"; "Build time"; "Upload time" ];
+      table [ "Package"; "Queue wait"; "Request time"; "Build time" ];
       List.iter slow_requests ~f:(fun job ->
         row
           [ code (job_name job)
           ; elapsed "queueSeconds" job
           ; elapsed "activeSeconds" job
           ; elapsed "buildSeconds" job
-          ; elapsed "uploadSeconds" job
           ]));
   let queue_waits =
     ranked
@@ -898,10 +935,9 @@ let render_progress snapshot =
       status_line
         "EVAL"
         (Printf.sprintf
-           "%d attributes evaluated · %d cached · %d derivations discovered%s"
-           (count "attrs" evaluation)
+           "%s · %d cached%s"
+           (evaluation_counts snapshot jobs)
            (n "cached")
-           (List.length jobs)
            (if errors = 0
             then ""
             else Printf.sprintf " · %d evaluation errors" errors))
@@ -910,8 +946,8 @@ let render_progress snapshot =
       status_line
         "PLAN"
         (Printf.sprintf
-           "checking remaining dependencies · %d attributes · %d cached%s"
-           (count "attrs" evaluation)
+           "checking remaining dependencies · %s · %d cached%s"
+           (evaluation_counts snapshot jobs)
            (n "cached")
            (if errors = 0
             then ""
@@ -920,8 +956,8 @@ let render_progress snapshot =
       status_line
         "STATUS"
         (Printf.sprintf
-           "%d/%d complete · cached %d · built %d · requests %d · queued \
-            %d%s%s%s"
+           "%d/%d root derivations complete · cached %d · built %d · requests \
+            %d · queued %d%s%s%s"
            completed
            (List.length jobs)
            (n "cached")
@@ -959,12 +995,12 @@ let render_progress snapshot =
       status_line
         (active_phase activity)
         (display_name activity
-        ^ (if text "phase" activity = ""
-           then ""
-           else " / " ^ single_line ~limit:60 (text "phase" activity))
         ^ " ("
         ^ duration (activity_seconds activity)
-        ^ ")"
+        ^ " total activity)"
+        ^ (if text "phase" activity = ""
+           then ""
+           else " / phase " ^ single_line ~limit:60 (text "phase" activity))
         ^ consumers activity))
   in
   let more =
@@ -1318,10 +1354,9 @@ let emit_plan t snapshot =
        ~color:t.color
        (if errors > 0 then "WARN" else "PLAN")
        (Printf.sprintf
-          "%s%d attributes · %d cached · %d queued · %d builds · %d \
-           downloads%s%s"
+          "%s%s · %d cached · %d queued · %d builds · %d downloads%s%s"
           (if errors > 0 then "plan: " else "")
-          (count "attrs" (field "evaluation" snapshot))
+          (evaluation_counts snapshot jobs)
           (count_state "cached" jobs)
           (count_state "queued" jobs)
           (List.length builds)

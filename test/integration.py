@@ -119,7 +119,7 @@ class Fixture:
     def env(self):
         env = os.environ.copy()
         for key in list(env):
-            if key.startswith("GITHUB_") or key in ("NIX_CONFIG", "NIX_REMOTE"):
+            if key.startswith("GITHUB_") or key in ("NIX_CONFIG", "NIX_REMOTE", "NIX_CI_BUILD_NIX_EVAL_JOBS_VERSION"):
                 del env[key]
         env["NIX_CI_FIXTURE"] = str(self.directory)
         env["PATH"] = str(self.bin) + os.pathsep + env.get("PATH", "")
@@ -298,10 +298,15 @@ class Integration(unittest.TestCase):
 
     def test_cache_reuse_imports_dependency_published_during_running_request(self):
         f = self.fixture
+        f.config["path_info_missing_output"] = "none"
         blocker, target, app = self.waiting_cache_target()
         with self.running_fixture("--cache-refresh", "0.05") as (process, log):
             self.wait_for_build(process, blocker)
             self.assertTrue(any(event["kind"] == "substitution_miss" and event["drv"] == target for event in f.trace()))
+            self.observe_trace(process, lambda events: any(
+                event["kind"] == "validity_query" and event["store"] == REMOTE
+                and event["fresh"] and f.output(target) in event["paths"] for event in events
+            ))
             f.publish([f.output(target)])
             self.observe_snapshot(process, lambda snapshot: any(
                 entry["drvPath"] == target and entry["state"] == "imported"
@@ -318,6 +323,10 @@ class Integration(unittest.TestCase):
         self.assertEqual(len(commands), 1)
         self.assertIn("--stdin", commands[0]["args"])
         self.assertIn("narinfo-cache-negative-ttl", commands[0]["rawArgs"])
+        remote_validity = [event for event in f.trace() if event["kind"] == "command"
+                           and event["tool"] == "nix-store" and "--store" in event["args"]]
+        self.assertTrue(any("narinfo-cache-negative-ttl" in event["rawArgs"] for event in remote_validity))
+        self.assertEqual(snapshot["warnings"], [])
         kinds = [event["type"] for event in f.events()]
         self.assertIn("cache-import-start", kinds)
         self.assertIn("cache-import-finished", kinds)
@@ -831,6 +840,7 @@ class Integration(unittest.TestCase):
             self.assertEqual(snapshot["plan"][field], [], field)
         for command in ("derivation", "path-info", "build", "copy"):
             self.assertEqual(f.commands(command), [], command)
+        self.assertFalse(any(event["kind"] == "validity_query" for event in f.trace()))
         self.assertEqual(f.state()["attempts"], {})
         self.assertEqual(snapshot["uploads"], [])
         self.assertEqual(self.imports(snapshot), [])
@@ -856,9 +866,8 @@ class Integration(unittest.TestCase):
             self.assert_cached(job)
         for field in ("builds", "downloads", "unknown"):
             self.assertEqual(snapshot["plan"][field], [], field)
-        queries = [event for event in f.trace() if event["kind"] == "path_info"]
-        local = [event for event in queries if event["store"] is None]
-        remote = [event for event in queries if event["store"] == REMOTE]
+        local = [event for event in f.trace() if event["kind"] == "validity_query" and event["store"] is None]
+        remote = [event for event in f.trace() if event["kind"] == "path_info" and event["store"] == REMOTE]
         self.assertGreater(len(local), 0)
         self.assertGreater(len(remote), 0)
         self.assertLessEqual(len(local), 2, local)
@@ -912,22 +921,24 @@ class Integration(unittest.TestCase):
         self.assertEqual(downloads[f.output(runtime_leaf)]["downloadSize"], 200)
         self.assertIn(f.output(local), plan["localOutputs"])
         self.assertEqual(plan["unknown"], [])
-        queried = {path for event in f.trace() if event["kind"] == "path_info" for path in event["paths"]}
+        queried = {path for event in f.trace() if event["kind"] in ("path_info", "validity_query") for path in event["paths"]}
         self.assertNotIn(f.output(skipped), queried)
         self.assertNotIn(f.output(unused_runtime), queried)
-        local_queries = []
+        local_queries = [event for event in f.trace() if event["kind"] == "command"
+                         and event["tool"] == "nix-store" and "--check-validity" in event["args"]]
         remote_queries = []
         for command in f.commands("path-info"):
             args = command["rawArgs"]
             options = [args[index:index + 3] for index in range(len(args) - 2)]
-            if "--store" in args:
-                remote_queries.append(command)
-                self.assertEqual(args[args.index("--store") + 1], REMOTE)
-                self.assertNotIn(["--option", "substituters", ""], options)
-            else:
-                local_queries.append(command)
-                self.assertIn(["--option", "substituters", ""], options)
+            remote_queries.append(command)
+            self.assertIn("--store", args, "local probes must use direct validity, without installable resolution")
+            self.assertEqual(args[args.index("--store") + 1], REMOTE)
+            self.assertNotIn(["--option", "substituters", ""], options)
         self.assertTrue(local_queries)
+        for command in local_queries:
+            self.assertNotIn("--store", command["args"])
+            self.assertIn("--print-invalid", command["args"])
+            self.assertIn("--stdin", command["args"])
         self.assertTrue(remote_queries)
         self.assertEqual(f.commands("build"), [])
         self.assertEqual(f.commands("copy"), [])
@@ -995,14 +1006,208 @@ class Integration(unittest.TestCase):
         cached = f.job("packages.cached", f.node("cached"))
         missing = f.job("packages.missing", f.node("missing"))
         f.cached = [f.output(cached)]
+        noise = [store_path("unrelated-planner-path-%03d" % index) for index in range(70)]
+        cause = "error: HTTP error 503 (Service Unavailable) querying " + REMOTE
         f.config["path_info_error"] = {
             "store": REMOTE,
-            "message": "error: HTTP error 503 (Service Unavailable) querying fixture cache",
+            "message": cause + "\nthese 70 paths will be fetched (100 MiB download, 200 MiB unpacked):\n"
+                       + "\n".join("  " + path for path in noise),
         }
+        result = f.run("--dry-run")
+        snapshot = self.success(result)
+        self.assert_cached(self.jobs_by_attr(snapshot)["packages.cached"])
+        self.assertEqual({node["drvPath"] for node in snapshot["plan"]["builds"]}, {missing})
+        warnings = "\n".join(snapshot["warnings"])
+        self.assertIn(cause, warnings)
+        self.assertLess(len(warnings), 1024)
+        for rendered in (warnings, result.stdout, html.unescape(f.summary.read_text())):
+            self.assertIn("HTTP error 503", rendered)
+            self.assertIn(REMOTE, rendered)
+            self.assertNotIn("unrelated-planner-path", rendered)
+        details_files = list((f.report / "logs").glob("cache-query-*.json"))
+        self.assertTrue(details_files)
+        self.assertTrue(any("logs/" + path.name in warnings for path in details_files))
+        details = [json.loads(path.read_text()) for path in details_files]
+        relevant = next(item for item in details if cause in item["diagnostics"])
+        self.assertIn("path-info", relevant["command"])
+        self.assertIn(f.output(cached), relevant["paths"])
+        self.assertNotIn(cause, "\n".join(relevant["stderrTail"]), "the fixture must exercise diagnostics lost from the bounded tail")
+
+    def assert_missing_cache_query_preserves_hits(self, missing_output):
+        f = self.fixture
+        f.config["path_info_missing_output"] = missing_output
+        missing = set()
+        cached_attrs = []
+        for index in range(48):
+            attr = "packages.probe-%03d" % index
+            drv = f.job(attr, f.node("probe-%03d" % index))
+            if index % 3 == 0:
+                f.local.append(f.output(drv))
+                cached_attrs.append(attr)
+            elif index % 3 == 1:
+                f.cached.append(f.output(drv))
+                cached_attrs.append(attr)
+            else:
+                missing.add(drv)
+        result = f.run("--dry-run", "--heartbeat", "60")
+        snapshot = self.success(result)
+        jobs = self.jobs_by_attr(snapshot)
+        for attr in cached_attrs:
+            self.assert_cached(jobs[attr])
+        self.assertEqual({node["drvPath"] for node in snapshot["plan"]["builds"]}, missing)
+        self.assertEqual(snapshot["warnings"], [])
+        self.assertNotIn("don't know how to build", result.stdout)
+        self.assertNotIn("is not valid", f.summary.read_text())
+        trace = f.trace()
+        local = [event for event in trace if event["kind"] == "validity_query" and event["store"] is None]
+        remote = [event for event in trace if event["kind"] == "path_info"]
+        fallback = [event for event in trace if event["kind"] == "validity_query" and event["store"] == REMOTE]
+        self.assertTrue(local)
+        self.assertLessEqual(len(local), 2)
+        self.assertEqual(len(fallback), 1, fallback)
+        self.assertLessEqual(len(remote), 2, remote)
+        self.assertTrue(all(event["store"] == REMOTE for event in remote))
+        graphs = [event for event in trace if event["kind"] == "derivation_query"]
+        self.assertEqual(len(graphs), 1)
+        self.assertEqual(set(graphs[0]["roots"]), missing)
+        self.assertEqual(f.commands("build"), [])
+        self.assertEqual(f.commands("copy"), [])
+
+    def test_missing_cache_paths_without_json_preserve_all_available_hits(self):
+        self.assert_missing_cache_query_preserves_hits("none")
+
+    def test_partial_cache_json_preserves_initial_and_omitted_hits(self):
+        self.assert_missing_cache_query_preserves_hits("partial")
+
+    def test_malformed_cache_json_is_an_actionable_warning(self):
+        f = self.fixture
+        app = f.job("packages.app", f.node("app"))
+        f.config["path_info_malformed_json"] = True
+        result = f.run("--dry-run")
+        snapshot = self.success(result)
+        self.assertEqual({node["drvPath"] for node in snapshot["plan"]["builds"]}, {app})
+        warnings = "\n".join(snapshot["warnings"])
+        self.assertIn("json", warnings.lower())
+        self.assertIn(REMOTE, warnings)
+        self.assertIn("json", result.stdout.lower())
+        self.assertFalse(any(event["kind"] == "validity_query" and event["store"] == REMOTE for event in f.trace()))
+        details_files = list((f.report / "logs").glob("cache-query-*.json"))
+        self.assertTrue(details_files)
+        self.assertTrue(any("logs/" + path.name in warnings for path in details_files))
+        details = json.loads(details_files[0].read_text())
+        self.assertEqual(details["stdout"].strip(), '{"unfinished":')
+        self.assertIn("path-info", details["command"])
+        self.assertEqual(details["paths"], [f.output(app)])
+
+    def test_failed_fallback_validity_does_not_invent_cache_hits(self):
+        f = self.fixture
+        cached = f.job("packages.cached", f.node("cached"))
+        missing = f.job("packages.missing", f.node("missing"))
+        f.cached = [f.output(cached)]
+        f.config["path_info_missing_output"] = "none"
+        cause = "error: TLS certificate verification failed for " + REMOTE
+        f.config["validity_error"] = {"store": REMOTE, "exit": 7, "message": cause}
+        snapshot = self.success(f.run("--dry-run"))
+        self.assertEqual({node["drvPath"] for node in snapshot["plan"]["builds"]}, {cached, missing})
+        for job in snapshot["jobs"]:
+            self.assertNotIn(job["state"], ("cached", "local", "substituted"))
+        warnings = "\n".join(snapshot["warnings"])
+        self.assertIn(cause, warnings)
+        self.assertEqual(len([event for event in f.trace() if event["kind"] == "validity_query" and event["store"] == REMOTE]), 1)
+        self.assertEqual(len(f.commands("path-info")), 1)
+        details = [json.loads(path.read_text()) for path in (f.report / "logs").glob("cache-query-*.json")]
+        failed = next(item for item in details if "--check-validity" in item["command"])
+        self.assertEqual(failed["status"], "exit 7")
+        self.assertEqual(failed["stdout"], "")
+        self.assertEqual(set(failed["paths"]), {f.output(cached), f.output(missing)})
+
+    def test_abnormal_metadata_exit_is_not_suppressed_by_normal_misses(self):
+        f = self.fixture
+        cached = f.job("packages.cached", f.node("cached"))
+        missing = f.job("packages.missing", f.node("missing"))
+        f.cached = [f.output(cached)]
+        # path-info already emits the ordinary missing-path diagnostic. Its
+        # unexpected exit status must still surface even without another error.
+        f.config["path_info_error"] = {"store": REMOTE, "exit": 7, "message": ""}
         snapshot = self.success(f.run("--dry-run"))
         self.assert_cached(self.jobs_by_attr(snapshot)["packages.cached"])
         self.assertEqual({node["drvPath"] for node in snapshot["plan"]["builds"]}, {missing})
-        self.assertIn("503", "\n".join(snapshot["warnings"]))
+        warnings = "\n".join(snapshot["warnings"])
+        self.assertIn("exit 7", warnings)
+        self.assertIn(REMOTE, warnings)
+        self.assertFalse(any(event["kind"] == "validity_query" and event["store"] == REMOTE for event in f.trace()))
+        details = [json.loads(path.read_text()) for path in (f.report / "logs").glob("cache-query-*.json")]
+        self.assertTrue(any(item["status"] == "exit 7" and "path-info" in item["command"] for item in details))
+
+    def test_repeated_identical_cache_errors_share_one_warning_and_diagnostic(self):
+        f = self.fixture
+        blocker, target, app = self.waiting_cache_target()
+        cause = "error: HTTP error 503 (Service Unavailable) querying " + REMOTE
+        poll_paths = [f.output(target), f.output(app)]
+        f.config["path_info_error"] = {
+            "store": REMOTE,
+            "fresh_only": True,
+            "paths": poll_paths,
+            "message": cause,
+        }
+        with self.running_fixture("--cache-refresh", "0.05") as (process, log):
+            self.wait_for_build(process, blocker)
+            self.observe_trace(process, lambda events: sum(
+                event["kind"] == "path_info_failed" for event in events
+            ) >= 3)
+            f.release("blocker")
+            snapshot = self.finish_successfully(process, log)
+        self.assertEqual(len(snapshot["warnings"]), 1)
+        self.assertIn(cause, snapshot["warnings"][0])
+        details_files = list((f.report / "logs").glob("cache-query-*.json"))
+        self.assertEqual(len(details_files), 1)
+        self.assertIn("logs/" + details_files[0].name, snapshot["warnings"][0])
+        details = json.loads(details_files[0].read_text())
+        self.assertEqual(set(details["paths"]), set(poll_paths))
+        self.assertIn(cause, details["diagnostics"])
+        self.assertEqual(f.state()["attempts"], {blocker: 1, target: 1, app: 1})
+
+    def test_native_tool_versions_take_precedence_over_package_metadata(self):
+        f = self.fixture
+        f.job("packages.cached", f.node("cached"), cache="cached")
+        env = f.env()
+        env["NIX_CI_BUILD_NIX_EVAL_JOBS_VERSION"] = "different-package-version"
+        snapshot = self.success(f.run("--dry-run", env=env))
+        self.assertEqual(snapshot["context"]["nixVersion"], "nix (Nix) 2.35.3")
+        self.assertEqual(snapshot["context"]["nixEvalJobsVersion"], "nix-eval-jobs 2.35.0")
+
+    def test_unsupported_version_flag_uses_explicit_package_metadata(self):
+        f = self.fixture
+        f.job("packages.cached", f.node("cached"), cache="cached")
+        f.config["version_responses"] = {
+            "nix-eval-jobs": {"exit": 1, "stderr": "error: unrecognised flag '--version'"},
+        }
+        env = f.env()
+        env["NIX_CI_BUILD_NIX_EVAL_JOBS_VERSION"] = "2.35.0-fixture"
+        snapshot = self.success(f.run("--dry-run", env=env))
+        expected = "nix-eval-jobs 2.35.0-fixture (Nix package)"
+        self.assertEqual(snapshot["context"]["nixEvalJobsVersion"], expected)
+        self.assertIn(expected, f.summary.read_text())
+        self.assertNotIn("unrecognised flag", f.summary.read_text())
+        self.assertEqual(snapshot["warnings"], [])
+        self.assertEqual(f.commands("path-info"), [])
+        self.assertEqual(f.commands("derivation"), [])
+
+    def test_unsupported_version_flag_without_package_metadata_remains_unknown(self):
+        f = self.fixture
+        f.job("packages.cached", f.node("cached"), cache="cached")
+        f.config["version_responses"] = {
+            "nix-eval-jobs": {"exit": 1, "stderr": "error: unrecognised flag '--version'"},
+        }
+        for metadata in (None, ""):
+            with self.subTest(metadata=metadata):
+                env = f.env()
+                if metadata is not None:
+                    env["NIX_CI_BUILD_NIX_EVAL_JOBS_VERSION"] = metadata
+                snapshot = self.success(f.run("--dry-run", env=env))
+                self.assertEqual(snapshot["context"]["nixEvalJobsVersion"], "unknown")
+                self.assertNotIn("unrecognised flag", f.summary.read_text())
+                self.assertEqual(snapshot["warnings"], [])
 
     def test_graph_json_larger_than_16_mib_is_not_truncated(self):
         f = self.fixture
@@ -1173,7 +1378,7 @@ class Integration(unittest.TestCase):
         self.assertGreaterEqual(download["downloadSeconds"], 0.35)
         self.assertEqual(f.state()["copied"], [f.output(app)])
         self.assertTrue(any(
-            event["kind"] == "path_info" and event["store"] is None and runtime in event["paths"]
+            event["kind"] == "validity_query" and event["store"] is None and runtime in event["paths"]
             for event in f.trace()
         ))
 

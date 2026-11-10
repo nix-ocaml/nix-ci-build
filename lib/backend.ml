@@ -119,7 +119,19 @@ let query_json process_mgr ?input args =
 
 let version process_mgr program =
   let result = run process_mgr [ program; "--version" ] in
-  if successful result then String.trim result.stdout else "unknown"
+  let reported = String.trim result.stdout in
+  if successful result && reported <> ""
+  then reported
+  else if program = "nix-eval-jobs"
+  then
+    (* Some nix-eval-jobs releases have no version flag. The Nix wrapper knows
+       the version of the package it puts on PATH; distinguish that metadata
+       from a version reported by the executable itself. *)
+    match Sys.getenv_opt "NIX_CI_BUILD_NIX_EVAL_JOBS_VERSION" with
+    | Some version when String.trim version <> "" ->
+      "nix-eval-jobs " ^ String.trim version ^ " (Nix package)"
+    | _ -> "unknown"
+  else "unknown"
 
 let substituters process_mgr =
   (* Query one setting only. The full config can contain access tokens. *)
@@ -131,16 +143,14 @@ let substituters process_mgr =
 let normalize_path path =
   if String.starts_with ~prefix:"/" path then path else "/nix/store/" ^ path
 
+let path_info_fields = function
+  | `List xs -> List.map xs ~f:(fun j -> Json.string (Json.member "path" j), j)
+  | `Assoc xs ->
+    (match List.assoc_opt "info" xs with Some (`Assoc xs) -> xs | _ -> xs)
+  | _ -> []
+
 let path_infos json =
-  let fields =
-    match json with
-    | `List xs ->
-      List.map xs ~f:(fun j -> Json.string (Json.member "path" j), j)
-    | `Assoc xs ->
-      (match List.assoc_opt "info" xs with Some (`Assoc xs) -> xs | _ -> xs)
-    | _ -> []
-  in
-  List.filter_map fields ~f:(fun (path, info) ->
+  List.filter_map (path_info_fields json) ~f:(fun (path, info) ->
     if path = "" || not (match info with `Assoc _ -> true | _ -> false)
     then None
     else
@@ -154,61 +164,217 @@ let path_infos json =
                 ~f:normalize_path
           } ))
 
-let cache_query_warning json result =
-  let diagnostics = List.map (readable_lines result.tail) ~f:String.trim in
-  let format_warning line =
-    String.starts_with
-      ~prefix:"warning: '--json' without '--json-format' is deprecated"
-      line
-  in
-  let expected_missing line =
-    line = ""
-    || format_warning line
-    || line = "don't know how to build these paths:"
-    || String.starts_with ~prefix:"/nix/store/" line
-    || (String.starts_with ~prefix:"error: path " line
-       && Json.contains ~sub:" is not valid" line)
-  in
-  let unexpected_error =
-    (not (successful result))
-    && (diagnostics = []
-       || List.exists diagnostics ~f:(fun line -> not (expected_missing line)))
-  in
-  let cache_warning =
-    List.exists diagnostics ~f:(fun line ->
-      String.starts_with ~prefix:"warning:" line && not (format_warning line))
-  in
-  if json = `Null || unexpected_error || cache_warning
-  then
-    Some
-      (if result.tail = []
-       then "Cache query returned no valid JSON or diagnostics"
-       else error result)
-  else None
+let missing_diagnostic line =
+  String.starts_with ~prefix:"error: path '/nix/store/" line
+  && String.ends_with ~suffix:"' is not valid" line
 
-let path_info process_mgr ?store ?(fresh = false) paths =
+let query_noise line =
+  line = ""
+  || String.starts_with
+       ~prefix:"warning: '--json' without '--json-format' is deprecated"
+       line
+  || line = "don't know how to build these paths:"
+  || String.starts_with ~prefix:"/nix/store/" line
+  || missing_diagnostic line
+  || ((String.starts_with ~prefix:"this " line
+      || String.starts_with ~prefix:"these " line)
+     && String.ends_with ~suffix:":" line
+     && (Json.contains ~sub:" will be fetched (" line
+        || Json.contains ~sub:" will be built:" line))
+
+(* Keep significant diagnostics as they arrive: a long planner path list can
+   otherwise evict the actual HTTP/authentication error from the stderr tail.
+   Internal-JSON messages may contain several physical lines. *)
+let run_cache_query process_mgr args paths =
+  let messages = ref []
+  and missing = ref false in
+  let on_stderr line =
+    readable_lines [ line ]
+    |> List.concat_map ~f:(String.split_on_char ~sep:'\n')
+    |> List.iter ~f:(fun line ->
+      let line = String.trim line in
+      if missing_diagnostic line then missing := true;
+      if (not (query_noise line)) && List.length !messages < 20
+      then messages := Json.clip 4096 line :: !messages)
+  in
+  let result =
+    run
+      process_mgr
+      ~input:(String.concat ~sep:"\n" paths ^ "\n")
+      ~on_stderr
+      args
+  in
+  result, List.rev !messages, !missing
+
+let query_options store fresh =
+  (match store with
+    | None -> [ "--option"; "substituters"; "" ]
+    | Some s -> [ "--store"; s ])
+  @ if fresh then [ "--option"; "narinfo-cache-negative-ttl"; "0" ] else []
+
+let query_warning ?log_dir ~store ~args ~paths result messages reason =
+  let status =
+    match result.status with
+    | `Exited code -> Printf.sprintf "exit %d" code
+    | `Signaled signal -> Printf.sprintf "signal %d" signal
+  in
+  let details =
+    match log_dir with
+    | None -> ""
+    | Some dir ->
+      let diagnostic =
+        `Assoc
+          [ "command", Json.strs args
+          ; "paths", Json.strs paths
+          ; "status", `String status
+          ; "reason", `String reason
+          ; "stdout", `String result.stdout
+          ; "stderrTail", Json.strs result.tail
+          ; "diagnostics", Json.strs messages
+          ]
+      in
+      (* Repeated identical outages must keep the same warning text, so the
+         engine can deduplicate them and polling does not create endless
+         logs. *)
+      let id =
+        Digest.to_hex (Digest.string (Yojson.Safe.to_string diagnostic))
+      in
+      let path = Filename.concat dir ("cache-query-" ^ id ^ ".json") in
+      if not (Sys.file_exists path) then Json.atomic_write path diagnostic;
+      " (details: "
+      ^ Filename.concat (Filename.basename dir) (Filename.basename path)
+      ^ ")"
+  in
+  let diagnostic =
+    match messages with
+    | [] -> reason
+    | _ -> reason ^ ": " ^ Json.clip 2048 (String.concat ~sep:"\n" messages)
+  in
+  Some
+    (Printf.sprintf
+       "Cache query against %s (%d paths, %s): %s%s"
+       (Option.value store ~default:"local store")
+       (List.length paths)
+       status
+       diagnostic
+       details)
+
+let valid_paths process_mgr ?log_dir ?store ?(fresh = false) paths =
   if paths = []
   then [], None
   else
-    let options =
-      (match store with
-        | None ->
-          (* Even path-info's read-only installable resolution calls Nix's
-             substitution planner. A local validity check must not query remote
-             caches or walk the download closure of every missing output. *)
-          [ "--option"; "substituters"; "" ]
-        | Some s -> [ "--store"; s ])
-      @ if fresh then [ "--option"; "narinfo-cache-negative-ttl"; "0" ] else []
+    let args =
+      [ "nix-store"; "--check-validity"; "--print-invalid"; "--stdin" ]
+      @ query_options store fresh
     in
-    let json, result =
-      query_json
-        process_mgr
-        ~input:(String.concat ~sep:"\n" paths ^ "\n")
-        ([ "path-info"; "--json"; "--stdin" ] @ options)
+    let result, messages, _ = run_cache_query process_mgr args paths in
+    let invalid =
+      String.split_on_char ~sep:'\n' result.stdout
+      |> List.map ~f:String.trim
+      |> List.filter ~f:(fun s -> s <> "")
     in
-    let infos = path_infos json in
-    let warning = cache_query_warning json result in
-    infos, warning
+    let requested = Hashtbl.create (List.length paths) in
+    List.iter paths ~f:(fun path -> Hashtbl.replace requested path ());
+    if successful result && List.for_all invalid ~f:(Hashtbl.mem requested)
+    then (
+      let missing = Hashtbl.create (List.length invalid) in
+      List.iter invalid ~f:(fun path -> Hashtbl.replace missing path ());
+      ( List.filter paths ~f:(fun path -> not (Hashtbl.mem missing path))
+      , if messages = []
+        then None
+        else
+          query_warning
+            ?log_dir
+            ~store
+            ~args
+            ~paths
+            result
+            messages
+            "Validity query diagnostics" ))
+    else
+      ( []
+      , query_warning
+          ?log_dir
+          ~store
+          ~args
+          ~paths
+          result
+          messages
+          "Cannot determine valid paths" )
+
+let path_info process_mgr ?log_dir ?store ?(fresh = false) paths =
+  if paths = []
+  then [], None
+  else
+    let args =
+      nix ([ "path-info"; "--json"; "--stdin" ] @ query_options store fresh)
+    in
+    let query paths =
+      let result, messages, missing = run_cache_query process_mgr args paths in
+      let json =
+        try Yojson.Safe.from_string result.stdout with
+        | Yojson.Json_error _ -> `Null
+      in
+      let valid_json =
+        match json with `Assoc _ | `List _ -> true | _ -> false
+      in
+      let fields = path_info_fields json in
+      let accounted = Hashtbl.create (List.length fields) in
+      List.iter fields ~f:(fun (path, info) ->
+        match info with
+        | `Assoc _ | `Null -> Hashtbl.replace accounted (normalize_path path) ()
+        | _ -> ());
+      let omitted =
+        List.filter paths ~f:(fun p -> not (Hashtbl.mem accounted p))
+      in
+      let warning =
+        let reason =
+          if messages <> []
+          then Some "Metadata query diagnostics"
+          else if
+            not (successful result || (result.status = `Exited 1 && missing))
+          then Some "Metadata query failed"
+          else if
+            (not valid_json) && not (String.trim result.stdout = "" && missing)
+          then Some "Metadata query returned invalid JSON"
+          else None
+        in
+        Option.bind
+          reason
+          (query_warning ?log_dir ~store ~args ~paths result messages)
+      in
+      path_infos json, omitted, warning, result
+    in
+    let infos, omitted, warning, _ = query paths in
+    if warning <> None || omitted = []
+    then infos, warning
+    else
+      (* Some Nix queries abort on a missing path before emitting all JSON.
+         Recover in two bounded batches, never one subprocess per miss. A
+         validity check bypasses installable resolution and its planner. *)
+      let valid, warning =
+        valid_paths process_mgr ?log_dir ?store ~fresh omitted
+      in
+      if warning <> None
+      then infos, warning
+      else if valid = []
+      then infos, None
+      else
+        let recovered, omitted, warning, retry = query valid in
+        let warning =
+          if warning <> None || omitted = []
+          then warning
+          else
+            query_warning
+              ?log_dir
+              ~store
+              ~args
+              ~paths:valid
+              retry
+              []
+              "Metadata query remained incomplete after validity check"
+        in
+        infos @ recovered, warning
 
 let graph process_mgr drvs =
   let json, result =

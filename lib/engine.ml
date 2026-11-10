@@ -421,14 +421,16 @@ let skip_available_roots t =
 
 let refresh_local t process_mgr paths =
   let paths = List.sort_uniq ~cmp:String.compare paths in
-  let infos, error = Backend.path_info process_mgr paths in
+  let valid_paths, error =
+    Backend.valid_paths process_mgr ~log_dir:(full_log t "logs") paths
+  in
   Option.iter (warning t) error;
-  let valid = Hashtbl.create (List.length infos) in
-  List.iter infos ~f:(fun (p, _) -> Hashtbl.replace valid p ());
+  let valid = Hashtbl.create (List.length valid_paths) in
+  List.iter valid_paths ~f:(fun p -> Hashtbl.replace valid p ());
   List.iter paths ~f:(fun p ->
     if Hashtbl.mem valid p
     then set_availability t p Plan.Local
-    else if availability t p = Plan.Local
+    else if error = None && availability t p = Plan.Local
     then set_availability t p Plan.Missing)
 
 let probe t process_mgr stores ~fresh paths =
@@ -448,7 +450,14 @@ let probe t process_mgr stores ~fresh paths =
         (not (local (availability t p)))
         && not (cached (Hashtbl.find observed p)))
     in
-    let infos, error = Backend.path_info process_mgr ~store ~fresh missing in
+    let infos, error =
+      Backend.path_info
+        process_mgr
+        ~log_dir:(full_log t "logs")
+        ~store
+        ~fresh
+        missing
+    in
     Option.iter (warning t) error;
     List.iter infos ~f:(fun (p, info) ->
       Hashtbl.replace observed p (Plan.Cached info)));
@@ -1623,7 +1632,12 @@ let cache_follower t process_mgr clock stores =
             List.iter (chunks 128 paths) ~f:(fun paths ->
               match
                 bounded 30. (fun () ->
-                  Backend.path_info process_mgr ~store:source ~fresh:true paths)
+                  Backend.path_info
+                    process_mgr
+                    ~log_dir:(full_log t "logs")
+                    ~store:source
+                    ~fresh:true
+                    paths)
               with
               | `Timeout ->
                 warning t ("Dependency cache refresh timed out for " ^ source)
