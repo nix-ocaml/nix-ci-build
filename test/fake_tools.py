@@ -152,13 +152,16 @@ def path_info(args):
     record("path_info", paths=paths, store=store)
     query_barrier = CONFIG.get("query_barriers", {}).get(store)
     if query_barrier and "narinfo-cache-negative-ttl" in sys.argv:
-        publication = query_barrier["after_publication"]
+        hit = query_barrier["after_cache_hit"]
         with state() as current:
-            published = publication["path"] in current["remote"].get(publication["store"], [])
-        if published:
+            observed = hit["path"] in current.get("queried_cache_hits", {}).get(hit["store"], [])
+        if observed:
             barrier(query_barrier["name"])
     with state() as current:
         available = set(current["local"] if store is None else current["remote"].get(store, []))
+        if store is not None and "narinfo-cache-negative-ttl" in sys.argv:
+            hits = current.setdefault("queried_cache_hits", {})
+            hits[store] = sorted(set(hits.get(store, [])) | (set(paths) & available))
     if "--all" in args:
         paths = sorted(available)
     if "--recursive" in args or "-r" in args:
@@ -233,37 +236,39 @@ def barrier(name):
     record("barrier_released", name=name)
 
 
-def realize(drv):
+def realize(drv, selected=None):
     node = NODES[drv]
     outputs = list(node["outputs"].values())
+    names = node["outputs"] if selected is None or "*" in selected else selected
+    requested = [node["outputs"][name] for name in names]
     # Nix tries substitutes before realizing inputs. A running request does not
     # keep asking the remote cache once it has committed to the build path.
     with state() as current:
-        valid = all(output in current["local"] for output in outputs)
+        valid = all(output in current["local"] for output in requested)
         cached_source = next((source for source in CONFIG.get("substituters", [REMOTE]) if all(
-            output in current["remote"].get(source, []) for output in outputs
+            output in current["remote"].get(source, []) for output in requested
         )), None) if node.get("env", {}).get("allowSubstitutes", "1") == "1" else None
     if valid:
         return True
     if cached_source:
-        with output_locks(outputs):
+        with output_locks(requested):
             with state() as current:
-                if all(output in current["local"] for output in outputs):
+                if all(output in current["local"] for output in requested):
                     return True
             activity = next_activity()
             emit({"action": "start", "id": activity, "level": 3, "type": 108,
-                  "text": "copying path", "fields": [outputs[0], cached_source], "parent": 0})
+                  "text": "copying path", "fields": [requested[0], cached_source], "parent": 0})
             barrier(node.get("download_barrier"))
             time.sleep(node.get("download_delay", 0))
             with state() as current:
-                current["local"] = sorted(set(current["local"] + outputs))
-            record("substituted", drv=drv, outputs=outputs)
+                current["local"] = sorted(set(current["local"] + requested))
+            record("substituted", drv=drv, outputs=requested)
             emit({"action": "stop", "id": activity})
             return True
     record("substitution_miss", drv=drv)
     failed_dependencies = 0
-    for dependency in node.get("inputDrvs", {}):
-        if not realize(dependency):
+    for dependency, selected_outputs in node.get("inputDrvs", {}).items():
+        if not realize(dependency, selected_outputs):
             failed_dependencies += 1
     if failed_dependencies:
         message("error: %d dependencies of derivation '%s' failed to build" % (failed_dependencies, drv))
@@ -272,9 +277,9 @@ def realize(drv):
     # can make these outputs valid while this request waits for its inputs.
     with output_locks(outputs):
         with state() as current:
-            valid = all(output in current["local"] for output in outputs)
+            valid = all(output in current["local"] for output in requested)
         if valid:
-            record("build_avoided", drv=drv, outputs=outputs)
+            record("build_avoided", drv=drv, outputs=requested)
             return True
         with state() as current:
             attempt = current["attempts"].get(drv, 0) + 1

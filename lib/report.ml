@@ -134,6 +134,113 @@ let activity_seconds activity =
     (number (field "buildSeconds" activity)
     +. number (field "downloadSeconds" activity))
 
+let single_line ?(limit = 240) value =
+  clean_terminal value
+  |> String.map ~f:(function '\n' | '\r' | '\t' -> ' ' | c -> c)
+  |> shorten ~limit
+
+let diagnostic_message ?(limit = 2000) value =
+  let value = clean_terminal value in
+  if String.length value <= limit
+  then value
+  else
+    let head = utf8_prefix value (min 400 (limit / 4)) in
+    let separator = "\n…\n" in
+    let tail_length =
+      max 0 (limit - String.length head - String.length separator)
+    in
+    let rec boundary i =
+      if i < String.length value && Char.code value.[i] land 0xc0 = 0x80
+      then boundary (i + 1)
+      else i
+    in
+    let start = boundary (String.length value - tail_length) in
+    head
+    ^ separator
+    ^ String.sub value ~pos:start ~len:(String.length value - start)
+
+let error_cause value =
+  let lines =
+    clean_terminal value
+    |> String.split_on_char ~sep:'\n'
+    |> List.map ~f:String.trim
+    |> List.filter ~f:(fun line -> line <> "")
+    |> List.rev
+  in
+  let cause =
+    match
+      List.find_opt lines ~f:(fun line ->
+        String.starts_with ~prefix:"error:" (String.lowercase_ascii line))
+    with
+    | Some cause -> cause
+    | None -> (match lines with last :: _ -> last | [] -> value)
+  in
+  single_line ~limit:300 (diagnostic_message ~limit:280 cause)
+
+let short_path path =
+  if String.starts_with ~prefix:"/nix/store/" path
+  then
+    let name = Filename.basename path in
+    let name =
+      if String.length name > 33 && name.[32] = '-'
+      then String.sub name ~pos:33 ~len:(String.length name - 33)
+      else name
+    in
+    if String.ends_with ~suffix:".drv" name
+    then String.sub name ~pos:0 ~len:(String.length name - 4)
+    else name
+  else path
+
+let display_name item =
+  let fallback =
+    match attrs item with
+    | name :: _ -> name
+    | [] -> short_path (activity_path item)
+  in
+  single_line ~limit:140 (nonempty fallback (text "name" item))
+
+let status_line ?(color = false) label message =
+  let badge = Printf.sprintf "%-7s" label in
+  let badge =
+    if not color
+    then badge
+    else
+      let code =
+        match label with
+        | "FAIL" | "ERROR" -> "1;31"
+        | "WARN" | "RETRY" | "WAIT" | "CANCEL" -> "1;33"
+        | "DONE" | "BUILT" | "REUSED" -> "1;32"
+        | "BUILD" | "REQUEST" -> "1;35"
+        | "DEBUG" -> "2"
+        | _ -> "1;36"
+      in
+      "\027[" ^ code ^ "m" ^ badge ^ "\027[0m"
+  in
+  badge ^ " " ^ message
+
+let consumers item =
+  let needed = unique (strings (items "neededBy" item)) in
+  match needed with
+  | [] -> ""
+  | _ ->
+    " → "
+    ^ single_line ~limit:120 (String.concat ~sep:", " (take 2 needed))
+    ^
+    if List.length needed > 2
+    then Printf.sprintf " (+%d more)" (List.length needed - 2)
+    else ""
+
+let run_seconds snapshot =
+  let context = field "context" snapshot in
+  if field "elapsedSeconds" context <> `Null
+  then Some (number (field "elapsedSeconds" context))
+  else if
+    field "startedAt" context <> `Null && field "finishedAt" context <> `Null
+  then
+    Some
+      (number (field "finishedAt" context) -. number (field "startedAt" context))
+  else None
+
 let activity_kind activity =
   if
     text "kind" activity = "download"
@@ -286,8 +393,9 @@ let failure_kind kind =
   match kind with
   | "evaluation" | "eval" -> "Evaluation"
   | "download" | "fetch" | "substitution" -> "Download"
-  | "upload" -> "Upload"
+  | "upload" -> "Cache sync"
   | "build" -> "Build"
+  | "run" -> "Run"
   | "cancelled" -> "Cancelled"
   | _ -> nonempty "Unknown" kind
 
@@ -311,6 +419,21 @@ let render_summary snapshot =
   in
   let row cells = add ("| " ^ String.concat ~sep:" | " cells ^ " |\n") in
   let section title = add ("\n## " ^ title ^ "\n") in
+  let details title render =
+    let opening = "\n<details><summary>" ^ html title ^ "</summary>\n\n" in
+    let closing = "\n</details>\n" in
+    if
+      Buffer.length output + String.length opening + String.length closing
+      <= !limit
+    then (
+      add opening;
+      let previous_limit = !limit in
+      limit := !limit - String.length closing;
+      render ();
+      limit := previous_limit;
+      add closing)
+    else truncated := true
+  in
   let context = field "context" snapshot in
   let evaluation = field "evaluation" snapshot in
   let jobs = deduplicate_jobs (items "jobs" snapshot) in
@@ -334,10 +457,23 @@ let render_summary snapshot =
     List.filter uploads ~f:(fun item -> state item = "failed")
   in
   let waits = items "waits" snapshot in
+  let outcome =
+    match text "status" snapshot with
+    | "success" -> "Build succeeded"
+    | "failure" | "failed" -> "Build failed"
+    | "cancelled" -> "Build cancelled"
+    | "planned" | "dry-run" -> "Build plan"
+    | _ -> "Build in progress"
+  in
   add
-    ("# Package build report\n\nStatus: "
+    ("# "
+    ^ outcome
+    ^ "\n\nStatus: "
     ^ code (nonempty "in progress" (text "status" snapshot))
     ^ "\n\n");
+  let artifact = text "artifactUrl" context in
+  if has_prefix "https://" artifact
+  then add ("[Download full report and logs](<" ^ url artifact ^ ">)\n\n");
   add
     (Printf.sprintf
        "Evaluated **%d attributes**, **%d unique derivations**. Evaluation %s.\n\n"
@@ -347,34 +483,27 @@ let render_summary snapshot =
         then "complete"
         else "incomplete"));
   table
-    [ "Built"
-    ; "Local cache"
-    ; "Remote cache"
-    ; "Failed"
-    ; "Blocked"
-    ; "Cancelled"
-    ; "Queued"
-    ; "Submitted"
-    ];
+    [ "Built"; "Cached"; "Failed"; "Blocked"; "Evaluation errors"; "Elapsed" ];
   row
-    (List.map
-       [ n "built"
-       ; local
-       ; remote
-       ; n "failed"
-       ; n "blocked"
-       ; n "cancelled"
-       ; n "queued"
-       ; n "submitted"
-       ]
-       ~f:string_of_int);
-  add
-    (Printf.sprintf
-       "\n\
-        **%d root failures**, **%d evaluation errors**, **%d upload failures**.\n"
-       (List.length failures)
-       (List.length eval_errors)
-       (List.length failed_uploads));
+    [ string_of_int (n "built")
+    ; string_of_int (n "cached")
+    ; string_of_int (n "failed")
+    ; string_of_int (n "blocked")
+    ; string_of_int (List.length eval_errors)
+    ; Option.fold ~none:"—" ~some:duration (run_seconds snapshot)
+    ];
+  if local + remote > 0
+  then add (Printf.sprintf "\nCache hits: %d local, %d remote.\n" local remote);
+  if failures <> [] || eval_errors <> [] || failed_uploads <> []
+  then
+    add
+      (Printf.sprintf
+         "\n\
+          **%d root failures**, **%d evaluation errors**, **%d upload \
+          failures**.\n"
+         (List.length failures)
+         (List.length eval_errors)
+         (List.length failed_uploads));
   if cache_reuse <> []
   then
     add
@@ -387,54 +516,11 @@ let render_summary snapshot =
          (count_state "failed" cache_reuse)
          (count_state "cancelled" cache_reuse));
   let error = text "error" snapshot in
-  if error <> "" then add ("\nRun error: " ^ code error ^ "\n");
-  add
-    (Printf.sprintf
-       "\nNix lock waits: **%d active waits**.\n"
-       (List.length waits));
-  if waits <> []
+  if error <> ""
   then (
-    section "Nix lock waits";
-    add
-      "\n\
-       These are request-level lock waits; the same request may also be \
-       building other derivations.\n";
-    table [ "Request"; "Reason"; "Elapsed"; "Requested derivations" ];
-    List.iter (take 20 waits) ~f:(fun wait ->
-      row
-        [ code (text "requestId" wait)
-        ; code (wait_reason wait)
-        ; elapsed "seconds" wait
-        ; code (String.concat ~sep:", " (strings (items "drvs" wait)))
-        ]));
-  let plan = field "plan" snapshot in
-  if plan <> `Null
-  then (
-    let downloads = items "downloads" plan in
-    let known =
-      List.filter downloads ~f:(fun download ->
-        field "downloadSize" download <> `Null)
-    in
-    let bytes =
-      List.fold_left known ~init:0. ~f:(fun total download ->
-        total +. number (field "downloadSize" download))
-    in
-    add
-      (Printf.sprintf
-         "\n\
-          Initial plan: **%d derivations to build**, **%d downloads**, **%d \
-          unresolved outputs**.\n"
-         (List.length (items "builds" plan))
-         (List.length downloads)
-         (List.length (items "unknown" plan)));
-    if downloads <> []
-    then
-      add
-        (Printf.sprintf
-           "\n\
-            Known compressed downloads: %.1f MiB; size unavailable for %d paths.\n"
-           (bytes /. 1048576.)
-           (List.length downloads - List.length known)));
+    add ("\nRun error: " ^ code (error_cause error) ^ "\n");
+    details "Run error details" (fun () ->
+      add (pre (diagnostic_message ~limit:8192 error))));
   if failures <> []
   then (
     section "Root failures";
@@ -456,7 +542,7 @@ let render_summary snapshot =
            (if List.length affected > 50
             then ", … (complete list in results.json)"
             else ""));
-      add (code (text "message" root) ^ "\n\n");
+      add (code (diagnostic_message (text "message" root)) ^ "\n\n");
       if drv <> ""
       then (
         add
@@ -478,9 +564,15 @@ let render_summary snapshot =
   if eval_errors <> []
   then (
     section "Evaluation errors";
-    table [ "Attribute"; "Error" ];
+    table [ "Attribute"; "Cause" ];
     List.iter (take 30 eval_errors) ~f:(fun error ->
-      row [ code (text "attr" error); code (text "error" error) ]));
+      row [ code (text "attr" error); code (error_cause (text "error" error)) ]);
+    details "Evaluation traces" (fun () ->
+      List.iter (take 30 eval_errors) ~f:(fun error ->
+        add ("\n### " ^ code (text "attr" error) ^ "\n\n");
+        add (pre (diagnostic_message ~limit:8192 (text "error" error)))));
+    if List.length eval_errors > 30
+    then add "\nAdditional evaluation errors are recorded in results.json.\n");
   if failed_uploads <> []
   then (
     section "Upload failures";
@@ -492,62 +584,62 @@ let render_summary snapshot =
         ; code (text "error" upload)
         ]));
   if cache_reuse <> []
-  then (
-    section "Opportunistic dependency imports";
-    add
-      "\n\
-       Import failures are warnings; normal builds continue. Counts and \
-       timings describe cache imports, not measured build savings.\n";
-    table [ "Dependency"; "State"; "Time"; "Needed by"; "Details" ];
-    let priority imported =
-      match state imported with
-      | "failed" -> 0
-      | "importing" -> 1
-      | "imported" -> 2
-      | _ -> 3
-    in
-    let visible =
-      List.stable_sort cache_reuse ~cmp:(fun a b ->
-        Int.compare (priority a) (priority b))
-      |> take 30
-    in
-    List.iter visible ~f:(fun imported ->
-      let paths = strings (items "paths" imported) in
-      let needed = unique (strings (items "neededBy" imported)) in
-      let compact values =
-        String.concat ~sep:", " (List.map (take 5 values) ~f:code)
-        ^
-        if List.length values > 5
-        then Printf.sprintf ", … (%d more)" (List.length values - 5)
-        else ""
+  then
+    details "Opportunistic dependency imports" (fun () ->
+      add
+        "\n\
+         Import failures are warnings; normal builds continue. Counts and \
+         timings describe cache imports, not measured build savings.\n";
+      table [ "Dependency"; "State"; "Time"; "Needed by"; "Details" ];
+      let priority imported =
+        match state imported with
+        | "failed" -> 0
+        | "importing" -> 1
+        | "imported" -> 2
+        | _ -> 3
       in
-      let details =
-        [ (if text "source" imported = ""
-           then ""
-           else "Source: " ^ code (text "source" imported))
-        ; (if paths = [] then "" else "Import paths: " ^ compact paths)
-        ; (if text "error" imported = ""
-           then ""
-           else
-             (if state imported = "failed" then "Warning: " else "Note: ")
-             ^ code (text "error" imported))
-        ; log_reference context (text "logPath" imported)
-        ]
-        |> List.filter ~f:(fun detail -> detail <> "")
-        |> String.concat ~sep:"<br>"
+      let visible =
+        List.stable_sort cache_reuse ~cmp:(fun a b ->
+          Int.compare (priority a) (priority b))
+        |> take 30
       in
-      row
-        [ code (activity_name imported)
-        ; code
-            (if state imported = "failed"
-             then "warning (import failed)"
-             else state imported)
-        ; elapsed "seconds" imported
-        ; compact needed
-        ; details
-        ]);
-    if List.length cache_reuse > 30
-    then add "\nAdditional dependency imports are recorded in results.json.\n");
+      List.iter visible ~f:(fun imported ->
+        let paths = strings (items "paths" imported) in
+        let needed = unique (strings (items "neededBy" imported)) in
+        let compact values =
+          String.concat ~sep:", " (List.map (take 5 values) ~f:code)
+          ^
+          if List.length values > 5
+          then Printf.sprintf ", … (%d more)" (List.length values - 5)
+          else ""
+        in
+        let details =
+          [ (if text "source" imported = ""
+             then ""
+             else "Source: " ^ code (text "source" imported))
+          ; (if paths = [] then "" else "Import paths: " ^ compact paths)
+          ; (if text "error" imported = ""
+             then ""
+             else
+               (if state imported = "failed" then "Warning: " else "Note: ")
+               ^ code (text "error" imported))
+          ; log_reference context (text "logPath" imported)
+          ]
+          |> List.filter ~f:(fun detail -> detail <> "")
+          |> String.concat ~sep:"<br>"
+        in
+        row
+          [ code (activity_name imported)
+          ; code
+              (if state imported = "failed"
+               then "warning (import failed)"
+               else state imported)
+          ; elapsed "seconds" imported
+          ; compact needed
+          ; details
+          ]);
+      if List.length cache_reuse > 30
+      then add "\nAdditional dependency imports are recorded in results.json.\n");
   let blocked = List.filter jobs ~f:(fun job -> state job = "blocked") in
   if blocked <> []
   then (
@@ -600,29 +692,82 @@ let render_summary snapshot =
         ]));
   let slow_requests = ranked "activeSeconds" jobs in
   if slow_requests <> []
-  then (
-    section "Slowest package requests";
-    add
-      "\n\
-       Request time can include Nix scheduling, dependency builds, and \
-       downloads; it is not compilation time.\n";
-    table
-      [ "Package"; "Queue wait"; "Request time"; "Build time"; "Upload time" ];
-    List.iter slow_requests ~f:(fun job ->
-      row
-        [ code (job_name job)
-        ; elapsed "queueSeconds" job
-        ; elapsed "activeSeconds" job
-        ; elapsed "buildSeconds" job
-        ; elapsed "uploadSeconds" job
-        ]));
-  let queue_waits = ranked "queueSeconds" jobs in
+  then
+    details "Slowest package requests" (fun () ->
+      add
+        "\n\
+         Request time can include Nix scheduling, dependency builds, and \
+         downloads; it is not compilation time.\n";
+      table
+        [ "Package"; "Queue wait"; "Request time"; "Build time"; "Upload time" ];
+      List.iter slow_requests ~f:(fun job ->
+        row
+          [ code (job_name job)
+          ; elapsed "queueSeconds" job
+          ; elapsed "activeSeconds" job
+          ; elapsed "buildSeconds" job
+          ; elapsed "uploadSeconds" job
+          ]));
+  let queue_waits =
+    ranked
+      "queueSeconds"
+      (List.filter jobs ~f:(fun job ->
+         state job <> "cached" && number (field "queueSeconds" job) >= 0.05))
+  in
   if queue_waits <> []
-  then (
-    section "Longest queue waits";
-    table [ "Package"; "Wait" ];
-    List.iter queue_waits ~f:(fun job ->
-      row [ code (job_name job); elapsed "queueSeconds" job ]));
+  then
+    details "Longest queue waits" (fun () ->
+      table [ "Package"; "Wait" ];
+      List.iter queue_waits ~f:(fun job ->
+        row [ code (job_name job); elapsed "queueSeconds" job ]));
+  details "Plan and cache activity" (fun () ->
+    add
+      (Printf.sprintf
+         "\nNix lock waits: **%d active waits**.\n"
+         (List.length waits));
+    if waits <> []
+    then (
+      add
+        "\n\
+         These are request-level lock waits; a request may also be building \
+         other derivations.\n";
+      table [ "Request"; "Reason"; "Elapsed"; "Requested derivations" ];
+      List.iter (take 20 waits) ~f:(fun wait ->
+        row
+          [ code (text "requestId" wait)
+          ; code (wait_reason wait)
+          ; elapsed "seconds" wait
+          ; code (String.concat ~sep:", " (strings (items "drvs" wait)))
+          ]));
+    let plan = field "plan" snapshot in
+    if plan <> `Null
+    then (
+      let downloads = items "downloads" plan in
+      let known =
+        List.filter downloads ~f:(fun download ->
+          field "downloadSize" download <> `Null)
+      in
+      let bytes =
+        List.fold_left known ~init:0. ~f:(fun total download ->
+          total +. number (field "downloadSize" download))
+      in
+      add
+        (Printf.sprintf
+           "\n\
+            Initial plan: **%d derivations to build**, **%d downloads**, **%d \
+            unresolved outputs**.\n"
+           (List.length (items "builds" plan))
+           (List.length downloads)
+           (List.length (items "unknown" plan)));
+      if downloads <> []
+      then
+        add
+          (Printf.sprintf
+             "\n\
+              Known compressed downloads: %.1f MiB; size unavailable for %d \
+              paths.\n"
+             (bytes /. 1048576.)
+             (List.length downloads - List.length known))));
   (* Reserve space for context and totals even when many failures are large. *)
   limit := 900_000;
   let warnings = strings (items "warnings" snapshot) in
@@ -631,42 +776,45 @@ let render_summary snapshot =
     section "Warnings";
     List.iter (take 20 warnings) ~f:(fun warning ->
       add ("\n- " ^ code warning ^ "\n")));
-  section "Context";
-  table [ "Field"; "Value" ];
-  List.iter
-    [ "flake"
-    ; "gitSha"
-    ; "system"
-    ; "startedAt"
-    ; "finishedAt"
-    ; "evaluationSeconds"
-    ; "planningSeconds"
-    ; "nixVersion"
-    ; "nixEvalJobsVersion"
-    ; "runUrl"
-    ; "runAttempt"
-    ; "jobs"
-    ]
-    ~f:(fun name ->
-      let value =
-        match name, field name context with
-        | "system", `Null ->
-          let systems =
-            List.filter_map jobs ~f:(fun job ->
-              match text "system" job with "" -> None | system -> Some system)
-            |> unique
-          in
-          if systems = []
-          then `Null
-          else `String (String.concat ~sep:", " systems)
-        | _, value -> value
-      in
-      if value <> `Null then row [ code name; code (context_value name value) ]);
+  details "Context" (fun () ->
+    table [ "Field"; "Value" ];
+    List.iter
+      [ "flake"
+      ; "gitSha"
+      ; "system"
+      ; "startedAt"
+      ; "finishedAt"
+      ; "evaluationSeconds"
+      ; "planningSeconds"
+      ; "nixVersion"
+      ; "nixEvalJobsVersion"
+      ; "runUrl"
+      ; "runAttempt"
+      ; "jobs"
+      ]
+      ~f:(fun name ->
+        let value =
+          match name, field name context with
+          | "system", `Null ->
+            let systems =
+              List.filter_map jobs ~f:(fun job ->
+                match text "system" job with
+                | "" -> None
+                | system -> Some system)
+              |> unique
+            in
+            if systems = []
+            then `Null
+            else `String (String.concat ~sep:", " systems)
+          | _, value -> value
+        in
+        if value <> `Null && value <> `String ""
+        then row [ code name; code (context_value name value) ]));
   let plan_diff = field "planDiff" snapshot in
   if plan_diff <> `Null
-  then (
-    section "Plan comparison";
-    add (pre (shorten ~limit:8192 (Yojson.Safe.pretty_to_string plan_diff))));
+  then
+    details "Plan comparison" (fun () ->
+      add (pre (shorten ~limit:8192 (Yojson.Safe.pretty_to_string plan_diff))));
   let uploaded =
     List.length (List.filter uploads ~f:(fun item -> state item = "uploaded"))
   in
@@ -679,15 +827,19 @@ let render_summary snapshot =
   let cancelled_uploads =
     List.length (List.filter uploads ~f:(fun item -> state item = "cancelled"))
   in
-  add
-    (Printf.sprintf
-       "\n\
-        Uploads: %d complete, %d active, %d queued, %d failed, %d cancelled.\n"
-       uploaded
-       uploading
-       queued_uploads
-       (List.length failed_uploads)
-       cancelled_uploads);
+  if uploads <> []
+  then
+    add
+      (Printf.sprintf
+         "\n\
+          Cache sync: %d complete, %d active, %d queued, %d failed, %d \
+          cancelled. Completed syncs may already exist in the destination \
+          cache.\n"
+         uploaded
+         uploading
+         queued_uploads
+         (List.length failed_uploads)
+         cancelled_uploads);
   add
     "\n\
      Complete machine-readable results, chronological events, and logs are in \
@@ -702,108 +854,184 @@ let render_summary snapshot =
        in results.json and the report logs.\n";
   Buffer.contents output
 
+let is_active activity =
+  let has_counts =
+    List.exists [ "active"; "activeBuilds"; "activeDownloads" ] ~f:(fun name ->
+      field name activity <> `Null)
+  in
+  if has_counts
+  then
+    List.exists [ "active"; "activeBuilds"; "activeDownloads" ] ~f:(fun name ->
+      count name activity > 0)
+  else
+    field "finishedAt" activity = `Null
+    && List.mem (state activity) ~set:[ "waiting"; "downloading"; "building" ]
+
+let active_phase activity =
+  if count "activeBuilds" activity > 0
+  then "BUILD"
+  else if count "activeDownloads" activity > 0
+  then "FETCH"
+  else
+    match state activity with
+    | "building" -> "BUILD"
+    | "downloading" -> "FETCH"
+    | _ -> "WAIT"
+
 let render_progress snapshot =
   let jobs = deduplicate_jobs (items "jobs" snapshot) in
-  let n name =
-    List.length (List.filter jobs ~f:(fun job -> state job = name))
-  in
+  let n name = count_state name jobs in
   let evaluation = field "evaluation" snapshot in
   let uploads = items "uploads" snapshot in
   let cache_reuse = items "cacheReuse" snapshot in
   let waits = items "waits" snapshot in
-  let uploads_in name =
-    List.length (List.filter uploads ~f:(fun upload -> state upload = name))
+  let errors = List.length (items "errors" evaluation) in
+  let completed =
+    n "built" + n "cached" + n "failed" + n "blocked" + n "cancelled"
   in
   let head =
-    Printf.sprintf
-      "evaluated %d attrs / %d derivations%s | cached %d | built %d | requests \
-       %d | queued %d | failed %d | blocked %d | Nix lock waits: %d | uploads \
-       %d/%d (%d active, %d failed) | cache imports %d (%d active, %d \
-       warnings)"
-      (max
-         (count "attrs" evaluation)
-         (List.length (unique (List.concat_map jobs ~f:attrs))))
-      (List.length jobs)
-      (if field "complete" evaluation = `Bool true then "" else " (evaluating)")
-      (n "cached")
-      (n "built")
-      (n "submitted")
-      (n "queued")
-      (n "failed")
-      (n "blocked")
-      (List.length waits)
-      (uploads_in "uploaded")
-      (List.length uploads)
-      (uploads_in "uploading")
-      (uploads_in "failed")
-      (count_state "imported" cache_reuse)
-      (count_state "importing" cache_reuse)
-      (count_state "failed" cache_reuse)
+    if
+      text "status" snapshot = "evaluating"
+      || (text "status" snapshot = ""
+         && field "complete" evaluation <> `Bool true)
+    then
+      status_line
+        "EVAL"
+        (Printf.sprintf
+           "%d attributes evaluated · %d cached · %d derivations discovered%s"
+           (count "attrs" evaluation)
+           (n "cached")
+           (List.length jobs)
+           (if errors = 0
+            then ""
+            else Printf.sprintf " · %d evaluation errors" errors))
+    else if text "status" snapshot = "planning"
+    then
+      status_line
+        "PLAN"
+        (Printf.sprintf
+           "checking remaining dependencies · %d attributes · %d cached%s"
+           (count "attrs" evaluation)
+           (n "cached")
+           (if errors = 0
+            then ""
+            else Printf.sprintf " · %d evaluation errors" errors))
+    else
+      status_line
+        "STATUS"
+        (Printf.sprintf
+           "%d/%d complete · cached %d · built %d · requests %d · queued \
+            %d%s%s%s"
+           completed
+           (List.length jobs)
+           (n "cached")
+           (n "built")
+           (n "submitted")
+           (n "queued")
+           (if n "failed" + n "blocked" = 0
+            then ""
+            else
+              Printf.sprintf
+                " · failed %d · blocked %d"
+                (n "failed")
+                (n "blocked"))
+           (if errors = 0
+            then ""
+            else Printf.sprintf " · %d evaluation errors" errors)
+           (Option.fold
+              ~none:""
+              ~some:(fun seconds -> " · " ^ duration seconds ^ " elapsed")
+              (run_seconds snapshot)))
   in
   let active =
-    List.filter (items "derivations" snapshot) ~f:(fun drv ->
-      List.mem (state drv) ~set:[ "waiting"; "downloading"; "building" ])
+    List.filter (items "derivations" snapshot) ~f:is_active
+    |> List.stable_sort ~cmp:(fun a b ->
+      let priority item =
+        match active_phase item with "BUILD" -> 0 | "FETCH" -> 1 | _ -> 2
+      in
+      let order = Int.compare (priority a) (priority b) in
+      if order <> 0
+      then order
+      else Float.compare (activity_seconds b) (activity_seconds a))
   in
   let lines =
-    List.map (take 5 active) ~f:(fun drv ->
-      let name = activity_name drv in
-      let needed = strings (items "neededBy" drv) in
-      Printf.sprintf
-        "  %s %s%s%s%s"
-        (state drv)
-        (shorten ~limit:160 (clean_terminal name))
-        (if text "phase" drv = ""
-         then ""
-         else " / " ^ shorten ~limit:80 (clean_terminal (text "phase" drv)))
-        (if
-           field "seconds" drv = `Null
-           && field "buildSeconds" drv = `Null
-           && field "downloadSeconds" drv = `Null
-         then ""
-         else " (" ^ duration (activity_seconds drv) ^ ")")
-        (if needed = []
-         then ""
-         else
-           " → "
-           ^ shorten
-               ~limit:200
-               (clean_terminal (String.concat ~sep:", " (take 3 needed)))))
+    List.map (take 4 active) ~f:(fun activity ->
+      status_line
+        (active_phase activity)
+        (display_name activity
+        ^ (if text "phase" activity = ""
+           then ""
+           else " / " ^ single_line ~limit:60 (text "phase" activity))
+        ^ " ("
+        ^ duration (activity_seconds activity)
+        ^ ")"
+        ^ consumers activity))
   in
   let more =
-    if List.length active > 5
+    if List.length active > 4
     then
-      [ Printf.sprintf
-          "  … %d more active dependency requests"
-          (List.length active - 5)
+      [ status_line
+          "ACTIVE"
+          (Printf.sprintf
+             "%d more builds/downloads/waits"
+             (List.length active - 4))
       ]
     else []
   in
   let wait_lines =
-    List.map (take 3 waits) ~f:(fun wait ->
-      Printf.sprintf
-        "  Nix lock wait: %s (%s), request %s"
-        (shorten ~limit:240 (clean_terminal (wait_reason wait)))
-        (elapsed "seconds" wait)
-        (shorten ~limit:80 (clean_terminal (text "requestId" wait))))
+    List.map (take 2 waits) ~f:(fun wait ->
+      status_line
+        "WAIT"
+        (single_line ~limit:160 (wait_reason wait)
+        ^ " ("
+        ^ elapsed "seconds" wait
+        ^ ") · request "
+        ^ single_line ~limit:60 (text "requestId" wait)))
   in
   let import_lines =
     List.filter cache_reuse ~f:(fun imported -> state imported = "importing")
+    |> List.stable_sort ~cmp:(fun a b ->
+      Float.compare (number (field "seconds" b)) (number (field "seconds" a)))
     |> take 2
     |> List.map ~f:(fun imported ->
-      let needed = strings (items "neededBy" imported) in
-      Printf.sprintf
-        "  cache import %s (%s)%s"
-        (shorten ~limit:160 (clean_terminal (activity_name imported)))
-        (elapsed "seconds" imported)
-        (if needed = []
+      status_line
+        "IMPORT"
+        (display_name imported
+        ^ " ("
+        ^ elapsed "seconds" imported
+        ^ ")"
+        ^ consumers imported))
+  in
+  let background =
+    let parts =
+      [ (if uploads = []
          then ""
          else
-           " → "
-           ^ shorten
-               ~limit:200
-               (clean_terminal (String.concat ~sep:", " (take 3 needed)))))
+           Printf.sprintf
+             "cache sync %d/%d (%d active, %d failed)"
+             (count_state "uploaded" uploads)
+             (List.length uploads)
+             (count_state "uploading" uploads)
+             (count_state "failed" uploads))
+      ; (if cache_reuse = []
+         then ""
+         else
+           Printf.sprintf
+             "cache imports %d (%d active, %d warnings)"
+             (count_state "imported" cache_reuse)
+             (count_state "importing" cache_reuse)
+             (count_state "failed" cache_reuse))
+      ; (if waits = []
+         then ""
+         else Printf.sprintf "Nix lock waits: %d" (List.length waits))
+      ]
+      |> List.filter ~f:(fun value -> value <> "")
+    in
+    if parts = []
+    then []
+    else [ status_line "CACHE" (String.concat ~sep:" · " parts) ]
   in
-  (head :: lines) @ more @ wait_lines @ import_lines
+  [ head ] @ lines @ more @ wait_lines @ import_lines @ background
 
 let workflow_escape ~property value =
   let output = Buffer.create (String.length value) in
@@ -833,11 +1061,86 @@ let protected_log value =
   let token = token 0 in
   "::stop-commands::" ^ token ^ "\n" ^ value ^ "\n::" ^ token ^ "::\n"
 
-let render_failure_with_annotation ~github_actions ~annotation root =
+let render_event ?(verbose = false) ?(color = false) event =
+  let kind = nonempty (text "kind" event) (text "type" event) in
+  let name = nonempty "Nix request" (display_name event) in
+  let raw_message = nonempty (text "error" event) (text "message" event) in
+  let message = single_line ~limit:300 raw_message in
+  let timing =
+    if field "seconds" event = `Null
+    then ""
+    else " (" ^ elapsed "seconds" event ^ ")"
+  in
+  let detail = if message = "" then "" else ": " ^ message in
+  let line label value = Some (status_line ~color label value) in
+  match kind, state event with
+  | "job", "submitted" -> line "REQUEST" name
+  | "job", "built" -> line "DONE" (name ^ timing)
+  | "job", "failed" -> line "FAIL" (name ^ detail)
+  | "job", "blocked" -> line "BLOCKED" (name ^ detail)
+  | "job", "cancelled" -> line "CANCEL" name
+  | "activity-start", "building" -> line "BUILD" (name ^ consumers event)
+  | "retry", _ ->
+    let names =
+      strings (items "drvs" event) |> take 3 |> List.map ~f:short_path
+    in
+    line
+      "RETRY"
+      ((if names = [] then name else single_line (String.concat ~sep:", " names))
+      ^ detail)
+  | "upload-retry", _ -> line "RETRY" ("cache sync " ^ name ^ detail)
+  | "upload", "failed" -> line "WARN" ("cache sync " ^ name ^ detail)
+  | "cache-import-start", _ -> line "IMPORT" (name ^ consumers event)
+  | "cache-import-finished", "imported" -> line "REUSED" (name ^ timing)
+  | "cache-import-finished", "failed" ->
+    line "WARN" ("cache import " ^ name ^ detail ^ "; normal build continues")
+  | "warning", _ -> line "WARN" message
+  | ("evaluation-error" | "eval-error"), _ ->
+    line
+      "FAIL"
+      ("evaluation "
+      ^ nonempty name (single_line (text "attr" event))
+      ^ if raw_message = "" then "" else ": " ^ error_cause raw_message)
+  | _ when verbose ->
+    line "DEBUG" (single_line ~limit:1800 (Yojson.Safe.to_string event))
+  | _ -> None
+
+let render_failure_with_annotation
+      ?(color = false)
+      ~github_actions
+      ~annotation
+      root
+  =
   let name = activity_name root |> shorten ~limit:300 |> clean_terminal in
-  let message = text "message" root |> shorten ~limit:2000 |> clean_terminal in
+  let message = diagnostic_message (text "message" root) in
   let title = failure_kind (text "kind" root) ^ " failure: " ^ name in
-  let logs = excerpt root |> clean_terminal in
+  let logs =
+    excerpt root
+    |> clean_terminal
+    |> String.split_on_char ~sep:'\n'
+    |> take 20
+    |> String.concat ~sep:"\n"
+    |> shorten ~limit:4096
+  in
+  let affected = unique (strings (items "affected" root)) in
+  let details =
+    message
+    ^ (if affected = []
+       then ""
+       else
+         "\nAffects "
+         ^ string_of_int (List.length affected)
+         ^ " attributes: "
+         ^ String.concat ~sep:", " (take 8 affected)
+         ^ if List.length affected > 8 then ", …" else "")
+    ^ (if text "drvPath" root = ""
+       then ""
+       else
+         "\nReproduce: nix build --no-link -L "
+         ^ shell_quote (text "drvPath" root ^ "^*"))
+    ^ (if text "logPath" root = "" then "" else "\nLog: " ^ text "logPath" root)
+    ^ if logs = "" then "" else "\n\n" ^ logs
+  in
   if github_actions
   then
     let annotation =
@@ -846,7 +1149,7 @@ let render_failure_with_annotation ~github_actions ~annotation root =
         "::error title="
         ^ workflow_escape ~property:true title
         ^ "::"
-        ^ workflow_escape ~property:false message
+        ^ workflow_escape ~property:false (error_cause (text "message" root))
         ^ "\n"
       else ""
     in
@@ -854,9 +1157,9 @@ let render_failure_with_annotation ~github_actions ~annotation root =
     ^ "::group::"
     ^ workflow_escape ~property:false title
     ^ "\n"
-    ^ protected_log (message ^ if logs = "" then "" else "\n" ^ logs)
+    ^ protected_log details
     ^ "::endgroup::\n"
-  else title ^ "\n" ^ message ^ if logs = "" then "\n" else "\n" ^ logs ^ "\n"
+  else status_line ~color "FAIL" (single_line title) ^ "\n" ^ details ^ "\n"
 
 let render_failure ~github_actions root =
   render_failure_with_annotation ~github_actions ~annotation:true root
@@ -890,13 +1193,22 @@ type t =
   { directory : string
   ; summary_output : string option
   ; github_actions : bool
+  ; color : bool
+  ; verbose : bool
   ; events : out_channel
   ; mutable closed : bool
   ; mutable reported : StringSet.t
   ; mutable annotations : int
   }
 
-let create ~directory ~summary_output ~github_actions =
+let create
+      ?(verbose = false)
+      ?color
+      ~directory
+      ~summary_output
+      ~github_actions
+      ()
+  =
   ensure_directory directory;
   let events =
     open_out_gen
@@ -907,6 +1219,8 @@ let create ~directory ~summary_output ~github_actions =
   { directory
   ; summary_output
   ; github_actions
+  ; color = Option.value color ~default:github_actions
+  ; verbose
   ; events
   ; closed = false
   ; reported = StringSet.empty
@@ -929,16 +1243,29 @@ let write_snapshot t snapshot =
     (Filename.concat t.directory "summary.md")
     (render_summary snapshot)
 
-let emit_progress t snapshot =
-  let value = String.concat ~sep:"\n" (render_progress snapshot) in
-  (* Progress contains names from package metadata, so protect it as well. *)
-  let value =
-    if t.github_actions && contains value "::"
-    then protected_log value
-    else value ^ "\n"
-  in
-  output_string stdout value;
+let console t value =
+  output_string
+    stdout
+    (if t.github_actions && contains value "::"
+     then protected_log value
+     else value ^ "\n");
   flush stdout
+
+let emit_event t event =
+  Option.iter (console t) (render_event ~verbose:t.verbose ~color:t.color event)
+
+let emit_progress t snapshot =
+  render_progress snapshot
+  |> List.map ~f:(fun line ->
+    if t.color && String.length line >= 8
+    then
+      status_line
+        ~color:true
+        (String.trim (String.sub line ~pos:0 ~len:7))
+        (String.sub line ~pos:8 ~len:(String.length line - 8))
+    else line)
+  |> String.concat ~sep:"\n"
+  |> console t
 
 let emit_failure t failure =
   let key = failure_key failure in
@@ -950,24 +1277,189 @@ let emit_failure t failure =
     output_string
       stdout
       (render_failure_with_annotation
+         ~color:t.color
          ~github_actions:t.github_actions
          ~annotation
          failure);
     flush stdout)
 
+let emit_evaluation_errors t snapshot =
+  let errors = items "errors" (field "evaluation" snapshot) in
+  List.iter (take 5 errors) ~f:(fun error ->
+    emit_failure
+      t
+      (`Assoc
+          [ "kind", `String "evaluation"
+          ; "name", `String (nonempty "flake evaluation" (text "attr" error))
+          ; "message", `String (text "error" error)
+          ]));
+  let key = "evaluation-errors-omitted" in
+  if List.length errors > 5 && not (StringSet.mem key t.reported)
+  then (
+    t.reported <- StringSet.add key t.reported;
+    console
+      t
+      (status_line
+         ~color:t.color
+         "ERROR"
+         (Printf.sprintf
+            "%d more evaluation errors; see summary.md and results.json"
+            (List.length errors - 5))))
+
+let emit_plan t snapshot =
+  let jobs = deduplicate_jobs (items "jobs" snapshot) in
+  let plan = field "plan" snapshot in
+  let builds = items "builds" plan in
+  let downloads = items "downloads" plan in
+  let errors = List.length (items "errors" (field "evaluation" snapshot)) in
+  console
+    t
+    (status_line
+       ~color:t.color
+       (if errors > 0 then "WARN" else "PLAN")
+       (Printf.sprintf
+          "%s%d attributes · %d cached · %d queued · %d builds · %d \
+           downloads%s%s"
+          (if errors > 0 then "plan: " else "")
+          (count "attrs" (field "evaluation" snapshot))
+          (count_state "cached" jobs)
+          (count_state "queued" jobs)
+          (List.length builds)
+          (List.length downloads)
+          (if items "unknown" plan = []
+           then ""
+           else
+             Printf.sprintf
+               " · %d unresolved outputs"
+               (List.length (items "unknown" plan)))
+          (if errors = 0
+           then ""
+           else Printf.sprintf " · %d evaluation errors" errors)));
+  (if builds <> [] || downloads <> []
+   then
+     let known =
+       List.filter downloads ~f:(fun item -> field "downloadSize" item <> `Null)
+     in
+     let bytes =
+       List.fold_left known ~init:0. ~f:(fun n item ->
+         n +. number (field "downloadSize" item))
+     in
+     let body =
+       (List.map (take 12 builds) ~f:(fun item -> "Build  " ^ display_name item)
+       @ (if List.length builds > 12
+          then
+            [ Printf.sprintf
+                "… %d more derivations in plan.json"
+                (List.length builds - 12)
+            ]
+          else [])
+       @
+       if downloads = []
+       then []
+       else
+         [ Printf.sprintf
+             "Fetch  %d paths · %.1f MiB known compressed size · %d unknown \
+              sizes"
+             (List.length downloads)
+             (bytes /. 1048576.)
+             (List.length downloads - List.length known)
+         ])
+       |> String.concat ~sep:"\n"
+     in
+     if t.github_actions
+     then (
+       (* A whole group is one write: parallel build streams cannot leave it
+          open. *)
+       output_string
+         stdout
+         ("::group::Build plan details\n"
+         ^ protected_log body
+         ^ "::endgroup::\n");
+       flush stdout)
+     else if t.verbose
+     then console t body);
+  emit_evaluation_errors t snapshot
+
 let finish t snapshot =
   write_snapshot t snapshot;
   List.iter (roots snapshot) ~f:(emit_failure t);
+  emit_evaluation_errors t snapshot;
+  if text "error" snapshot <> ""
+  then
+    emit_failure
+      t
+      (`Assoc
+          [ "kind", `String "run"
+          ; "name", `String "nix-ci-build"
+          ; "message", `String (text "error" snapshot)
+          ]);
+  let failed_uploads =
+    List.filter (items "uploads" snapshot) ~f:(fun upload ->
+      state upload = "failed")
+  in
+  List.iter (take 5 failed_uploads) ~f:(fun upload ->
+    emit_failure
+      t
+      (`Assoc
+          [ "kind", `String "upload"
+          ; "name", `String (short_path (text "path" upload))
+          ; "message", `String (text "error" upload)
+          ; "logPath", field "logPath" upload
+          ]));
+  let jobs = deduplicate_jobs (items "jobs" snapshot) in
+  let label =
+    match text "status" snapshot with
+    | "failure" | "failed" -> "FAIL"
+    | "cancelled" -> "CANCEL"
+    | "planned" | "dry-run" -> "PLAN"
+    | "success" -> "DONE"
+    | _ -> "STATUS"
+  in
+  console
+    t
+    (status_line
+       ~color:t.color
+       label
+       (Printf.sprintf
+          "%d built · %d cached · %d failed · %d blocked%s%s%s%s%s%s"
+          (count_state "built" jobs)
+          (count_state "cached" jobs)
+          (count_state "failed" jobs)
+          (count_state "blocked" jobs)
+          (let count =
+             List.length (items "errors" (field "evaluation" snapshot))
+           in
+           if count = 0
+           then ""
+           else Printf.sprintf " · %d evaluation errors" count)
+          (if failed_uploads = []
+           then ""
+           else
+             Printf.sprintf
+               " · %d cache sync failures"
+               (List.length failed_uploads))
+          (let count = count_state "cancelled" jobs in
+           if count = 0 then "" else Printf.sprintf " · %d cancelled" count)
+          (let count = count_state "queued" jobs in
+           if count = 0 then "" else Printf.sprintf " · %d queued" count)
+          (let count = count_state "submitted" jobs in
+           if count = 0
+           then ""
+           else Printf.sprintf " · %d active requests" count)
+          (Option.fold
+             ~none:""
+             ~some:(fun seconds -> " · " ^ duration seconds ^ " elapsed")
+             (run_seconds snapshot))));
   let summary = render_summary snapshot in
   match t.summary_output with
   | Some path -> atomic_write path summary
   | None ->
-    output_string
-      stdout
-      (if t.github_actions && contains summary "::"
-       then protected_log summary
-       else summary);
-    flush stdout
+    console
+      t
+      (status_line
+         ~color:t.color
+         "REPORT"
+         (single_line ~limit:240 (Filename.concat t.directory "summary.md")))
 
 let close t =
   if not t.closed

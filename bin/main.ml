@@ -14,7 +14,7 @@ let main
       cache_refresh
       batch_size
       retries
-      _verbose
+      verbose
   =
   if
     jobs < 1
@@ -44,6 +44,7 @@ let main
       ; cache_refresh
       ; batch_size
       ; retries
+      ; verbose
       }
     in
     Eio_main.run (Nix_ci_build.Engine.run config)
@@ -86,7 +87,9 @@ let command =
       & info
           [ "o"; "output" ]
           ~docv:"FILE"
-          ~doc:"Summary destination; defaults to GITHUB_STEP_SUMMARY or stdout.")
+          ~doc:
+            "Write a Markdown summary to FILE; defaults to GITHUB_STEP_SUMMARY \
+             in Actions. A summary is always saved in the report directory.")
   in
   let report_dir =
     Arg.(
@@ -179,8 +182,8 @@ let command =
       & info
           [ "v"; "verbose" ]
           ~doc:
-            "Retained for command-line compatibility; full logs are always \
-             saved.")
+            "Show detailed lifecycle events in the console. Full logs and \
+             structured events are always saved in the report directory.")
   in
   Cmd.v
     (Cmd.info

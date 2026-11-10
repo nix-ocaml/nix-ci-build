@@ -56,6 +56,27 @@ Running builds are never cancelled to pursue a cache import.
 
 ## Understanding progress
 
+A compact plan summarizes the work, followed by new requests, actual builds,
+completed packages, and failures. Cached packages and routine downloads are
+summarized in totals so a large package set does not bury useful progress in
+thousands of messages. For example:
+
+```text
+PLAN    420 attributes · 398 cached · 22 queued · 31 builds · 14 downloads
+REQUEST piaf
+BUILD   libpq-17.6 → caqti, piaf
+STATUS  407/420 complete · cached 398 · built 9 · requests 4 · queued 9 · 12m30s elapsed
+BUILD   libpq-17.6 / buildPhase (4m10s) → caqti, piaf
+FETCH   git-2.51.0 (18.2s) → piaf
+CACHE   cache sync 12/15 (2 active, 0 failed)
+```
+
+Heartbeats put active builds first, followed by downloads and waits, with the
+longest-running activity first within each category. They name the packages
+that need each dependency and include current Nix phases when available.
+`--verbose` adds every lifecycle event to the console; the complete event
+stream and logs are saved regardless of verbosity.
+
 Progress distinguishes the package requests submitted to Nix from the
 derivations Nix is actually building or downloading. A submitted package can be
 waiting on a shared dependency or on Nix's own build slots. Its request time
@@ -98,10 +119,21 @@ the platform and tool versions. Full details stay in JSON and log files when
 the summary would become too large.
 
 Use `--output FILE` to choose the summary destination explicitly. In GitHub
-Actions, the default destination is `GITHUB_STEP_SUMMARY`; outside Actions it
-is stdout. The report directory always keeps its own `summary.md`.
+Actions, the default destination is `GITHUB_STEP_SUMMARY`. Outside Actions the
+console prints the summary's location instead of the full Markdown. The
+report directory always keeps its own `summary.md`.
 
 ## GitHub Actions
+
+Actions logs use colored status labels, short expandable plan and failure
+groups, and error annotations that point to the cause of a failure. Set
+`NO_COLOR` to disable colors. Groups are emitted as complete blocks so output
+from concurrent builds does not get folded into another package's group.
+
+The job summary leads with the outcome and totals, followed by root failures,
+affected packages, reproduction commands, and the slowest observed work.
+Detailed timing, cache activity, and environment information are expandable.
+Evaluation errors remain visible even when no package can be planned.
 
 ```yaml
 - name: Build package set
@@ -117,6 +149,7 @@ is stdout. The report directory always keeps its own `summary.md`.
   with:
     name: package-report-${{ runner.os }}-${{ github.run_attempt }}
     path: report/
+    if-no-files-found: ignore
     retention-days: 14
 - name: Link build report
   if: ${{ always() && steps.reports.outputs.artifact-url != '' }}

@@ -12,6 +12,7 @@ type config =
   ; cache_refresh : float
   ; batch_size : int
   ; retries : int
+  ; verbose : bool
   }
 
 type job =
@@ -129,43 +130,27 @@ let duration start finish =
   | Some s -> max 0. (Option.value finish ~default:(now ()) -. s)
 
 let event t kind fields =
-  Report.append_event
-    t.report
-    (`Assoc (("time", `Float (now ())) :: ("type", `String kind) :: fields));
-  if
-    List.mem
-      kind
-      ~set:
-        [ "job"
-        ; "activity-start"
-        ; "activity-stop"
-        ; "upload"
-        ; "upload-queued"
-        ; "upload-retry"
-        ; "retry"
-        ; "cache-import-start"
-        ; "cache-import-finished"
-        ]
-  then
-    let json = `Assoc fields in
-    let state = Json.string (Json.member "state" json) in
-    let target =
-      match Json.strings (Json.member "attrs" json) with
-      | [] ->
-        let drv = Json.string (Json.member "drvPath" json) in
-        if drv <> ""
-        then Filename.basename drv
-        else Json.string (Json.member "path" json)
-      | attrs -> String.concat ~sep:", " attrs
-    in
-    let message =
-      kind ^ (if state = "" then "" else " " ^ state) ^ " " ^ target
-    in
-    let message =
-      Activity.strip_ansi message
-      |> String.map ~f:(fun c -> if c = '\n' || c = '\r' then ' ' else c)
-    in
-    Printf.eprintf "nix-ci-build: %s\n%!" (Json.clip 1024 message)
+  let drv = Json.string (Json.member "drvPath" (`Assoc fields)) in
+  let fields =
+    match Plan.find t.graph drv with
+    | Some node when not (List.mem_assoc "name" ~map:fields) ->
+      ("name", `String node.name) :: fields
+    | _ -> fields
+  in
+  let fields =
+    if drv = "" || List.mem_assoc "neededBy" ~map:fields
+    then fields
+    else
+      ( "neededBy"
+      , Json.strs
+          (Option.value (Hashtbl.find_opt t.attribution drv) ~default:[]) )
+      :: fields
+  in
+  let json =
+    `Assoc (("time", `Float (now ())) :: ("type", `String kind) :: fields)
+  in
+  Report.append_event t.report json;
+  Report.emit_event t.report json
 
 let root_paths t (edge : Plan.edge) =
   let node =
@@ -285,6 +270,14 @@ let index_graph t =
     t.attribution
 
 let snapshot t =
+  let timestamp key fallback =
+    match List.assoc_opt key t.context with
+    | Some (`Float value) -> value
+    | _ -> fallback
+  in
+  let elapsed =
+    max 0. (timestamp "finishedAt" (now ()) -. timestamp "startedAt" (now ()))
+  in
   let derivations =
     values t.activities
     |> List.sort ~cmp:(fun a b ->
@@ -301,6 +294,9 @@ let snapshot t =
         ; "phase", `String a.phase
         ; "startedAt", Json.optional (fun x -> `Float x) a.started
         ; "finishedAt", Json.optional (fun x -> `Float x) a.finished
+        ; "active", `Int a.active
+        ; "activeBuilds", `Int a.active_builds
+        ; "activeDownloads", `Int a.active_downloads
         ; ( "seconds"
           , `Float
               (a.seconds
@@ -315,7 +311,7 @@ let snapshot t =
   in
   `Assoc
     [ "schemaVersion", `Int 1
-    ; "context", `Assoc t.context
+    ; "context", `Assoc (("elapsedSeconds", `Float elapsed) :: t.context)
     ; "status", `String t.status
     ; ( "evaluation"
       , `Assoc
@@ -391,10 +387,7 @@ let warning t message =
   if not (List.mem message ~set:t.warnings)
   then (
     t.warnings <- message :: t.warnings;
-    event t "warning" [ "message", `String message ];
-    Printf.eprintf
-      "nix-ci-build: %s\n%!"
-      (String.concat ~sep:" " (String.split_on_char ~sep:'\n' message)))
+    event t "warning" [ "message", `String message ])
 
 let transition t (j : job) state =
   if j.state <> state then changed t;
@@ -406,6 +399,7 @@ let transition t (j : job) state =
     [ "drvPath", `String j.edge.drv_path
     ; "attrs", Json.strs j.attrs
     ; "state", `String state
+    ; "seconds", `Float (duration j.started j.finished)
     ];
   checkpoint t
 
@@ -577,15 +571,7 @@ let make_plan t process_mgr stores =
              ])
     t.config.compare;
   event t "plan" [ "plan", t.plan; "diff", t.diff ];
-  Printf.eprintf
-    "Plan: %d attributes, %d derivations; %d missing builds, %d downloads, %d \
-     unresolved outputs.\n\
-     %!"
-    t.eval_attrs
-    (Hashtbl.length t.jobs)
-    (List.length plan.builds)
-    (List.length plan.downloads)
-    (List.length plan.unknown);
+  Report.emit_plan t.report (snapshot t);
   Option.iter
     (fun attr ->
        let job =
@@ -927,20 +913,24 @@ let run_build t process_mgr clock batch =
                Hashtbl.replace observed drv ();
                if a.started = None then a.started <- Some (now ());
                if a.active = 0 then a.active_started <- Some (now ());
+               a.finished <- None;
                a.active <- a.active + 1;
                if kind = 105 then a.active_builds <- a.active_builds + 1;
                if kind = 108 then a.active_downloads <- a.active_downloads + 1;
                a.building <- a.building || kind = 105;
                a.state <-
-                 (if kind = 105
+                 (if a.active_builds > 0
                   then "building"
-                  else if kind = 108
+                  else if a.active_downloads > 0
                   then "downloading"
                   else "waiting");
                event
                  t
                  "activity-start"
-                 [ "drvPath", `String drv; "state", `String a.state ];
+                 [ "drvPath", `String drv
+                 ; "state", `String a.state
+                 ; "active", `Int a.active
+                 ];
                checkpoint t)
             drv
         | _ -> ())
@@ -974,10 +964,28 @@ let run_build t process_mgr clock batch =
              if a.active = 0
              then (
                a.seconds <- a.seconds +. duration a.active_started None;
+               a.active_started <- None;
                a.finished <- Some (now ());
-               a.state <- "waiting";
                Hashtbl.replace t.candidates drv ());
-             event t "activity-stop" [ "drvPath", `String drv ];
+             (* A stopped substitution is finished even if Nix only requested
+                one output of a multi-output derivation. It must not remain an
+                active wait until every unrelated output becomes local. *)
+             a.state <-
+               (if a.active_builds > 0
+                then "building"
+                else if a.active_downloads > 0
+                then "downloading"
+                else if a.active > 0
+                then "waiting"
+                else "finished");
+             event
+               t
+               "activity-stop"
+               [ "drvPath", `String drv
+               ; "state", `String a.state
+               ; "seconds", `Float a.seconds
+               ; "active", `Int a.active
+               ];
              checkpoint t)
           (Hashtbl.find_opt ids id)
       | Message { message; _ } ->
@@ -1802,7 +1810,13 @@ let run config env =
     | None -> Sys.getenv_opt "GITHUB_STEP_SUMMARY"
   in
   let report =
-    Report.create ~directory:config.report_dir ~summary_output ~github_actions
+    Report.create
+      ~verbose:config.verbose
+      ~color:(github_actions && Sys.getenv_opt "NO_COLOR" = None)
+      ~directory:config.report_dir
+      ~summary_output
+      ~github_actions
+      ()
   in
   let env_string name = Option.value (Sys.getenv_opt name) ~default:"" in
   let run_url =
@@ -1945,6 +1959,9 @@ let run config env =
               then a.download_seconds <- a.download_seconds +. elapsed
               else a.wait_seconds <- a.wait_seconds +. elapsed;
               a.active <- 0;
+              a.active_builds <- 0;
+              a.active_downloads <- 0;
+              a.active_started <- None;
               a.finished <- Some (now ());
               a.state <- "cancelled"))
          t.activities;

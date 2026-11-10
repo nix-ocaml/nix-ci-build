@@ -8,6 +8,7 @@ No real Nix store, credentials, network or GitHub environment is needed.
 import hashlib
 import contextlib
 import fcntl
+import html
 import json
 import os
 from pathlib import Path
@@ -241,6 +242,17 @@ class Integration(unittest.TestCase):
                 self.fail("process exited before the expected fixture event appeared")
             time.sleep(0.01)
         self.fail("expected fixture event did not appear before deadline")
+
+    def observe_events(self, process, predicate, timeout=15):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            events = self.fixture.events()
+            if predicate(events):
+                return events
+            if process.poll() is not None:
+                self.fail("process exited before the expected report event appeared")
+            time.sleep(0.01)
+        self.fail("expected report event did not appear before deadline")
 
     @contextlib.contextmanager
     def running_fixture(self, *args):
@@ -486,7 +498,10 @@ class Integration(unittest.TestCase):
         f.config["query_barriers"] = {
             middle: {
                 "name": "middle-cache",
-                "after_publication": {"store": REMOTE, "path": f.output(target)},
+                # Publication alone can happen after this poll has already
+                # missed the first cache. Only block once that cache returned
+                # a hit, so the poll has an import to start before it waits.
+                "after_cache_hit": {"store": REMOTE, "path": f.output(target)},
             }
         }
         with self.running_fixture("--cache-refresh", "0.05") as (process, log):
@@ -497,9 +512,10 @@ class Integration(unittest.TestCase):
                 event["kind"] == "barrier_waiting" and event["name"] == "middle-cache"
                 for event in events
             ))
-            self.observe_snapshot(process, lambda snapshot: any(
-                entry["drvPath"] == target and entry["state"] == "failed"
-                for entry in self.imports(snapshot)
+            self.observe_events(process, lambda events: any(
+                entry["type"] == "cache-import-finished"
+                and entry["drvPath"] == target and entry["state"] == "failed"
+                for entry in events
             ))
             # The first copy has failed while this same poll is querying its
             # middle source. The last source must not immediately relaunch it.
@@ -674,11 +690,11 @@ class Integration(unittest.TestCase):
             # watcher several event-loop turns before releasing the useful copy.
             log.flush()
             log.seek(0)
-            heartbeats = log.read().count("evaluated ")
+            heartbeats = log.read().count("STATUS ")
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
                 log.seek(0)
-                if log.read().count("evaluated ") >= heartbeats + 3:
+                if log.read().count("STATUS ") >= heartbeats + 3:
                     break
                 time.sleep(0.01)
             else:
@@ -717,11 +733,11 @@ class Integration(unittest.TestCase):
             # Keep both import workers blocked while the event loop makes progress.
             log.flush()
             log.seek(0)
-            heartbeats = log.read().count("evaluated ")
+            heartbeats = log.read().count("STATUS ")
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
                 log.seek(0)
-                if log.read().count("evaluated ") >= heartbeats + 3:
+                if log.read().count("STATUS ") >= heartbeats + 3:
                     break
                 time.sleep(0.01)
             else:
@@ -801,8 +817,12 @@ class Integration(unittest.TestCase):
                 cache="cached",
             )
             f.cached.extend(outputs.values())
-        snapshot = self.success(f.run("--copy-to", DESTINATION, "--cache-refresh", "0.05"))
+        result = f.run("--copy-to", DESTINATION, "--cache-refresh", "0.05", "--heartbeat", "60")
+        snapshot = self.success(result)
         self.assertEqual(len(snapshot["jobs"]), 1000)
+        self.assertLess(len(result.stdout.splitlines()), 30, result.stdout)
+        self.assertIn("1000", result.stdout)
+        self.assertEqual(sum(event["type"] == "job" and event["state"] == "cached" for event in f.events()), 1000)
         self.assertTrue(snapshot["evaluation"]["complete"])
         for job in snapshot["jobs"]:
             self.assert_cached(job)
@@ -1036,7 +1056,7 @@ class Integration(unittest.TestCase):
             log.seek(0)
             output = log.read()
             self.assertEqual(process.returncode, 0, output)
-            self.assertIn("building compiler", output)
+            self.assertTrue(any(line.startswith("BUILD ") and "compiler" in line for line in output.splitlines()), output)
             self.assertIn("requests 1", output)
         job = self.jobs_by_attr(f.snapshot())["packages.app"]
         self.assertGreaterEqual(job["activeSeconds"], 0.6)
@@ -1052,11 +1072,28 @@ class Integration(unittest.TestCase):
         result = f.run("--heartbeat", "60", timeout=10)
         self.success(result)
         lines = result.stdout.splitlines()
-        submitted = next(index for index, line in enumerate(lines) if "submitted" in line and "packages.short" in line)
-        building = next(index for index, line in enumerate(lines) if "building" in line and Path(drv).name in line)
-        built = next(index for index, line in enumerate(lines) if "built" in line and "packages.short" in line)
+        submitted = next(index for index, line in enumerate(lines) if line.startswith("REQUEST ") and "short" in line)
+        building = next(index for index, line in enumerate(lines) if line.startswith("BUILD ") and "short" in line)
+        built = next(index for index, line in enumerate(lines) if line.startswith("DONE ") and "short" in line)
         self.assertLess(submitted, building)
         self.assertLess(building, built)
+
+    def test_verbose_preserves_detailed_lifecycle_events(self):
+        f = self.fixture
+        cached = f.job("packages.cached", f.node("cached"), cache="cached")
+        dependency = f.node("downloaded", references=[])
+        app = f.job("packages.app", f.node("app", [dependency]))
+        f.cached = [f.output(cached), f.output(dependency)]
+        result = f.run("--verbose", "--heartbeat", "60", "--copy-to", DESTINATION)
+        snapshot = self.success(result)
+        debug = [json.loads(line.split(None, 1)[1]) for line in result.stdout.splitlines() if line.startswith("DEBUG ")]
+        self.assertTrue(any(event["type"] == "job" and event.get("state") == "cached" for event in debug))
+        self.assertTrue(any(event["type"] == "activity-start" and event.get("state") == "downloading" for event in debug))
+        self.assertTrue(any(event["type"] == "activity-stop" for event in debug))
+        self.assertTrue(any(event["type"] == "upload" and event.get("state") == "uploaded" for event in debug))
+        self.assert_cached(self.jobs_by_attr(snapshot)["packages.cached"])
+        self.assert_built(self.jobs_by_attr(snapshot)["packages.app"])
+        self.assertEqual(f.state()["attempts"], {app: 1})
 
     def test_request_level_wait_is_reported_without_marking_package_building(self):
         f = self.fixture
@@ -1128,7 +1165,7 @@ class Integration(unittest.TestCase):
             log.seek(0)
             output = log.read()
             self.assertEqual(process.returncode, 0, output)
-            self.assertTrue(any("downloading" in line and "unknown-runtime" in line for line in output.splitlines()), output)
+            self.assertTrue(any(line.startswith("FETCH ") and "unknown-runtime" in line for line in output.splitlines()), output)
         snapshot = f.snapshot()
         download = next(node for node in snapshot["derivations"] if node.get("path") == runtime)
         self.assert_cached(download)
@@ -1151,10 +1188,41 @@ class Integration(unittest.TestCase):
         starts = [event for event in events if event["type"] == "activity-start" and event["drvPath"] == compiler]
         self.assertEqual([event["state"] for event in starts], ["downloading"])
         self.assertNotIn(compiler, f.state()["attempts"])
-        self.assertIn("downloading cached-compiler", result.stdout)
+        self.assertTrue(any(line.startswith("FETCH ") and "cached-compiler" in line for line in result.stdout.splitlines()), result.stdout)
         node = next(node for node in snapshot["derivations"] if node["drvPath"] == compiler)
         self.assert_cached(node)
         self.assertEqual(f.state()["copied"], [f.output(app)])
+
+    def test_completed_selected_output_download_is_not_reported_active(self):
+        f = self.fixture
+        outputs = {"out": store_path("split-library"), "dev": store_path("split-library-dev")}
+        dependency = f.node("split-library", outputs=outputs, references=[])
+        app = f.job("packages.app", f.node("app", [dependency], barrier="app"))
+        f.cached = list(outputs.values())
+        with self.running_fixture("--cache-refresh", "0") as (process, log):
+            snapshot = self.wait_for_build(process, app)
+            downloaded = next(node for node in snapshot["derivations"] if node["drvPath"] == dependency)
+            self.assertEqual(downloaded["state"], "finished")
+            self.assertFalse(downloaded["active"])
+            self.assertEqual(downloaded["activeBuilds"], 0)
+            self.assertEqual(downloaded["activeDownloads"], 0)
+            self.assertIn(outputs["out"], f.state()["local"])
+            self.assertNotIn(outputs["dev"], f.state()["local"])
+            log_path = f.directory / "process.log"
+            before = len(log_path.read_text())
+            self.observe_snapshot(process, lambda current: any(
+                node["drvPath"] == app and node["active"] and node["seconds"] >= 0.3
+                for node in current["derivations"]
+            ))
+            progress = log_path.read_text()[before:]
+            self.assertIn("STATUS ", progress)
+            self.assertNotIn("split-library", progress)
+            f.release("app")
+            self.finish_successfully(process, log)
+        self.assertEqual(f.state()["attempts"], {app: 1})
+        self.assertNotIn(outputs["dev"], f.state()["local"])
+        substitutions = [event for event in f.trace() if event["kind"] == "substituted"]
+        self.assertEqual([event["outputs"] for event in substitutions], [[outputs["out"]]])
 
     def test_queue_rechecks_validity_after_other_work_completes(self):
         f = self.fixture
@@ -1315,6 +1383,36 @@ class Integration(unittest.TestCase):
         self.assertIn("fixture evaluation exception", f.all_logs())
         self.assertTrue(f.summary.exists())
         self.assertTrue((f.report / "events.jsonl").read_text().strip())
+
+    def test_decoded_evaluation_errors_are_visible_with_no_successful_jobs(self):
+        f = self.fixture
+        trace = "error:\n" + (
+            "       ... while evaluating a package definition\n"
+            "         at /nix/store/fixture-source/lib/attrsets.nix:1571:10:\n"
+        ) * 35
+        cause = "error: attribute 'ocaml_pcre' missing"
+        diagnostic = trace + cause + "\n       at /nix/store/fixture-source/ocaml/default.nix:2585:16:\n"
+        for index in range(11):
+            attr = "packages.failure-%02d" % index
+            f.config["jobs"].append({"attr": attr, "attrPath": attr.split("."), "error": diagnostic, "fatal": False})
+        env = f.env()
+        env["GITHUB_ACTIONS"] = "true"
+        result = f.run("--heartbeat", "60", env=env)
+        snapshot = self.failure(result)
+        self.assertEqual(snapshot["jobs"], [])
+        self.assertEqual(snapshot["evaluation"]["attrs"], 11)
+        self.assertEqual(len(snapshot["evaluation"]["errors"]), 11)
+        self.assertTrue(snapshot["evaluation"]["complete"])
+        self.assertIn(cause, result.stdout)
+        self.assertIn(cause, html.unescape(f.summary.read_text()))
+        self.assertIn("11 evaluation errors", result.stdout)
+        lines = result.stdout.splitlines()
+        self.assertTrue(any(line.startswith("FAIL ") for line in lines), result.stdout)
+        self.assertTrue(any(line.startswith("::error ") and "ocaml_pcre" in line for line in lines), result.stdout)
+        self.assertTrue(any(line.startswith("::group::") and "evaluation" in line.lower() for line in lines), result.stdout)
+        self.assertEqual(sum(line.startswith("::group::") for line in lines), lines.count("::endgroup::"))
+        self.assertEqual(f.commands("build"), [])
+        self.assertEqual(f.commands("copy"), [])
 
     def test_malformed_evaluation_line_preserves_previous_jobs(self):
         f = self.fixture
