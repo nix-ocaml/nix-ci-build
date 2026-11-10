@@ -146,19 +146,44 @@ def references_for_path(path):
     ])
 
 
+def check_validity(args):
+    paths = paths_from_args(args)
+    store = option(args, "--store")
+    record("validity_query", paths=paths, store=store, fresh="narinfo-cache-negative-ttl" in sys.argv)
+    failure = CONFIG.get("validity_error")
+    if failure and failure.get("store") == store:
+        if failure.get("stdout"):
+            print(failure["stdout"])
+        print(failure["message"], file=sys.stderr)
+        return failure.get("exit", 1)
+    with state() as current:
+        available = set(current["local"] if store is None else current["remote"].get(store, []))
+    invalid = [path for path in paths if path not in available]
+    if "--print-invalid" in args:
+        for path in invalid:
+            print(path)
+        return 0
+    if invalid:
+        print("error: path '%s' is not valid" % invalid[0], file=sys.stderr)
+    return 1 if invalid else 0
+
+
 def path_info(args):
     paths = paths_from_args(args)
     store = option(args, "--store")
     record("path_info", paths=paths, store=store)
     query_barrier = CONFIG.get("query_barriers", {}).get(store)
     if query_barrier and "narinfo-cache-negative-ttl" in sys.argv:
-        publication = query_barrier["after_publication"]
+        hit = query_barrier["after_cache_hit"]
         with state() as current:
-            published = publication["path"] in current["remote"].get(publication["store"], [])
-        if published:
+            observed = hit["path"] in current.get("queried_cache_hits", {}).get(hit["store"], [])
+        if observed:
             barrier(query_barrier["name"])
     with state() as current:
         available = set(current["local"] if store is None else current["remote"].get(store, []))
+        if store is not None and "narinfo-cache-negative-ttl" in sys.argv:
+            hits = current.setdefault("queried_cache_hits", {})
+            hits[store] = sorted(set(hits.get(store, [])) | (set(paths) & available))
     if "--all" in args:
         paths = sorted(available)
     if "--recursive" in args or "-r" in args:
@@ -190,17 +215,34 @@ def path_info(args):
             "registrationTime": 0,
             "ultimate": False,
         }
+    missing_output = CONFIG.get("path_info_missing_output") if missing else None
     if "--json" in args:
-        print(json.dumps(result))
+        if CONFIG.get("path_info_malformed_json"):
+            print('{"unfinished":')
+        elif missing_output == "partial":
+            # Exercise a valid but incomplete batch response.
+            hit = next(((path, info) for path, info in result.items() if info is not None), None)
+            print(json.dumps(dict([hit]) if hit is not None else {}))
+        elif missing_output != "none":
+            print(json.dumps(result))
     else:
         for path in paths:
             if path in available:
                 print(path)
     if missing:
-        print("error: path is not valid in the requested store", file=sys.stderr)
+        if missing_output:
+            print("don't know how to build these paths:", file=sys.stderr)
+            for path in paths:
+                if path not in available:
+                    print("  " + path, file=sys.stderr)
+        first_missing = next(path for path in paths if path not in available)
+        print("error: path '%s' is not valid" % first_missing, file=sys.stderr)
     failure = CONFIG.get("path_info_error")
-    if failure and failure.get("store") == store:
+    if (failure and failure.get("store") == store
+            and (not failure.get("fresh_only") or "narinfo-cache-negative-ttl" in sys.argv)
+            and ("paths" not in failure or set(failure["paths"]) == set(paths))):
         print(failure["message"], file=sys.stderr)
+        record("path_info_failed", paths=paths, store=store, exit=failure.get("exit", 1))
         return failure.get("exit", 1)
     return 1 if missing else 0
 
@@ -233,37 +275,39 @@ def barrier(name):
     record("barrier_released", name=name)
 
 
-def realize(drv):
+def realize(drv, selected=None):
     node = NODES[drv]
     outputs = list(node["outputs"].values())
+    names = node["outputs"] if selected is None or "*" in selected else selected
+    requested = [node["outputs"][name] for name in names]
     # Nix tries substitutes before realizing inputs. A running request does not
     # keep asking the remote cache once it has committed to the build path.
     with state() as current:
-        valid = all(output in current["local"] for output in outputs)
+        valid = all(output in current["local"] for output in requested)
         cached_source = next((source for source in CONFIG.get("substituters", [REMOTE]) if all(
-            output in current["remote"].get(source, []) for output in outputs
+            output in current["remote"].get(source, []) for output in requested
         )), None) if node.get("env", {}).get("allowSubstitutes", "1") == "1" else None
     if valid:
         return True
     if cached_source:
-        with output_locks(outputs):
+        with output_locks(requested):
             with state() as current:
-                if all(output in current["local"] for output in outputs):
+                if all(output in current["local"] for output in requested):
                     return True
             activity = next_activity()
             emit({"action": "start", "id": activity, "level": 3, "type": 108,
-                  "text": "copying path", "fields": [outputs[0], cached_source], "parent": 0})
+                  "text": "copying path", "fields": [requested[0], cached_source], "parent": 0})
             barrier(node.get("download_barrier"))
             time.sleep(node.get("download_delay", 0))
             with state() as current:
-                current["local"] = sorted(set(current["local"] + outputs))
-            record("substituted", drv=drv, outputs=outputs)
+                current["local"] = sorted(set(current["local"] + requested))
+            record("substituted", drv=drv, outputs=requested)
             emit({"action": "stop", "id": activity})
             return True
     record("substitution_miss", drv=drv)
     failed_dependencies = 0
-    for dependency in node.get("inputDrvs", {}):
-        if not realize(dependency):
+    for dependency, selected_outputs in node.get("inputDrvs", {}).items():
+        if not realize(dependency, selected_outputs):
             failed_dependencies += 1
     if failed_dependencies:
         message("error: %d dependencies of derivation '%s' failed to build" % (failed_dependencies, drv))
@@ -272,9 +316,9 @@ def realize(drv):
     # can make these outputs valid while this request waits for its inputs.
     with output_locks(outputs):
         with state() as current:
-            valid = all(output in current["local"] for output in outputs)
+            valid = all(output in current["local"] for output in requested)
         if valid:
-            record("build_avoided", drv=drv, outputs=outputs)
+            record("build_avoided", drv=drv, outputs=requested)
             return True
         with state() as current:
             attempt = current["attempts"].get(drv, 0) + 1
@@ -421,11 +465,20 @@ def main():
     args = stripped_args(sys.argv[1:])
     record("command", tool=tool, args=args, rawArgs=sys.argv[1:])
     if args == ["--version"]:
+        response = CONFIG.get("version_responses", {}).get(tool)
+        if response is not None:
+            if response.get("stdout"):
+                print(response["stdout"])
+            if response.get("stderr"):
+                print(response["stderr"], file=sys.stderr)
+            return response.get("exit", 0)
         print("nix-eval-jobs 2.35.0" if tool == "nix-eval-jobs" else "nix (Nix) 2.35.3")
         return 0
     if tool == "nix-eval-jobs":
         return evaluate()
     if tool == "nix-store":
+        if "--check-validity" in args:
+            return check_validity(args)
         if "--add-root" in args:
             paths = paths_from_args(args)
             with state() as current:

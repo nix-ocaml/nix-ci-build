@@ -56,6 +56,30 @@ Running builds are never cancelled to pursue a cache import.
 
 ## Understanding progress
 
+A compact plan summarizes the work, followed by new requests, actual builds,
+completed packages, and failures. Cached packages and routine downloads are
+summarized in totals so a large package set does not bury useful progress in
+thousands of messages. For example:
+
+```text
+PLAN    425 attributes evaluated · 420 unique root derivations (5 aliases) · 398 cached · 22 queued · 31 builds · 14 downloads
+REQUEST piaf
+BUILD   libpq-17.6 → caqti, piaf
+STATUS  407/420 root derivations complete · cached 398 · built 9 · requests 4 · queued 9 · 12m30s elapsed
+BUILD   libpq-17.6 (4m10s total activity) / phase buildPhase → caqti, piaf
+FETCH   git-2.51.0 (18.2s total activity) → piaf
+CACHE   cache sync 12/15 (2 active, 0 failed)
+```
+
+Heartbeats put active builds first, followed by downloads and waits, with the
+longest-running activity first within each category. They name the packages
+that need each dependency and include current Nix phases when available.
+The duration is total observed activity, not time spent in the displayed phase.
+Completion counts use unique root derivations; multiple attribute aliases can
+refer to the same root, and evaluation errors are counted separately.
+`--verbose` adds every lifecycle event to the console; the complete event
+stream and logs are saved regardless of verbosity.
+
 Progress distinguishes the package requests submitted to Nix from the
 derivations Nix is actually building or downloading. A submitted package can be
 waiting on a shared dependency or on Nix's own build slots. Its request time
@@ -89,7 +113,7 @@ The report directory contains:
 | `plan.json` | The evaluated build plan, including dependency and cache information. |
 | `explanation.json` | Dependency paths and missing work for `--explain ATTRIBUTE`. |
 | `summary.md` | A bounded Markdown report for GitHub's job summary. |
-| `logs/` | Complete captured logs, including successful requests and failed dependencies. |
+| `logs/` | Complete captured build and transfer logs, plus diagnostic JSON for unexpected cache-query failures. |
 
 Snapshots and summaries are replaced atomically. Partial results remain useful
 after an interrupted run. The summary includes cache counts, root failures and
@@ -97,11 +121,31 @@ affected packages, reproduction commands, slow requests and queue waits, and
 the platform and tool versions. Full details stay in JSON and log files when
 the summary would become too large.
 
+Ordinary cache misses do not produce warnings. Unexpected query failures name
+the store and retain their command, response, and diagnostics under `logs/`.
+Local checks use direct store validity queries. An incomplete remote metadata
+response is recovered with a batched validity check and one metadata retry,
+so a missing path does not hide cached hits in the same batch.
+
+If `nix-eval-jobs` does not support `--version`, the Nix package wrapper supplies
+its package version. The report labels this fallback as `Nix package`.
+
 Use `--output FILE` to choose the summary destination explicitly. In GitHub
-Actions, the default destination is `GITHUB_STEP_SUMMARY`; outside Actions it
-is stdout. The report directory always keeps its own `summary.md`.
+Actions, the default destination is `GITHUB_STEP_SUMMARY`. Outside Actions the
+console prints the summary's location instead of the full Markdown. The
+report directory always keeps its own `summary.md`.
 
 ## GitHub Actions
+
+Actions logs use colored status labels, short expandable plan and failure
+groups, and error annotations that point to the cause of a failure. Set
+`NO_COLOR` to disable colors. Groups are emitted as complete blocks so output
+from concurrent builds does not get folded into another package's group.
+
+The job summary leads with the outcome and totals, followed by root failures,
+affected packages, reproduction commands, and the slowest observed work.
+Detailed timing, cache activity, and environment information are expandable.
+Evaluation errors remain visible even when no package can be planned.
 
 ```yaml
 - name: Build package set
@@ -117,6 +161,7 @@ is stdout. The report directory always keeps its own `summary.md`.
   with:
     name: package-report-${{ runner.os }}-${{ github.run_attempt }}
     path: report/
+    if-no-files-found: ignore
     retention-days: 14
 - name: Link build report
   if: ${{ always() && steps.reports.outputs.artifact-url != '' }}

@@ -42,6 +42,38 @@ let with_directory f =
     ~finally:(fun () -> remove_directory directory)
     (fun () -> f directory)
 
+let capture_stdout f =
+  with_directory (fun directory ->
+    let path = Filename.concat directory "stdout" in
+    flush stdout;
+    let descriptor = Unix.descr_of_out_channel stdout in
+    let saved = Unix.dup descriptor in
+    let destination =
+      Unix.openfile path [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC ] 0o600
+    in
+    Unix.dup2 destination descriptor;
+    Unix.close destination;
+    Fun.protect
+      ~finally:(fun () ->
+        flush stdout;
+        Unix.dup2 saved descriptor;
+        Unix.close saved)
+      f;
+    read path)
+
+let with_report ?(color = false) ?(verbose = false) ~github_actions f =
+  with_directory (fun directory ->
+    let report =
+      Report.create
+        ~color
+        ~verbose
+        ~directory
+        ~summary_output:(Some (Filename.concat directory "summary-output.md"))
+        ~github_actions
+        ()
+    in
+    Fun.protect ~finally:(fun () -> Report.close report) (fun () -> f report))
+
 let root =
   `Assoc
     [ "drvPath", `String "/nix/store/root-tzdata.drv"
@@ -111,7 +143,7 @@ let test_grouping () =
   in
   let summary = Report.render_summary (snapshot ~roots:[ root ] jobs) in
   check
-    (contains summary "**4 attributes**, **3 unique derivations**")
+    (contains summary "**4 attributes**, **3 unique root derivations**")
     "attributes and unique derivations must differ";
   check
     (occurrences summary "### <code>tzdata</code>" = 1)
@@ -139,7 +171,7 @@ let test_workflow_commands () =
     `Assoc
       [ "name", `String "bad, title\n::warning::injected"
       ; "kind", `String "download"
-      ; "message", `String "404%\n::error::injected"
+      ; "message", `String "404%\nerror: 404% ::error::injected"
       ; ( "excerpt"
         , `List [ `String "::add-mask::secret"; `String "::endgroup::" ] )
       ]
@@ -149,8 +181,9 @@ let test_workflow_commands () =
     (contains rendered "bad%2C title%0A")
     "annotation properties must escape commas and line breaks";
   check
-    (contains rendered "404%25%0A::error::injected")
-    "annotation messages must escape percent and line breaks";
+    (contains rendered "error: 404%25 ::error::injected")
+    "concise annotation causes must escape percent without executing embedded \
+     commands";
   check
     (contains rendered "::stop-commands::nix-ci-build-")
     "arbitrary log lines must disable runner command processing";
@@ -162,6 +195,10 @@ let test_workflow_commands () =
   check
     (!stop_index >= 0 && !log_index > !stop_index)
     "log commands must occur only within the protected block";
+  let ordinary = Report.render_failure ~github_actions:true root in
+  check
+    (not (contains ordinary "::stop-commands::"))
+    "ordinary failure details must not show stop/resume markers";
   let plain = Report.render_failure ~github_actions:false root in
   check
     (not (contains plain "::group::"))
@@ -217,7 +254,7 @@ let test_partial () =
     "queue waits should be reported independently";
   let progress = String.concat ~sep:"\n" (Report.render_progress report) in
   check
-    (contains progress "requests 0 | queued 1")
+    (contains progress "requests 0 · queued 1")
     "queued work must not be described as building";
   ignore (Report.render_summary (`Assoc []))
 
@@ -242,7 +279,7 @@ let test_activity () =
     (contains progress "requests 1")
     "request counters should reflect submitted work";
   check
-    (contains progress "downloading git (1m05s) → piaf")
+    (contains progress "FETCH   git (1m05s total activity) → piaf")
     "progress should expose actual dependency activity"
 
 let test_lock_waits () =
@@ -275,19 +312,19 @@ let test_lock_waits () =
   in
   let progress = String.concat ~sep:"\n" (Report.render_progress report) in
   check
-    (contains progress "requests 1 | queued 0")
+    (contains progress "requests 1 · queued 0")
     "lock waits must not change the package request state";
   check
     (contains progress "Nix lock waits: 2")
     "heartbeat must count waits, including multiple waits for one request";
   check
-    (contains progress "building piaf (12.0s)")
+    (contains progress "BUILD   piaf (12.0s total activity)")
     "one request can build and wait simultaneously";
   check
     (contains
        progress
-       "Nix lock wait: waiting for lock <held by another process> (1m05s), \
-        request batch-1")
+       "WAIT    waiting for lock <held by another process> (1m05s) · request \
+        batch-1")
     "lock progress should explain reason and elapsed time";
   let summary = Report.render_summary report in
   check
@@ -358,7 +395,7 @@ let test_unknown_producer_downloads () =
     "unknown producer outputs must not invent derivation build commands";
   let progress = String.concat ~sep:"\n" (Report.render_progress report) in
   check
-    (contains progress "downloading runtime-library (2.5s)")
+    (contains progress "FETCH   runtime-library (2.5s total activity)")
     "active output downloads must appear in progress";
   check
     (not (contains progress "second-runtime-output"))
@@ -403,10 +440,8 @@ let test_cache_imports () =
        "**1 imported**, **1 active**, **1 warnings**, **1 cancelled**")
     "dependency imports should count each state independently";
   check
-    (contains
-       summary
-       "**0 root failures**, **0 evaluation errors**, **0 upload failures**")
-    "opportunistic import warnings must not become build or upload failures";
+    (not (contains summary "root failures**"))
+    "successful summaries should avoid a redundant all-zero error paragraph";
   check
     (contains summary "Status: <code>success</code>")
     "import warnings must preserve the engine's successful build status";
@@ -438,11 +473,11 @@ let test_cache_imports () =
     (contains progress "cache imports 1 (1 active, 1 warnings)")
     "heartbeat must distinguish completed imports, active imports and warnings";
   check
-    (contains progress "cache import curl (1m05s) → piaf, caqti")
+    (contains progress "IMPORT  curl (1m05s) → caqti, piaf")
     "active imports should identify the dependency, elapsed time and consumers";
   check
-    ((not (contains progress "cache import ocaml"))
-    && not (contains progress "cache import rustc"))
+    ((not (contains progress "IMPORT  ocaml"))
+    && not (contains progress "IMPORT  rustc"))
     "completed and cancelled imports must not appear as active";
   let cancelled =
     snapshot
@@ -465,7 +500,7 @@ let test_cache_imports () =
   check
     (contains
        (String.concat ~sep:"\n" (Report.render_progress (`Assoc [])))
-       "cache imports 0 (0 active, 0 warnings)")
+       "EVAL    0 attributes evaluated")
     "older snapshots without cacheReuse must remain readable"
 
 let test_cache_import_limits () =
@@ -517,7 +552,7 @@ let test_cache_import_limits () =
     (contains progress "cache imports 0 (80 active, 1 warnings)")
     "heartbeat aggregate counts must include imports omitted from detail lines";
   check
-    (occurrences progress "  cache import " = 2)
+    (occurrences progress "IMPORT  " = 2)
     "heartbeat import detail lines must stay bounded"
 
 let test_files () =
@@ -538,6 +573,7 @@ let test_files () =
              ~directory:report_directory
              ~summary_output:(Some explicit_output)
              ~github_actions:false
+             ()
          in
          Fun.protect
            ~finally:(fun () -> Report.close report)
@@ -609,6 +645,363 @@ let test_files () =
               not (String.starts_with ~prefix:".nix-ci-build-" name)))
            "temporary atomic files should be cleaned up"))
 
+let test_event_feed () =
+  let event kind state =
+    `Assoc
+      [ "type", `String kind
+      ; "state", `String state
+      ; ( "drvPath"
+        , `String "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-libpq-17.5.drv" )
+      ]
+  in
+  List.iter
+    [ "job", "cached"
+    ; "job", "queued"
+    ; "activity-start", "downloading"
+    ; "activity-stop", "waiting"
+    ; "upload-queued", "queued"
+    ; "upload", "uploaded"
+    ]
+    ~f:(fun (kind, state) ->
+      check
+        (Report.render_event (event kind state) = None)
+        "routine cache/download/sync transitions must not flood the log";
+      check
+        (Report.render_event ~verbose:true (event kind state) <> None)
+        "verbose mode must keep quiet lifecycle details available");
+  let built =
+    Option.get (Report.render_event (event "activity-start" "building"))
+  in
+  check
+    (built = "BUILD   libpq-17.5")
+    "human events should omit store hashes and .drv suffixes";
+  check
+    (not (contains built "\027"))
+    "plain renderer must be free of color codes";
+  let colored =
+    Option.get
+      (Report.render_event ~color:true (event "activity-start" "building"))
+  in
+  check
+    (contains colored "\027[1;35mBUILD  \027[0m libpq-17.5")
+    "only the aligned badge should be colored, then reset";
+  List.iter
+    [ "package\n::error::forged\027[31m"; "package ##[error]forged" ]
+    ~f:(fun name ->
+      let malicious =
+        `Assoc
+          [ "type", `String "job"
+          ; "state", `String "submitted"
+          ; "name", `String name
+          ]
+      in
+      let plain = Option.get (Report.render_event malicious) in
+      check
+        (not (contains plain "\n"))
+        "untrusted package names must remain a single line";
+      with_report ~github_actions:true ~color:false (fun report ->
+        let output =
+          capture_stdout (fun () -> Report.emit_event report malicious)
+        in
+        check
+          (String.starts_with ~prefix:"::stop-commands::" output
+          && contains output ("\n" ^ plain ^ "\n::nix-ci-build-"))
+          "modern and legacy workflow commands must stay inside a protected \
+           block";
+        check
+          (not (contains output "\027"))
+          "explicitly disabled color must also apply in Actions"))
+
+let test_ranked_progress () =
+  let activity ?(active = 1) ?(finished = `Null) name state seconds =
+    `Assoc
+      [ "name", `String name
+      ; "state", `String state
+      ; "active", `Int active
+      ; "finishedAt", finished
+      ; "seconds", `Float seconds
+      ; "phase", `String "buildPhase"
+      ; ( "neededBy"
+        , `List
+            (List.map [ "app"; "cli"; "tests"; "daemon" ] ~f:(fun s ->
+               `String s)) )
+      ]
+  in
+  let report =
+    `Assoc
+      [ "evaluation", `Assoc [ "complete", `Bool true ]
+      ; "jobs", `List [ job "app" "/nix/store/app.drv" "submitted" ]
+      ; ( "derivations"
+        , `List
+            [ activity "short-build" "building" 5.
+            ; activity
+                ~active:0
+                ~finished:(`Float 1.)
+                "stale-waiting"
+                "waiting"
+                2000.
+            ; activity "large-download" "downloading" 500.
+            ; activity "long-build" "building" 120.
+            ; `Assoc
+                [ "name", `String "legacy-finished"
+                ; "state", `String "waiting"
+                ; "finishedAt", `Float 1.
+                ]
+            ] )
+      ]
+  in
+  let lines = Report.render_progress report in
+  check
+    (contains
+       (List.nth lines 1)
+       "long-build (2m00s total activity) / phase buildPhase")
+    "longest active build should lead the detail lines";
+  check
+    (contains (List.nth lines 2) "short-build")
+    "active builds should precede even longer downloads";
+  let output = String.concat ~sep:"\n" lines in
+  check
+    ((not (contains output "stale-waiting"))
+    && not (contains output "legacy-finished"))
+    "completed activity must not be counted as a live dependency request";
+  check
+    (contains output "→ app, cli (+2 more)")
+    "consumer names must be useful and bounded";
+  check
+    (List.length lines = 4)
+    "quiet progress should avoid empty cache and error counters"
+
+let test_partial_evaluation_progress () =
+  let report status =
+    `Assoc
+      [ "status", `String status
+      ; "evaluation", `Assoc [ "attrs", `Int 1; "complete", `Bool false ]
+      ; ( "jobs"
+        , `List
+            [ job ~cache_status:"cached" "first" "/nix/store/first.drv" "cached"
+            ] )
+      ]
+  in
+  let progress =
+    String.concat ~sep:"\n" (Report.render_progress (report "evaluating"))
+  in
+  check
+    (String.starts_with ~prefix:"EVAL    " progress
+    && contains progress "1 cached")
+    "partial cache evaluation must keep the evaluating phase visible";
+  check
+    (not (contains progress "1/1 complete"))
+    "a provisional evaluation denominator must not imply that the whole run is \
+     complete";
+  let planning =
+    String.concat ~sep:"\n" (Report.render_progress (report "planning"))
+  in
+  check
+    (String.starts_with ~prefix:"PLAN    " planning)
+    "dependency cache planning must have a distinct visible phase";
+  let building =
+    String.concat ~sep:"\n" (Report.render_progress (report "building"))
+  in
+  check
+    (String.starts_with ~prefix:"STATUS  " building)
+    "an evaluator error must not leave later build progress labelled as \
+     evaluation"
+
+let test_complete_groups_and_evaluation_errors () =
+  with_report ~github_actions:true (fun report ->
+    let errors =
+      List.init ~len:11 ~f:(fun i ->
+        `Assoc
+          [ "attr", `String (Printf.sprintf "package-%d" i)
+          ; ( "error"
+            , `String
+                ("while evaluating package\n"
+                ^ String.make 5000 'x'
+                ^ "\nerror: missing ocaml_pcre") )
+          ])
+    in
+    let base = snapshot ~errors [] in
+    let final =
+      match base with
+      | `Assoc fields ->
+        `Assoc (("error", `String "evaluation process failed") :: fields)
+      | _ -> assert false
+    in
+    let output =
+      capture_stdout (fun () ->
+        Report.emit_plan report final;
+        Report.finish report final)
+    in
+    check
+      (contains output "WARN    plan:" && contains output "11 evaluation errors")
+      "zero-job plans must prominently report evaluation errors";
+    check
+      (occurrences output "::error title=Evaluation failure%3A" = 5)
+      "evaluation annotations must be bounded and not repeated at finish";
+    check
+      (contains output "::error title=Run failure%3A")
+      "fatal errors must get actionable console diagnostics";
+    check
+      (contains output "6 more evaluation errors")
+      "omitted evaluation errors must remain discoverable";
+    check
+      (contains output "error: missing ocaml_pcre")
+      "long traces must retain the actionable final cause";
+    let open_group = ref false in
+    List.iter (String.split_on_char ~sep:'\n' output) ~f:(fun line ->
+      if String.starts_with ~prefix:"::group::" line
+      then (
+        check (not !open_group) "completed diagnostic groups must not overlap";
+        open_group := true)
+      else if line = "::endgroup::"
+      then (
+        check !open_group "group end must have a matching start";
+        open_group := false)
+      else if String.starts_with ~prefix:"FAIL    " line
+      then
+        check
+          (not !open_group)
+          "final status must appear outside diagnostic groups");
+    check (not !open_group) "each diagnostic block must close before returning";
+    let summary = Report.render_summary final in
+    check
+      (contains summary "error: missing ocaml_pcre")
+      "summary must preserve long-trace causes too")
+
+let test_plan_and_summary_presentation () =
+  let builds =
+    List.init ~len:20 ~f:(fun i ->
+      `Assoc [ "name", `String (Printf.sprintf "dependency-%d" i) ])
+  in
+  let report =
+    `Assoc
+      [ "status", `String "success"
+      ; ( "context"
+        , `Assoc
+            [ ( "artifactUrl"
+              , `String "https://github.com/org/repo/actions/artifacts/42" )
+            ; "startedAt", `Float 100.
+            ; "finishedAt", `Float 165.
+            ] )
+      ; "evaluation", `Assoc [ "attrs", `Int 1; "complete", `Bool true ]
+      ; "jobs", `List [ job "app" "/nix/store/app.drv" "built" ]
+      ; "plan", `Assoc [ "builds", `List builds; "downloads", `List [] ]
+      ]
+  in
+  with_report ~github_actions:true (fun renderer ->
+    let output = capture_stdout (fun () -> Report.emit_plan renderer report) in
+    check
+      (occurrences output "::group::Build plan details" = 1
+      && occurrences output "::endgroup::" = 1)
+      "a plan should be one complete collapsible block";
+    check
+      (contains output "::group::Build plan details\nBuild  dependency-0\n"
+      && not (contains output "::stop-commands::"))
+      "ordinary plan details must not show stop/resume markers";
+    check
+      (occurrences output "Build  dependency-" = 12
+      && contains output "8 more derivations")
+      "large plans should keep the console bounded");
+  let summary = Report.render_summary report in
+  check
+    (String.starts_with ~prefix:"# Build succeeded" summary)
+    "the summary should lead with the outcome";
+  check
+    (contains
+       (String.sub summary ~pos:0 ~len:(min 500 (String.length summary)))
+       "Download full report and logs")
+    "the full artifact should be directly accessible near the top";
+  check
+    (contains
+       summary
+       "| Built | Cached | Failed | Blocked | Evaluation errors | Elapsed |")
+    "top-level metrics should remain compact and comparable";
+  check (contains summary "1m05s") "overall elapsed time should be visible";
+  check
+    (contains summary "<details><summary>Context</summary>")
+    "supporting metadata should remain available without overwhelming the \
+     outcome";
+  check
+    (occurrences summary "<details>" = occurrences summary "</details>")
+    "summary disclosure blocks must remain balanced"
+
+let test_count_units_and_activity_time () =
+  let report =
+    `Assoc
+      [ "status", `String "building"
+      ; ( "evaluation"
+        , `Assoc
+            [ "attrs", `Int 5
+            ; "complete", `Bool true
+            ; ( "errors"
+              , `List
+                  [ `Assoc
+                      [ "attr", `String "invalid-one"
+                      ; "error", `String "missing input"
+                      ]
+                  ; `Assoc
+                      [ "attr", `String "invalid-two"
+                      ; "error", `String "missing input"
+                      ]
+                  ] )
+            ] )
+      ; ( "jobs"
+        , `List
+            [ job
+                ~cache_status:"cached"
+                "shared"
+                "/nix/store/shared.drv"
+                "cached"
+            ; job
+                ~cache_status:"cached"
+                "shared-alias"
+                "/nix/store/shared.drv"
+                "cached"
+            ; job "compiler" "/nix/store/compiler.drv" "submitted"
+            ] )
+      ; ( "derivations"
+        , `List
+            [ `Assoc
+                [ "name", `String "compiler"
+                ; "state", `String "building"
+                ; "active", `Int 1
+                ; "seconds", `Float 52.1
+                ; "phase", `String "checkPhase"
+                ]
+            ] )
+      ]
+  in
+  with_report ~github_actions:false (fun renderer ->
+    let plan = capture_stdout (fun () -> Report.emit_plan renderer report) in
+    check
+      (contains
+         plan
+         "5 attributes evaluated · 2 unique root derivations (1 alias)")
+      "plans must distinguish attributes, unique roots and aliases without \
+       counting evaluation errors as aliases");
+  let progress = String.concat ~sep:"\n" (Report.render_progress report) in
+  check
+    (contains progress "1/2 root derivations complete")
+    "progress denominators must explicitly count deduplicated root derivations";
+  check
+    (contains progress "compiler (52.1s total activity) / phase checkPhase")
+    "activity duration must not appear to be the time spent in the current \
+     phase";
+  let summary = Report.render_summary report in
+  check
+    (contains
+       summary
+       "**5 attributes**, **2 unique root derivations** (**1 alias**)")
+    "summary counts and aliases must agree with the plan despite evaluation \
+     errors";
+  check
+    (contains summary "| Last phase | Total activity time |")
+    "summary phase metadata must be separate from total activity time";
+  check
+    (contains summary "| Package | Queue wait | Request time | Build time |"
+    && not (contains summary "Upload time"))
+    "request timings must omit the unpopulated upload-time column"
+
 let () =
   test_grouping ();
   test_workflow_commands ();
@@ -620,4 +1013,10 @@ let () =
   test_cache_imports ();
   test_cache_import_limits ();
   test_files ();
+  test_event_feed ();
+  test_ranked_progress ();
+  test_partial_evaluation_progress ();
+  test_complete_groups_and_evaluation_errors ();
+  test_plan_and_summary_presentation ();
+  test_count_units_and_activity_time ();
   print_endline "report tests passed"
