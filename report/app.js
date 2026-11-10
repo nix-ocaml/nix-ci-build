@@ -1373,6 +1373,7 @@
     function renderInspector() {
       const panel = $("inspector");
       panel.replaceChildren();
+      panel.scrollTop = 0;
       if (!state.selection) {
         const placeholder = el("div", "inspector-placeholder");
         appendText(placeholder, "span", "inspect-illustration", "↳");
