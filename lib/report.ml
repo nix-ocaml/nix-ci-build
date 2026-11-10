@@ -1088,14 +1088,20 @@ let contains value part =
   loop 0
 
 let protected_log value =
-  let rec token n =
-    let candidate =
-      "nix-ci-build-" ^ Digest.to_hex (Digest.string (string_of_int n ^ value))
+  (* Actions prints the stop/resume markers, so reserve them for text that could
+     contain modern (::) or legacy (##[) workflow commands. *)
+  if not (contains value "::" || contains value "##[")
+  then value ^ "\n"
+  else
+    let rec token n =
+      let candidate =
+        "nix-ci-build-"
+        ^ Digest.to_hex (Digest.string (string_of_int n ^ value))
+      in
+      if contains value candidate then token (n + 1) else candidate
     in
-    if contains value candidate then token (n + 1) else candidate
-  in
-  let token = token 0 in
-  "::stop-commands::" ^ token ^ "\n" ^ value ^ "\n::" ^ token ^ "::\n"
+    let token = token 0 in
+    "::stop-commands::" ^ token ^ "\n" ^ value ^ "\n::" ^ token ^ "::\n"
 
 let render_event ?(verbose = false) ?(color = false) event =
   let kind = nonempty (text "kind" event) (text "type" event) in
@@ -1282,9 +1288,7 @@ let write_snapshot t snapshot =
 let console t value =
   output_string
     stdout
-    (if t.github_actions && contains value "::"
-     then protected_log value
-     else value ^ "\n");
+    (if t.github_actions then protected_log value else value ^ "\n");
   flush stdout
 
 let emit_event t event =

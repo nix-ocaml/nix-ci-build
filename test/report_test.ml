@@ -195,6 +195,10 @@ let test_workflow_commands () =
   check
     (!stop_index >= 0 && !log_index > !stop_index)
     "log commands must occur only within the protected block";
+  let ordinary = Report.render_failure ~github_actions:true root in
+  check
+    (not (contains ordinary "::stop-commands::"))
+    "ordinary failure details must not show stop/resume markers";
   let plain = Report.render_failure ~github_actions:false root in
   check
     (not (contains plain "::group::"))
@@ -681,27 +685,32 @@ let test_event_feed () =
   check
     (contains colored "\027[1;35mBUILD  \027[0m libpq-17.5")
     "only the aligned badge should be colored, then reset";
-  let malicious =
-    `Assoc
-      [ "type", `String "job"
-      ; "state", `String "submitted"
-      ; "name", `String "package\n::error::forged\027[31m"
-      ]
-  in
-  let plain = Option.get (Report.render_event malicious) in
-  check
-    (not (contains plain "\n"))
-    "untrusted package names must remain a single line";
-  with_report ~github_actions:true ~color:false (fun report ->
-    let output =
-      capture_stdout (fun () -> Report.emit_event report malicious)
-    in
-    check
-      (contains output "::stop-commands::")
-      "event names must not execute workflow commands";
-    check
-      (not (contains output "\027"))
-      "explicitly disabled color must also apply in Actions")
+  List.iter
+    [ "package\n::error::forged\027[31m"; "package ##[error]forged" ]
+    ~f:(fun name ->
+      let malicious =
+        `Assoc
+          [ "type", `String "job"
+          ; "state", `String "submitted"
+          ; "name", `String name
+          ]
+      in
+      let plain = Option.get (Report.render_event malicious) in
+      check
+        (not (contains plain "\n"))
+        "untrusted package names must remain a single line";
+      with_report ~github_actions:true ~color:false (fun report ->
+        let output =
+          capture_stdout (fun () -> Report.emit_event report malicious)
+        in
+        check
+          (String.starts_with ~prefix:"::stop-commands::" output
+          && contains output ("\n" ^ plain ^ "\n::nix-ci-build-"))
+          "modern and legacy workflow commands must stay inside a protected \
+           block";
+        check
+          (not (contains output "\027"))
+          "explicitly disabled color must also apply in Actions"))
 
 let test_ranked_progress () =
   let activity ?(active = 1) ?(finished = `Null) name state seconds =
@@ -885,6 +894,10 @@ let test_plan_and_summary_presentation () =
       (occurrences output "::group::Build plan details" = 1
       && occurrences output "::endgroup::" = 1)
       "a plan should be one complete collapsible block";
+    check
+      (contains output "::group::Build plan details\nBuild  dependency-0\n"
+      && not (contains output "::stop-commands::"))
+      "ordinary plan details must not show stop/resume markers";
     check
       (occurrences output "Build  dependency-" = 12
       && contains output "8 more derivations")
