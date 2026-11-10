@@ -218,8 +218,10 @@ let status_line ?(color = false) label message =
   in
   badge ^ " " ^ message
 
+let needed_consumers item = unique (strings (items "neededBy" item))
+
 let consumers item =
-  let needed = unique (strings (items "neededBy" item)) in
+  let needed = needed_consumers item in
   match needed with
   | [] -> ""
   | _ ->
@@ -880,8 +882,9 @@ let render_summary snapshot =
   add
     "\n\
      Complete machine-readable results, chronological events, and logs are in \
-     the report artifact. Reproduction commands require the derivation to \
-     remain available in the Nix store.\n";
+     the report artifact. Open <code>report.html</code> from the downloaded \
+     artifact to explore the run. Reproduction commands require the derivation \
+     to remain available in the Nix store.\n";
   if !truncated
   then
     Buffer.add_string
@@ -914,6 +917,23 @@ let active_phase activity =
     | "building" -> "BUILD"
     | "downloading" -> "FETCH"
     | _ -> "WAIT"
+
+let active_activities snapshot =
+  List.filter (items "derivations" snapshot) ~f:is_active
+  |> List.stable_sort ~cmp:(fun a b ->
+    let priority item =
+      match active_phase item with "BUILD" -> 0 | "FETCH" -> 1 | _ -> 2
+    in
+    let order = Int.compare (priority a) (priority b) in
+    if order <> 0
+    then order
+    else Float.compare (activity_seconds b) (activity_seconds a))
+
+let active_imports snapshot =
+  List.filter (items "cacheReuse" snapshot) ~f:(fun imported ->
+    state imported = "importing")
+  |> List.stable_sort ~cmp:(fun a b ->
+    Float.compare (number (field "seconds" b)) (number (field "seconds" a)))
 
 let render_progress snapshot =
   let jobs = deduplicate_jobs (items "jobs" snapshot) in
@@ -979,17 +999,7 @@ let render_progress snapshot =
               ~some:(fun seconds -> " · " ^ duration seconds ^ " elapsed")
               (run_seconds snapshot)))
   in
-  let active =
-    List.filter (items "derivations" snapshot) ~f:is_active
-    |> List.stable_sort ~cmp:(fun a b ->
-      let priority item =
-        match active_phase item with "BUILD" -> 0 | "FETCH" -> 1 | _ -> 2
-      in
-      let order = Int.compare (priority a) (priority b) in
-      if order <> 0
-      then order
-      else Float.compare (activity_seconds b) (activity_seconds a))
-  in
+  let active = active_activities snapshot in
   let lines =
     List.map (take 4 active) ~f:(fun activity ->
       status_line
@@ -1025,9 +1035,7 @@ let render_progress snapshot =
         ^ single_line ~limit:60 (text "requestId" wait)))
   in
   let import_lines =
-    List.filter cache_reuse ~f:(fun imported -> state imported = "importing")
-    |> List.stable_sort ~cmp:(fun a b ->
-      Float.compare (number (field "seconds" b)) (number (field "seconds" a)))
+    active_imports snapshot
     |> take 2
     |> List.map ~f:(fun imported ->
       status_line
@@ -1240,6 +1248,7 @@ type t =
   ; events : out_channel
   ; mutable closed : bool
   ; mutable reported : StringSet.t
+  ; mutable expanded_consumers : StringSet.t
   ; mutable annotations : int
   }
 
@@ -1266,6 +1275,7 @@ let create
   ; events
   ; closed = false
   ; reported = StringSet.empty
+  ; expanded_consumers = StringSet.empty
   ; annotations = 0
   }
 
@@ -1285,16 +1295,64 @@ let write_snapshot t snapshot =
     (Filename.concat t.directory "summary.md")
     (render_summary snapshot)
 
-let console t value =
+let console ?(details = "") t value =
   output_string
     stdout
-    (if t.github_actions then protected_log value else value ^ "\n");
+    ((if t.github_actions then protected_log value else value ^ "\n") ^ details);
   flush stdout
 
+let consumer_details t item =
+  let needed = needed_consumers item in
+  if (not t.github_actions) || List.length needed <= 2
+  then ""
+  else
+    let identity = nonempty (text "name" item) (activity_path item) in
+    let key =
+      Yojson.Safe.to_string
+        (`List
+            [ `String identity
+            ; `List (List.map needed ~f:(fun s -> `String s))
+            ])
+    in
+    if StringSet.mem key t.expanded_consumers
+    then ""
+    else (
+      t.expanded_consumers <- StringSet.add key t.expanded_consumers;
+      let title =
+        Printf.sprintf
+          "Consumers of %s (%d attributes)"
+          (nonempty "Nix activity" (display_name item))
+          (List.length needed)
+      in
+      let body =
+        List.map needed ~f:(fun name -> "  " ^ single_line ~limit:max_int name)
+        |> String.concat ~sep:"\n"
+      in
+      (* The complete group is returned as one block. Heartbeats and concurrent
+         activities never leave an open group around unrelated live output. *)
+      "::group::"
+      ^ workflow_escape ~property:false title
+      ^ "\n"
+      ^ protected_log body
+      ^ "::endgroup::\n")
+
 let emit_event t event =
-  Option.iter (console t) (render_event ~verbose:t.verbose ~color:t.color event)
+  Option.iter
+    (fun line ->
+       let details =
+         match text "type" event with
+         | "activity-start" | "cache-import-start" -> consumer_details t event
+         | _ -> ""
+       in
+       console ~details t line)
+    (render_event ~verbose:t.verbose ~color:t.color event)
 
 let emit_progress t snapshot =
+  let details =
+    take 4 (active_activities snapshot) @ take 2 (active_imports snapshot)
+    |> List.map ~f:(consumer_details t)
+    |> String.concat ~sep:""
+  in
   render_progress snapshot
   |> List.map ~f:(fun line ->
     if t.color && String.length line >= 8
@@ -1305,7 +1363,7 @@ let emit_progress t snapshot =
         (String.sub line ~pos:8 ~len:(String.length line - 8))
     else line)
   |> String.concat ~sep:"\n"
-  |> console t
+  |> console ~details t
 
 let emit_failure t failure =
   let key = failure_key failure in
@@ -1421,6 +1479,7 @@ let emit_plan t snapshot =
 
 let finish t snapshot =
   write_snapshot t snapshot;
+  Html_report.write ~directory:t.directory snapshot;
   List.iter (roots snapshot) ~f:(emit_failure t);
   emit_evaluation_errors t snapshot;
   if text "error" snapshot <> ""

@@ -1,0 +1,8 @@
+(executable
+ (name embed)
+ (modules embed))
+
+(rule
+ (alias runtest)
+ (deps app.js app.test.js)
+ (action (run %{bin:node} %{dep:app.test.js})))

@@ -712,6 +712,150 @@ let test_event_feed () =
           (not (contains output "\027"))
           "explicitly disabled color must also apply in Actions"))
 
+let consumer_activity
+      ?(drv = "/nix/store/compiler.drv")
+      ?(name = "compiler")
+      needed
+  =
+  `Assoc
+    [ "type", `String "activity-start"
+    ; "drvPath", `String drv
+    ; "name", `String name
+    ; "state", `String "building"
+    ; "active", `Int 1
+    ; "seconds", `Float 12.
+    ; "neededBy", `List (List.map needed ~f:(fun name -> `String name))
+    ]
+
+let consumer_snapshot activity =
+  `Assoc
+    [ "status", `String "building"
+    ; "evaluation", `Assoc [ "complete", `Bool true ]
+    ; "derivations", `List [ activity ]
+    ]
+
+let test_consumer_groups () =
+  let needed = List.init ~len:12 ~f:(Printf.sprintf "package-%02d") in
+  let activity = consumer_activity needed in
+  with_report ~github_actions:true (fun report ->
+    let first = capture_stdout (fun () -> Report.emit_event report activity) in
+    check
+      (contains first "BUILD   compiler → package-00, package-01 (+10 more)")
+      "consumer groups must leave the ordinary activity line compact";
+    check
+      (contains first "::group::Consumers of compiler (12 attributes)\n")
+      "the collapsed group should identify the activity and full attribute \
+       count";
+    List.iter needed ~f:(fun name ->
+      check
+        (contains first ("  " ^ name ^ "\n"))
+        "the group must include every consumer, including omitted names");
+    check
+      (occurrences first "::group::" = 1
+      && occurrences first "::endgroup::" = 1
+      && not (contains first "::stop-commands::"))
+      "ordinary consumer groups must close without unnecessary runner markers";
+    let repeated =
+      capture_stdout (fun () ->
+        Report.emit_event
+          report
+          (consumer_activity ("package-00" :: List.rev needed));
+        Report.emit_progress report (consumer_snapshot activity))
+    in
+    check
+      (not (contains repeated "::group::"))
+      "events and heartbeats must share deduplication despite reordered \
+       duplicate consumers";
+    let changed = consumer_activity ("package-new" :: needed) in
+    let updated =
+      capture_stdout (fun () ->
+        Report.emit_progress report (consumer_snapshot changed))
+    in
+    check
+      (contains updated "::group::Consumers of compiler (13 attributes)\n"
+      && contains updated "  package-new\n")
+      "a changed consumer list must expose its newly added attributes";
+    let other =
+      capture_stdout (fun () ->
+        Report.emit_event
+          report
+          (consumer_activity ~drv:"/nix/store/other-compiler.drv" needed))
+    in
+    check
+      (contains other "::group::Consumers of compiler (12 attributes)")
+      "distinct derivations with the same display name need independent groups");
+  with_report ~github_actions:false (fun report ->
+    let plain =
+      capture_stdout (fun () ->
+        Report.emit_event report activity;
+        Report.emit_progress report (consumer_snapshot activity))
+    in
+    check
+      (contains plain "(+10 more)"
+      && (not (contains plain "::group::"))
+      && not (contains plain "package-11"))
+      "plain progress must stay compact without Actions workflow commands");
+  with_report ~github_actions:true (fun report ->
+    let progress =
+      capture_stdout (fun () ->
+        Report.emit_progress report (consumer_snapshot activity))
+    in
+    check
+      (contains progress "::group::Consumers of compiler (12 attributes)")
+      "a heartbeat must expose consumers even without a previously rendered \
+       start event")
+
+let test_consumer_group_workflow_safety () =
+  let long_name = "long-" ^ String.make 500 'x' in
+  let needed =
+    [ "ordinary"
+    ; "::endgroup::\n::error::forged"
+    ; "legacy ##[error]forged"
+    ; long_name
+    ]
+  in
+  let activity =
+    consumer_activity ~name:"compiler\n::group::forged\027[31m" needed
+  in
+  with_report ~github_actions:true (fun report ->
+    let output = capture_stdout (fun () -> Report.emit_event report activity) in
+    check
+      (contains output ("  " ^ long_name ^ "\n"))
+      "expanded consumer lists must not truncate long attribute names";
+    check
+      (not (contains output "\027"))
+      "consumer names and group titles must strip terminal control sequences";
+    let protected = ref None
+    and groups = ref 0
+    and closed = ref 0 in
+    List.iter (String.split_on_char ~sep:'\n' output) ~f:(fun line ->
+      match !protected with
+      | Some token -> if line = "::" ^ token ^ "::" then protected := None
+      | None ->
+        let prefix = "::stop-commands::" in
+        if String.starts_with ~prefix line
+        then
+          protected :=
+            Some
+              (String.sub
+                 line
+                 ~pos:(String.length prefix)
+                 ~len:(String.length line - String.length prefix))
+        else if String.starts_with ~prefix:"::group::Consumers of " line
+        then incr groups
+        else if line = "::endgroup::"
+        then incr closed
+        else
+          check
+            ((not (contains line "::error::"))
+            && (not (contains line "##[error]"))
+            && not (contains line "::group::forged"))
+            "consumer and activity names must not become executable workflow \
+             commands");
+    check
+      (!groups = 1 && !closed = 1 && !protected = None)
+      "untrusted consumers must stay inside a protected, complete group")
+
 let test_ranked_progress () =
   let activity ?(active = 1) ?(finished = `Null) name state seconds =
     `Assoc
@@ -1014,6 +1158,8 @@ let () =
   test_cache_import_limits ();
   test_files ();
   test_event_feed ();
+  test_consumer_groups ();
+  test_consumer_group_workflow_safety ();
   test_ranked_progress ();
   test_partial_evaluation_progress ();
   test_complete_groups_and_evaluation_errors ();

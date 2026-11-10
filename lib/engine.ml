@@ -51,6 +51,9 @@ type activity =
 type upload =
   { path : string
   ; mutable state : string
+  ; queued : float
+  ; mutable started : float option
+  ; mutable finished : float option
   ; mutable seconds : float
   ; mutable error : string option
   ; log : string
@@ -306,6 +309,13 @@ let snapshot t =
         ; "waitSeconds", `Float a.wait_seconds
         ; "logPath", `String a.log
         ; "outputPaths", Json.strs (List.filter_map a.node.outputs ~f:snd)
+        ; ( "inputs"
+          , `List
+              (List.map a.node.inputs ~f:(fun (edge : Plan.edge) ->
+                 `Assoc
+                   [ "drvPath", `String edge.drv_path
+                   ; "outputs", Json.strs edge.outputs
+                   ])) )
         ; "neededBy", Json.strs (needed_by t a.node.drv_path)
         ])
   in
@@ -332,6 +342,11 @@ let snapshot t =
               ; "paths", Json.strs i.paths
               ; "source", `String i.source
               ; "state", `String i.state
+              ; "startedAt", `Float i.started
+              ; ( "finishedAt"
+                , if i.state = "importing"
+                  then `Null
+                  else `Float (i.started +. i.seconds) )
               ; ( "seconds"
                 , `Float
                     (if i.state = "importing"
@@ -360,6 +375,9 @@ let snapshot t =
              `Assoc
                [ "path", `String u.path
                ; "state", `String u.state
+               ; "queuedAt", `Float u.queued
+               ; "startedAt", Json.optional (fun x -> `Float x) u.started
+               ; "finishedAt", Json.optional (fun x -> `Float x) u.finished
                ; "seconds", `Float u.seconds
                ; "error", Json.optional Json.str u.error
                ; "logPath", `String u.log
@@ -860,6 +878,20 @@ let run_build t process_mgr clock batch =
     List.iter remaining ~f:(fun (j : job) -> j.log <- log);
     let ids = Hashtbl.create 32 in
     let wait_ids = Hashtbl.create 4 in
+    let activity_id id = request_id ^ ":" ^ string_of_int number ^ ":" ^ id in
+    let identity id kind =
+      [ "activityId", `String (activity_id id)
+      ; "requestId", `String request_id
+      ; "attempt", `Int number
+      ; ( "activityKind"
+        , `String
+            (if kind = 105
+             then "build"
+             else if kind = 108
+             then "download"
+             else "wait") )
+      ]
+    in
     let stop_wait id =
       Option.iter
         (fun key ->
@@ -870,6 +902,7 @@ let run_build t process_mgr clock batch =
              t
              "request-wait-ended"
              [ "requestId", `String request_id
+             ; "id", `String key
              ; "drvs", Json.strs drvs
              ; "reason", `String reason
              ; "seconds", `Float (now () -. started)
@@ -880,7 +913,7 @@ let run_build t process_mgr clock batch =
       let open Activity in
       match parse line with
       | Start { id; kind = 111; fields = []; text; _ } ->
-        let key = request_id ^ ":" ^ string_of_int number ^ ":" ^ id in
+        let key = activity_id id in
         let drvs = List.map remaining ~f:(fun j -> j.edge.drv_path) in
         Hashtbl.replace wait_ids id key;
         Hashtbl.replace t.waits key (request_id, drvs, strip_ansi text, now ());
@@ -888,6 +921,7 @@ let run_build t process_mgr clock batch =
           t
           "request-wait"
           [ "requestId", `String request_id
+          ; "id", `String key
           ; "drvs", Json.strs drvs
           ; "reason", `String (strip_ansi text)
           ]
@@ -918,7 +952,7 @@ let run_build t process_mgr clock batch =
                     drv
                     (List.sort_uniq ~cmp:String.compare attrs));
                append_log t a (strip_ansi text);
-               Hashtbl.replace ids id (drv, kind, now ());
+               Hashtbl.replace ids id (drv, kind, now (), path);
                Hashtbl.replace observed drv ();
                if a.started = None then a.started <- Some (now ());
                if a.active = 0 then a.active_started <- Some (now ());
@@ -936,28 +970,34 @@ let run_build t process_mgr clock batch =
                event
                  t
                  "activity-start"
-                 [ "drvPath", `String drv
-                 ; "state", `String a.state
-                 ; "active", `Int a.active
-                 ];
+                 (identity id kind
+                 @ [ "drvPath", `String drv
+                   ; "path", `String path
+                   ; "state", `String a.state
+                   ; "active", `Int a.active
+                   ]);
                checkpoint t)
             drv
         | _ -> ())
       | Result { id; kind; fields } ->
         Option.iter
-          (fun (drv, _, _) ->
+          (fun (drv, activity_kind, _, _) ->
              let a = get_activity t drv in
              match fields with
              | `String text :: _ when kind = 104 ->
                a.phase <- text;
-               event t "phase" [ "drvPath", `String drv; "phase", `String text ]
+               event
+                 t
+                 "phase"
+                 (identity id activity_kind
+                 @ [ "drvPath", `String drv; "phase", `String text ])
              | `String text :: _ when kind = 101 -> append_log t a text
              | _ -> ())
           (Hashtbl.find_opt ids id)
       | Stop id ->
         stop_wait id;
         Option.iter
-          (fun (drv, kind, started) ->
+          (fun (drv, kind, started, path) ->
              Hashtbl.remove ids id;
              let a = get_activity t drv in
              let elapsed = now () -. started in
@@ -990,11 +1030,14 @@ let run_build t process_mgr clock batch =
              event
                t
                "activity-stop"
-               [ "drvPath", `String drv
-               ; "state", `String a.state
-               ; "seconds", `Float a.seconds
-               ; "active", `Int a.active
-               ];
+               (identity id kind
+               @ [ "drvPath", `String drv
+                 ; "path", `String path
+                 ; "state", `String a.state
+                 ; "seconds", `Float a.seconds
+                 ; "activitySeconds", `Float elapsed
+                 ; "active", `Int a.active
+                 ]);
              checkpoint t)
           (Hashtbl.find_opt ids id)
       | Message { message; _ } ->
@@ -1713,6 +1756,9 @@ let uploader t process_mgr clock =
              let u =
                { path
                ; state = "queued"
+               ; queued = now ()
+               ; started = None
+               ; finished = None
                ; seconds = 0.
                ; error = None
                ; log = "logs/upload-" ^ name ^ ".log"
@@ -1728,6 +1774,7 @@ let uploader t process_mgr clock =
              | () -> event t "upload-queued" [ "path", `String path ]
              | exception Failure message ->
                u.state <- "failed";
+               u.finished <- Some (now ());
                u.error <- Some message;
                event
                  t
@@ -1756,6 +1803,11 @@ let uploader t process_mgr clock =
       | u :: _, Some destination when !active < 2 ->
         incr active;
         u.state <- "uploading";
+        u.started <- Some (now ());
+        event
+          t
+          "upload-start"
+          [ "path", `String u.path; "state", `String u.state ];
         Eio.Fiber.fork ~sw (fun () ->
           let started = now () in
           Fun.protect
@@ -1785,6 +1837,7 @@ let uploader t process_mgr clock =
                in
                let result = copy 0 in
                u.seconds <- now () -. started;
+               u.finished <- Some (now ());
                u.state <-
                  (if Backend.successful result then "uploaded" else "failed");
                if u.state = "failed" then u.error <- Some (Backend.error result);
@@ -1849,6 +1902,11 @@ let run config env =
     ; "gitSha", `String (env_string "GITHUB_SHA")
     ; "runUrl", `String run_url
     ; "runAttempt", `String (env_string "GITHUB_RUN_ATTEMPT")
+    ; "repository", `String (env_string "GITHUB_REPOSITORY")
+    ; "ref", `String (env_string "GITHUB_REF")
+    ; "headRef", `String (env_string "GITHUB_HEAD_REF")
+    ; "workflow", `String (env_string "GITHUB_WORKFLOW")
+    ; "job", `String (env_string "GITHUB_JOB")
     ; "jobs", `Int config.jobs
     ]
   in
@@ -1912,7 +1970,19 @@ let run config env =
                          )
                       :: t.context;
                     let evaluation_started = now () in
+                    event
+                      t
+                      "stage"
+                      [ "stage", `String "evaluation"
+                      ; "state", `String "started"
+                      ];
                     evaluate t process_mgr;
+                    event
+                      t
+                      "stage"
+                      [ "stage", `String "evaluation"
+                      ; "state", `String "finished"
+                      ];
                     t.context <-
                       ( "evaluationSeconds"
                       , `Float (now () -. evaluation_started) )
@@ -1920,12 +1990,24 @@ let run config env =
                     t.status <- "planning";
                     checkpoint t;
                     let planning_started = now () in
+                    event
+                      t
+                      "stage"
+                      [ "stage", `String "planning"
+                      ; "state", `String "started"
+                      ];
                     let stores =
                       if pending_roots t = []
                       then []
                       else Backend.substituters process_mgr
                     in
                     make_plan t process_mgr stores;
+                    event
+                      t
+                      "stage"
+                      [ "stage", `String "planning"
+                      ; "state", `String "finished"
+                      ];
                     t.context <-
                       ("planningSeconds", `Float (now () -. planning_started))
                       :: t.context;
@@ -1987,7 +2069,10 @@ let run config env =
        Hashtbl.iter
          (fun _ (u : upload) ->
             if u.state = "queued" || u.state = "uploading"
-            then u.state <- "cancelled")
+            then (
+              u.finished <- Some (now ());
+              u.seconds <- duration u.started u.finished;
+              u.state <- "cancelled"))
          t.uploads;
        if
          t.status <> "cancelled"

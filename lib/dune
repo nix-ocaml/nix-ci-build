@@ -3,3 +3,10 @@
  (name nix_ci_build)
  (libraries eio eio_main yojson logs unix fmt.tty logs.fmt logs.threaded)
  (flags :standard -open StdLabels))
+
+(rule
+ (targets report_assets.ml)
+ (deps ../report/template.html ../report/style.css ../report/app.js)
+ (action
+  (with-stdout-to %{targets}
+   (run %{exe:../report/embed.exe} %{deps}))))

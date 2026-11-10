@@ -2,6 +2,7 @@ open Cmdliner
 
 let main
       flake
+      render_report
       jobs
       copy_to
       output
@@ -16,48 +17,77 @@ let main
       retries
       verbose
   =
-  if
-    jobs < 1
-    || batch_size < 1
-    || retries < 0
-    || heartbeat <= 0.
-    || (not (Float.is_finite heartbeat))
-    || cache_refresh < 0.
-    || not (Float.is_finite cache_refresh)
-  then (
+  match render_report, flake with
+  | Some directory, None ->
+    (try
+       Nix_ci_build.Html_report.regenerate ~directory;
+       Printf.printf "%s\n%!" (Filename.concat directory "report.html");
+       0
+     with
+    | exn ->
+      prerr_endline ("Cannot render build report: " ^ Printexc.to_string exn);
+      1)
+  | Some _, Some _ ->
+    prerr_endline "--render-report cannot be combined with --flake";
+    2
+  | None, None ->
     prerr_endline
-      "jobs, batch-size and heartbeat must be positive; retries must be \
-       nonnegative; cache-refresh must be finite and nonnegative";
-    2)
-  else
-    let config =
-      { Nix_ci_build.Engine.flake
-      ; jobs
-      ; copy_to
-      ; output
-      ; report_dir
-      ; dry_run
-      ; explain
-      ; compare
-      ; history
-      ; heartbeat
-      ; cache_refresh
-      ; batch_size
-      ; retries
-      ; verbose
-      }
-    in
-    Eio_main.run (Nix_ci_build.Engine.run config)
+      "Provide --flake to build or --render-report to view a saved run";
+    2
+  | None, Some flake ->
+    if
+      jobs < 1
+      || batch_size < 1
+      || retries < 0
+      || heartbeat <= 0.
+      || (not (Float.is_finite heartbeat))
+      || cache_refresh < 0.
+      || not (Float.is_finite cache_refresh)
+    then (
+      prerr_endline
+        "jobs, batch-size and heartbeat must be positive; retries must be \
+         nonnegative; cache-refresh must be finite and nonnegative";
+      2)
+    else
+      let config =
+        { Nix_ci_build.Engine.flake
+        ; jobs
+        ; copy_to
+        ; output
+        ; report_dir
+        ; dry_run
+        ; explain
+        ; compare
+        ; history
+        ; heartbeat
+        ; cache_refresh
+        ; batch_size
+        ; retries
+        ; verbose
+        }
+      in
+      Eio_main.run (Nix_ci_build.Engine.run config)
 
 let command =
   let flake =
     Arg.(
-      required
+      value
       & opt (some string) None
       & info
           [ "f"; "flake" ]
           ~docv:"FLAKE#ATTR"
           ~doc:"Package set to evaluate and build.")
+  in
+  let render_report =
+    Arg.(
+      value
+      & opt (some string) None
+      & info
+          [ "render-report" ]
+          ~docv:"DIR"
+          ~doc:
+            "Generate an offline interactive report from saved results.json \
+             and events.jsonl in DIR; does not run Nix.")
   in
   let jobs =
     Arg.(
@@ -192,6 +222,7 @@ let command =
     Term.(
       const main
       $ flake
+      $ render_report
       $ jobs
       $ copy_to
       $ output
