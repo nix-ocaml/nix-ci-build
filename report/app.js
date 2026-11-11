@@ -1,6 +1,13 @@
 (function (global) {
   "use strict";
 
+  const Query =
+    typeof module !== "undefined" && module.exports
+      ? require("./query.js")
+      : global.NixReportQuery;
+  const TIMELINE_ROW_HEIGHT = 32,
+    PACKAGE_ROW_HEIGHT = 44;
+
   const KINDS = {
     evaluation: {
       label: "Evaluation",
@@ -879,13 +886,13 @@
 
   function filterRows(model, options) {
     const o = object(options),
-      text = string(o.search).toLowerCase().trim(),
+      query = o.query || Query.compile(string(o.search)),
       from = number(o.start) ?? model.start,
       to = number(o.end) ?? model.end;
     return model.rows.filter(
       (row) =>
         (!o.kinds || o.kinds.has(row.kind)) &&
-        (!text || row.search.includes(text)) &&
+        query.match(row) &&
         stateMatches(row.state, o.state || "all") &&
         row.end >= from &&
         row.start <= to &&
@@ -906,6 +913,81 @@
         length,
         first + Math.ceil(Math.max(0, height) / rowHeight) + 2 * overscan,
       ),
+    };
+  }
+
+  function viewFragment(state, model) {
+    const params = new URLSearchParams();
+    params.set("view", state.tab);
+    if (state.search) params.set("q", state.search);
+    if (state.outcome !== "all") params.set("status", state.outcome);
+    params.set("kinds", [...state.kinds].join(","));
+    if (state.from > model.start)
+      params.set("from", (state.from - model.start).toFixed(3));
+    if (state.to < model.end)
+      params.set("to", (state.to - model.start).toFixed(3));
+    if (state.sort !== "start") params.set("sort", state.sort);
+    if (state.packageSort !== "attention")
+      params.set("packages", state.packageSort);
+    if (state.focus) params.set("focus", state.focus);
+    if (state.selection) {
+      if (state.selection.nodeId) params.set("node", state.selection.nodeId);
+      if (state.selection.rowId) params.set("row", state.selection.rowId);
+      params.set("detail", state.inspectorTab);
+    }
+    return "#" + params.toString();
+  }
+
+  function readView(fragment, model) {
+    if (typeof fragment !== "string" || fragment.length > 32768) return null;
+    const params = new URLSearchParams(fragment.replace(/^#/, ""));
+    if (!params.has("view")) return null;
+    const choice = (key, choices, fallback) =>
+      choices.includes(params.get(key)) ? params.get(key) : fallback;
+    const time = (key, fallback) => {
+      if (!params.has(key)) return fallback;
+      const value = Number(params.get(key));
+      return Number.isFinite(value)
+        ? clamp(model.start + value, model.start, model.end)
+        : fallback;
+    };
+    const row = model.rowMap.get(params.get("row"));
+    const node = model.nodes.get(params.get("node"));
+    return {
+      tab: choice("view", ["timeline", "packages", "diagnostics"], "timeline"),
+      search: (params.get("q") || "").slice(0, 8192),
+      outcome: choice(
+        "status",
+        ["all", "failed", "active", "built", "cached", "cancelled"],
+        "all",
+      ),
+      kinds: new Set(
+        params.has("kinds")
+          ? params
+              .get("kinds")
+              .split(",")
+              .filter((k) => Object.hasOwn(KINDS, k))
+          : DEFAULT_KINDS,
+      ),
+      from: time("from", model.start),
+      to: time("to", model.end),
+      sort: choice("sort", ["start", "duration", "kind", "name"], "start"),
+      packageSort: choice(
+        "packages",
+        ["attention", "time", "name", "state"],
+        "attention",
+      ),
+      inspectorTab: choice(
+        "detail",
+        ["overview", "dependencies", "metadata"],
+        "overview",
+      ),
+      selection: row
+        ? { nodeId: row.nodeId, rowId: row.id }
+        : node
+          ? { nodeId: node.id, rowId: null }
+          : null,
+      focus: model.nodes.has(params.get("focus")) ? params.get("focus") : null,
     };
   }
 
@@ -938,11 +1020,13 @@
         focus: null,
         selection: null,
         diagnosticPage: 0,
+        inspectorTab: "overview",
       };
     let filteredRows = [],
       filteredPackages = [],
       pendingFrame = false,
-      toastTimer;
+      toastTimer,
+      restoringView = true;
     const color = (kind) => `var(${KINDS[kind].color})`;
     const setKind = (node, kind) =>
       node.style.setProperty("--kind-color", color(kind));
@@ -995,6 +1079,111 @@
         );
       }
     };
+    function saveView() {
+      if (restoringView) return;
+      try {
+        global.history.replaceState(null, "", viewFragment(state, model));
+      } catch (_) {
+        /* Some browsers restrict history for local files. */
+      }
+    }
+    function updateSearch(value) {
+      state.search = value;
+      $("search").value = value;
+      state.diagnosticPage = 0;
+      refilter(true);
+    }
+    function addQueryTerm(field, value) {
+      updateSearch(Query.addTerm(state.search, { field, value }));
+    }
+    function renderQuery(query) {
+      $("query-error").hidden = !query.error;
+      $("query-error").textContent = query.error || "";
+      $("search").setAttribute("aria-invalid", String(Boolean(query.error)));
+      const chips = $("active-filters");
+      const focus = focusedKey(chips);
+      chips.replaceChildren();
+      query.terms.forEach((term, index) => {
+        const chip = button(`${term.raw} ×`, "filter-chip", () =>
+          updateSearch(Query.removeTerm(state.search, index)),
+        );
+        chip.dataset.focusKey = `term-${index}`;
+        chip.setAttribute("aria-label", `Remove filter ${term.raw}`);
+        chips.append(chip);
+      });
+      if (state.outcome !== "all") {
+        const chip = button(`outcome:${state.outcome} ×`, "filter-chip", () => {
+          state.outcome = "all";
+          $("state-filter").value = "all";
+          refilter(true);
+        });
+        chip.dataset.focusKey = "outcome";
+        chips.append(chip);
+      }
+      chips.hidden = !chips.children.length;
+      restoreFocus(chips, focus, $("search"));
+    }
+    function packageQueryRow(node) {
+      return {
+        ...node,
+        kind: "request",
+        seconds:
+          number(node.job.startedAt) === null
+            ? null
+            : number(node.job.activeSeconds),
+      };
+    }
+    function renderStateFacets(query) {
+      const container = $("facet-states"),
+        focus = focusedKey(container);
+      container.replaceChildren();
+      const candidates =
+        state.tab === "diagnostics"
+          ? model.diagnostics.map(diagnosticQueryRow).filter(query.match)
+          : state.tab === "packages"
+            ? model.jobs.map(packageQueryRow).filter(query.match)
+            : filterRows(model, {
+                query,
+                kinds: query.terms.some((t) => t.field === "kind")
+                  ? null
+                  : state.kinds,
+                start: state.from,
+                end: state.to,
+                focus: state.focus,
+              });
+      for (const [value, label] of [
+        ["all", "All outcomes"],
+        ["failed", "Failed / blocked"],
+        ["active", "In progress"],
+        ["built", "Built"],
+        ["cached", "Cached"],
+        ["cancelled", "Cancelled"],
+      ]) {
+        const b = button("", "facet-toggle", () => {
+          state.outcome = value;
+          $("state-filter").value = value;
+          refilter(true);
+        });
+        b.dataset.focusKey = value;
+        b.setAttribute("aria-pressed", String(state.outcome === value));
+        appendText(b, "span", "facet-label", label);
+        appendText(
+          b,
+          "span",
+          "facet-count",
+          count(candidates.filter((r) => stateMatches(r.state, value)).length),
+        );
+        container.append(b);
+      }
+      restoreFocus(container, focus);
+      $("facet-summary").textContent =
+        state.tab === "diagnostics"
+          ? `${count(candidates.filter((r) => stateMatches(r.state, state.outcome)).length)} diagnostics`
+          : state.tab === "packages"
+            ? `${count(filteredPackages.length)} packages`
+            : `${count(filteredRows.length)} activities`;
+      $("facet-kinds").hidden = state.tab !== "timeline";
+    }
     const linkLog = (parent, path) => {
       if (!safeLog(path)) return;
       const hosted = model.context.logsAvailable === false;
@@ -1033,6 +1222,7 @@
       state.selection = { nodeId, rowId };
       renderInspector();
       renderVisible();
+      saveView();
       if (fromInspector) {
         $("inspector-title").tabIndex = -1;
         $("inspector-title").focus({ preventScroll: true });
@@ -1062,7 +1252,10 @@
         (candidate) => candidate.id === row.id,
       );
       if (index >= 0)
-        $("timeline-scroll").scrollTop = Math.max(0, index * 44 - 88);
+        $("timeline-scroll").scrollTop = Math.max(
+          0,
+          index * TIMELINE_ROW_HEIGHT - 64,
+        );
       select(row.nodeId, row.id);
       restoreFocus($("timeline-rows"), `${row.id}:label`);
     }
@@ -1073,8 +1266,9 @@
         $("tab-" + name).setAttribute("aria-selected", String(name === tab));
         $("tab-" + name).tabIndex = name === tab ? 0 : -1;
       }
-      renderVisible();
+      refilter();
       if (tab === "timeline") drawOverview();
+      saveView();
     }
     function setWindow(a, b) {
       const minimum = model.extent / 1000;
@@ -1128,10 +1322,13 @@
       setWindow(a, b);
     }
     function refilter(resetScroll) {
+      const query = Query.compile(state.search);
       filteredRows = filterRows(model, {
-        search: state.search,
+        query,
         state: state.outcome,
-        kinds: state.kinds,
+        kinds: query.terms.some((term) => term.field === "kind")
+          ? null
+          : state.kinds,
         start: state.from,
         end: state.to,
         focus: state.focus,
@@ -1150,7 +1347,7 @@
       );
       filteredPackages = model.jobs.filter(
         (n) =>
-          (!state.search || n.search.includes(state.search)) &&
+          query.match(packageQueryRow(n)) &&
           stateMatches(n.state, state.outcome),
       );
       const rank = {
@@ -1176,9 +1373,9 @@
       $("timeline-count").textContent =
         `${count(filteredRows.length)} activity lanes`;
       $("timeline-rows").style.height =
-        `${Math.max(110, filteredRows.length * 44)}px`;
+        `${Math.max(110, filteredRows.length * TIMELINE_ROW_HEIGHT)}px`;
       $("package-rows").style.height =
-        `${Math.max(110, filteredPackages.length * 56)}px`;
+        `${Math.max(110, filteredPackages.length * PACKAGE_ROW_HEIGHT)}px`;
       $("package-footnote").textContent =
         `${count(filteredPackages.length)} of ${count(model.jobs.length)} unique root derivations · request time includes dependency work and Nix waiting; build time is observed builder activity.`;
       $("focus-strip").hidden = !state.focus;
@@ -1192,6 +1389,10 @@
       }
       renderVisible();
       renderDiagnostics();
+      renderQuery(query);
+      renderKindFilters(query);
+      renderStateFacets(query);
+      saveView();
     }
     function renderAxis() {
       const ticks = $("axis-ticks");
@@ -1234,7 +1435,7 @@
           filteredRows.length,
           viewport.scrollTop,
           viewport.clientHeight || 484,
-          44,
+          TIMELINE_ROW_HEIGHT,
         ),
         span = Math.max(0.001, state.to - state.from);
       const fragment = document.createDocumentFragment();
@@ -1242,10 +1443,11 @@
         const row = filteredRows[i],
           wrapper = el("div", "timeline-row"),
           label = button("", "row-label", () => select(row.nodeId, row.id));
-        wrapper.style.top = `${i * 44}px`;
+        wrapper.style.top = `${i * TIMELINE_ROW_HEIGHT}px`;
         wrapper.dataset.row = row.id;
         wrapper.dataset.index = String(i);
         label.dataset.focusKey = `${row.id}:label`;
+        label.addEventListener("dblclick", () => focusActivity(row));
         if (
           state.selection &&
           (state.selection.rowId === row.id ||
@@ -1283,6 +1485,8 @@
           const bar = button("", "interval", () => select(row.nodeId, row.id));
           setKind(bar, row.kind);
           bar.dataset.focusKey = `${row.id}:bar:${thisSegment}`;
+          bar.addEventListener("dblclick", () => focusActivity(row));
+          bar.dataset.segment = String(thisSegment);
           bar.style.left = `${((a - state.from) / span) * 100}%`;
           bar.style.width = `${Math.max(0.08, ((b - a) / span) * 100)}%`;
           if (segment.estimated) bar.classList.add("estimated");
@@ -1327,13 +1531,13 @@
           filteredPackages.length,
           viewport.scrollTop,
           viewport.clientHeight || 484,
-          56,
+          PACKAGE_ROW_HEIGHT,
         ),
         fragment = document.createDocumentFragment();
       for (let i = range.first; i < range.last; i++) {
         const node = filteredPackages[i],
           row = button("", "package-row", () => select(node.id, null));
-        row.style.top = `${i * 56}px`;
+        row.style.top = `${i * PACKAGE_ROW_HEIGHT}px`;
         row.dataset.index = String(i);
         row.dataset.focusKey = node.id;
         if (state.selection && state.selection.nodeId === node.id)
@@ -1374,6 +1578,58 @@
       const panel = $("inspector");
       panel.replaceChildren();
       panel.scrollTop = 0;
+      const resize = el("div", "inspector-resize");
+      resize.setAttribute("role", "separator");
+      resize.setAttribute("aria-label", "Resize activity details");
+      resize.setAttribute("aria-orientation", "vertical");
+      resize.tabIndex = 0;
+      const resizeWidth = (width) => {
+        const next = clamp(width, 260, Math.min(600, global.innerWidth * 0.45));
+        $("workspace-grid").style.setProperty("--inspector-width", `${next}px`);
+        resize.setAttribute("aria-valuenow", String(Math.round(next)));
+        drawOverview();
+      };
+      resize.setAttribute("aria-valuemin", "260");
+      resize.setAttribute(
+        "aria-valuemax",
+        String(Math.min(600, Math.floor(global.innerWidth * 0.45))),
+      );
+      resize.setAttribute(
+        "aria-valuenow",
+        String(Math.round(panel.getBoundingClientRect().width)),
+      );
+      let resizeOrigin = null;
+      resize.addEventListener("pointerdown", (event) => {
+        if (event.button !== 0) return;
+        resizeOrigin = {
+          x: event.clientX,
+          width: panel.getBoundingClientRect().width,
+        };
+        resize.setPointerCapture(event.pointerId);
+        event.preventDefault();
+      });
+      resize.addEventListener("pointermove", (event) => {
+        if (resizeOrigin)
+          resizeWidth(resizeOrigin.width + resizeOrigin.x - event.clientX);
+      });
+      for (const event of ["pointerup", "pointercancel", "lostpointercapture"])
+        resize.addEventListener(event, () => {
+          resizeOrigin = null;
+        });
+      resize.addEventListener("keydown", (event) => {
+        if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key))
+          return;
+        event.preventDefault();
+        resizeWidth(
+          event.key === "Home"
+            ? 260
+            : event.key === "End"
+              ? 600
+              : panel.getBoundingClientRect().width +
+                (event.key === "ArrowLeft" ? 20 : -20),
+        );
+      });
+      panel.append(resize);
       if (!state.selection) {
         const placeholder = el("div", "inspector-placeholder");
         appendText(placeholder, "span", "inspect-illustration", "↳");
@@ -1408,6 +1664,7 @@
         state.selection = null;
         renderInspector();
         renderVisible();
+        saveView();
         $("tab-" + state.tab).focus({ preventScroll: true });
       });
       close.setAttribute("aria-label", "Close activity details");
@@ -1416,6 +1673,19 @@
       const title = appendText(head, "h2", "", name);
       title.id = "inspector-title";
       if (row || node) head.append(stateLabel(row ? row.state : node.state));
+      const tags = el("div", "detail-tags");
+      if (row)
+        tags.append(
+          button(`kind:${row.kind}`, "tag-filter", () =>
+            addQueryTerm("kind", row.kind),
+          ),
+        );
+      tags.append(
+        button("Filter this name", "tag-filter", () =>
+          addQueryTerm("name", name),
+        ),
+      );
+      head.append(tags);
       const actions = el("div", "detail-actions");
       linkLog(
         actions,
@@ -1447,10 +1717,67 @@
         );
       head.append(actions);
       panel.append(head);
-      const section = (title) => {
+      const tabs = el("div", "inspector-tabs");
+      tabs.setAttribute("role", "tablist");
+      tabs.setAttribute("aria-label", "Activity details");
+      panel.append(tabs);
+      const tabNames = node
+        ? ["overview", "dependencies", "metadata"]
+        : ["overview"];
+      if (!tabNames.includes(state.inspectorTab))
+        state.inspectorTab = "overview";
+      const contents = new Map();
+      const showDetail = (name, focus = false) => {
+        state.inspectorTab = name;
+        for (const tab of tabs.children) {
+          const selected = tab.dataset.detail === name;
+          tab.setAttribute("aria-selected", String(selected));
+          tab.tabIndex = selected ? 0 : -1;
+          if (selected && focus) tab.focus({ preventScroll: true });
+        }
+        for (const [key, content] of contents) content.hidden = key !== name;
+        panel.scrollTop = 0;
+        saveView();
+      };
+      for (const name of tabNames) {
+        const tab = button(
+          name[0].toUpperCase() + name.slice(1),
+          "inspector-tab",
+          () => showDetail(name),
+        );
+        tab.dataset.detail = name;
+        tab.id = `detail-tab-${name}`;
+        tab.setAttribute("role", "tab");
+        tab.setAttribute("aria-controls", `detail-panel-${name}`);
+        tabs.append(tab);
+        const content = el("div", "inspector-content");
+        content.id = `detail-panel-${name}`;
+        content.setAttribute("role", "tabpanel");
+        content.setAttribute("aria-labelledby", tab.id);
+        contents.set(name, content);
+        panel.append(content);
+      }
+      tabs.addEventListener("keydown", (event) => {
+        if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key))
+          return;
+        event.preventDefault();
+        const i = tabNames.indexOf(state.inspectorTab);
+        showDetail(
+          tabNames[
+            event.key === "Home"
+              ? 0
+              : event.key === "End"
+                ? tabNames.length - 1
+                : (i + (event.key === "ArrowRight" ? 1 : tabNames.length - 1)) %
+                  tabNames.length
+          ],
+          true,
+        );
+      });
+      const section = (title, tab = "overview") => {
         const s = el("section", "inspector-section");
         appendText(s, "h3", "", title);
-        panel.append(s);
+        contents.get(tab).append(s);
         return s;
       };
       const timing = section("Timing"),
@@ -1536,7 +1863,12 @@
         const showPhases = (limit) => {
           const body = el("div");
           for (const p of phases.slice(0, limit)) {
-            const line = el("div", "phase-list-row");
+            const line = button("", "phase-list-row", () => {
+              setTab("timeline");
+              const padding = Math.max(0.1, (p.end - p.start) * 0.1);
+              setWindow(p.start - padding, p.end + padding);
+            });
+            line.title = `Focus ${p.name || "phase"} in the waterfall`;
             appendText(line, "span", "", p.name || "Unnamed phase");
             appendText(
               line,
@@ -1572,7 +1904,7 @@
         );
       }
       if (node) {
-        const flow = section("Dependency neighborhood"),
+        const flow = section("Dependency neighborhood", "dependencies"),
           inputNodes = node.inputs.filter((x) => x && string(x.drvPath));
         const linkList = (parent, values, render, limit = 8) => {
           const list = el("div");
@@ -1698,7 +2030,7 @@
             ? `nix build -L --no-link '${node.id.replace(/'/g, "'\\''")}^*'`
             : "");
         if (reproduction) {
-          const repro = section("Reproduce");
+          const repro = section("Reproduce", "metadata");
           appendText(repro, "pre", "code-block", reproduction);
           repro.append(
             button("Copy command", "button secondary compact", () =>
@@ -1706,7 +2038,7 @@
             ),
           );
         }
-        const details = section("Identity & outputs");
+        const details = section("Identity & outputs", "metadata");
         appendText(details, "pre", "code-block", node.id);
         details.append(button("Copy path", "text-button", () => copy(node.id)));
         if (node.system)
@@ -1726,17 +2058,16 @@
           details.append(list);
         }
       }
+      showDetail(state.inspectorTab);
     }
     function renderDiagnostics() {
       const container = $("diagnostics-list");
       container.replaceChildren();
+      const query = Query.compile(state.search);
       const diagnostics = model.diagnostics.filter(
         (d) =>
-          !state.search ||
-          [d.name, d.message, d.excerpt, ...array(d.affected)]
-            .join(" ")
-            .toLowerCase()
-            .includes(state.search),
+          query.match(diagnosticQueryRow(d)) &&
+          stateMatches(diagnosticQueryRow(d).state, state.outcome),
       );
       if (!diagnostics.length) {
         empty(
@@ -1808,21 +2139,71 @@
         container.append(pager);
       }
     }
-    function renderKindFilters() {
+    function diagnosticQueryRow(d) {
+      return {
+        name: d.name,
+        search: [d.name, d.message, d.excerpt, ...array(d.affected)]
+          .join(" ")
+          .toLowerCase(),
+        neededBy: array(d.affected),
+        state: d.severity === "error" ? "failed" : "warning",
+        kind:
+          d.type === "Evaluation error"
+            ? "evaluation"
+            : d.type === "Cache sync failed"
+              ? "upload"
+              : d.type === "Root failure"
+                ? "build"
+                : "",
+        seconds: null,
+      };
+    }
+    function renderKindFilters(query = Query.compile(state.search)) {
       const container = $("kind-filters"),
         focus = focusedKey(container);
       container.replaceChildren();
+      const candidates = filterRows(model, {
+        query,
+        state: state.outcome,
+        start: state.from,
+        end: state.to,
+        focus: state.focus,
+      });
+      const kindTerms = query.terms.filter((term) => term.field === "kind"),
+        kindQuery = Query.compile(kindTerms.map((term) => term.raw).join(" "));
       for (const [kind, info] of Object.entries(KINDS)) {
         if (!model.rows.some((r) => r.kind === kind)) continue;
-        const b = button(info.short, "kind-toggle", (event) => {
+        const b = button("", "kind-toggle", (event) => {
+          if (kindTerms.length) {
+            state.kinds = new Set(
+              Object.keys(KINDS).filter((k) => kindQuery.match({ kind: k })),
+            );
+            for (let i = query.terms.length - 1; i >= 0; i--)
+              if (query.terms[i].field === "kind")
+                state.search = Query.removeTerm(state.search, i);
+            $("search").value = state.search;
+          }
           if (event.altKey) state.kinds = new Set([kind]);
           else if (state.kinds.has(kind)) state.kinds.delete(kind);
           else state.kinds.add(kind);
-          renderKindFilters();
           refilter(true);
         });
+        appendText(b, "span", "facet-label", info.short);
+        appendText(
+          b,
+          "span",
+          "facet-count",
+          count(candidates.filter((r) => r.kind === kind).length),
+        );
         b.dataset.focusKey = kind;
-        b.setAttribute("aria-pressed", String(state.kinds.has(kind)));
+        b.setAttribute(
+          "aria-pressed",
+          String(
+            kindTerms.length
+              ? kindQuery.match({ kind })
+              : state.kinds.has(kind),
+          ),
+        );
         b.title = `${info.label} · Alt-click to show only this type`;
         setKind(b, kind);
         container.append(b);
@@ -2135,9 +2516,7 @@
         `${count(model.events.length)} recorded events · no network requests`;
     }
     $("search").addEventListener("input", (event) => {
-      state.search = event.target.value.toLowerCase().trim();
-      state.diagnosticPage = 0;
-      refilter(true);
+      updateSearch(event.target.value);
     });
     $("state-filter").addEventListener("change", (event) => {
       state.outcome = event.target.value;
@@ -2170,7 +2549,7 @@
         $("tab-" + names[next]).focus();
         event.preventDefault();
       });
-    $("clear-filters").addEventListener("click", () => {
+    function resetFilters() {
       state.search = "";
       state.outcome = "all";
       state.focus = null;
@@ -2180,7 +2559,12 @@
       renderKindFilters();
       setWindow(model.start, model.end);
       refilter(true);
-    });
+    }
+    $("clear-filters").addEventListener("click", resetFilters);
+    $("facet-reset").addEventListener("click", resetFilters);
+    $("copy-view").addEventListener("click", () =>
+      copy(global.location.href.split("#")[0] + viewFragment(state, model)),
+    );
     $("clear-focus").addEventListener("click", () => {
       state.focus = null;
       refilter(true);
@@ -2218,25 +2602,165 @@
     };
     $("overview").addEventListener("pointerdown", (event) => {
       if (event.button !== 0) return;
-      drag = pointerTime(event);
+      drag = {
+        time: pointerTime(event),
+        x: event.clientX,
+        from: state.from,
+        to: state.to,
+        moved: false,
+      };
       $("overview").setPointerCapture(event.pointerId);
     });
     $("overview").addEventListener("pointermove", (event) => {
-      if (drag !== null) setWindow(drag, pointerTime(event));
+      if (drag && (drag.moved || Math.abs(event.clientX - drag.x) >= 4)) {
+        drag.moved = true;
+        setWindow(drag.time, pointerTime(event));
+      }
     });
     $("overview").addEventListener("pointerup", (event) => {
       if (drag !== null) {
         const current = pointerTime(event);
-        if (Math.abs(current - drag) < model.extent / 100) {
-          const half = (state.to - state.from) / 2;
-          setWindow(current - half, current + half);
-        } else setWindow(drag, current);
+        if (!drag.moved) {
+          const width = drag.to - drag.from;
+          const start = clamp(
+            current - width / 2,
+            model.start,
+            model.end - width,
+          );
+          setWindow(start, start + width);
+        } else setWindow(drag.time, current);
         drag = null;
       }
     });
     $("overview").addEventListener("pointercancel", () => {
       drag = null;
     });
+    const waterfall = $("timeline-scroll"),
+      shell = waterfall.parentElement;
+    const cursor = el("div", "time-cursor"),
+      cursorLabel = el("span", "time-cursor-label");
+    cursor.append(cursorLabel);
+    cursor.hidden = true;
+    cursor.setAttribute("aria-hidden", "true");
+    shell.append(cursor);
+    const tooltip = el("div", "activity-tooltip");
+    tooltip.hidden = true;
+    tooltip.setAttribute("aria-hidden", "true");
+    document.body.append(tooltip);
+    const hideCursor = () => {
+      cursor.hidden = true;
+      tooltip.hidden = true;
+    };
+    let pan = null;
+    waterfall.addEventListener("pointermove", (event) => {
+      if (pan) {
+        const delta =
+          ((pan.x - event.clientX) / pan.width) * (pan.to - pan.from);
+        const a = clamp(
+          pan.from + delta,
+          model.start,
+          model.end - (pan.to - pan.from),
+        );
+        setWindow(a, a + pan.to - pan.from);
+        hideCursor();
+        return;
+      }
+      const chart = event.target.closest(".row-chart");
+      if (!chart) {
+        hideCursor();
+        return;
+      }
+      const rect = chart.getBoundingClientRect(),
+        outer = shell.getBoundingClientRect();
+      const fraction = clamp((event.clientX - rect.left) / rect.width, 0, 1);
+      const time = state.from + fraction * (state.to - state.from);
+      cursor.style.left = `${event.clientX - outer.left}px`;
+      cursor.style.top = `${waterfall.offsetTop}px`;
+      cursor.hidden = false;
+      cursorLabel.textContent = `+${duration(time - model.start)}`;
+      const row = model.rowMap.get(chart.closest("[data-row]").dataset.row);
+      const interval = event.target.closest(".interval");
+      if (!row || !interval) {
+        tooltip.hidden = true;
+        return;
+      }
+      const segment = row.intervals[Number(interval.dataset.segment)];
+      tooltip.replaceChildren();
+      appendText(tooltip, "strong", "", row.name);
+      appendText(
+        tooltip,
+        "div",
+        "",
+        `${KINDS[row.kind].label} · ${duration(segment.end - segment.start)} · ${row.state}`,
+      );
+      appendText(
+        tooltip,
+        "div",
+        "",
+        `+${duration(segment.start - model.start)} → +${duration(segment.end - model.start)}`,
+      );
+      const phase = array(segment.phases).find(
+        (p) => p.start <= time && p.end >= time,
+      );
+      if (phase)
+        appendText(
+          tooltip,
+          "div",
+          "",
+          `${phase.name} · ${duration(phase.end - phase.start)}`,
+        );
+      if (segment.estimated)
+        appendText(tooltip, "small", "", "Inferred timing");
+      tooltip.hidden = false;
+      const bounds = tooltip.getBoundingClientRect();
+      tooltip.style.left = `${clamp(event.clientX + 14, 8, global.innerWidth - bounds.width - 8)}px`;
+      tooltip.style.top = `${clamp(event.clientY + 16, 8, global.innerHeight - bounds.height - 8)}px`;
+    });
+    waterfall.addEventListener("pointerleave", hideCursor);
+    waterfall.addEventListener("scroll", hideCursor, { passive: true });
+    waterfall.addEventListener("pointerdown", (event) => {
+      const chart = event.target.closest(".row-chart");
+      if (event.button !== 0 || !chart || event.target.closest("button"))
+        return;
+      pan = {
+        x: event.clientX,
+        from: state.from,
+        to: state.to,
+        width: chart.getBoundingClientRect().width,
+      };
+      waterfall.setPointerCapture(event.pointerId);
+      event.preventDefault();
+    });
+    for (const event of ["pointerup", "pointercancel", "lostpointercapture"])
+      waterfall.addEventListener(event, () => {
+        pan = null;
+      });
+    waterfall.addEventListener(
+      "wheel",
+      (event) => {
+        if (!event.ctrlKey && !event.metaKey) return;
+        const chart = waterfall.querySelector(".row-chart");
+        if (!chart) return;
+        event.preventDefault();
+        hideCursor();
+        const rect = chart.getBoundingClientRect();
+        const fraction = clamp((event.clientX - rect.left) / rect.width, 0, 1);
+        const anchor = state.from + fraction * (state.to - state.from);
+        const width = clamp(
+          (state.to - state.from) *
+            Math.exp(clamp(event.deltaY, -100, 100) * 0.01),
+          model.extent / 1000,
+          model.extent,
+        );
+        const a = clamp(
+          anchor - width * fraction,
+          model.start,
+          model.end - width,
+        );
+        setWindow(a, a + width);
+      },
+      { passive: false },
+    );
     for (const id of ["timeline-scroll", "package-scroll"])
       $(id).addEventListener(
         "scroll",
@@ -2252,8 +2776,18 @@
         { passive: true },
       );
     for (const [viewId, contentId, rowHeight, getRows] of [
-      ["timeline-scroll", "timeline-rows", 44, () => filteredRows],
-      ["package-scroll", "package-rows", 56, () => filteredPackages],
+      [
+        "timeline-scroll",
+        "timeline-rows",
+        TIMELINE_ROW_HEIGHT,
+        () => filteredRows,
+      ],
+      [
+        "package-scroll",
+        "package-rows",
+        PACKAGE_ROW_HEIGHT,
+        () => filteredPackages,
+      ],
     ]) {
       $(viewId).addEventListener("keydown", (event) => {
         if (
@@ -2309,6 +2843,7 @@
         state.selection = null;
         renderInspector();
         renderVisible();
+        saveView();
         if (wasInside) $("tab-" + state.tab).focus({ preventScroll: true });
       }
     });
@@ -2327,9 +2862,45 @@
       drawOverview();
       renderVisible();
     });
+    function restoreView() {
+      restoringView = true;
+      const saved =
+        readView(global.location.hash, model) ||
+        readView("#view=timeline", model);
+      Object.assign(state, saved);
+      $("search").value = state.search;
+      $("state-filter").value = state.outcome;
+      $("timeline-sort").value = state.sort;
+      $("package-sort").value = state.packageSort;
+      setWindow(state.from, state.to);
+      setTab(state.tab);
+      renderInspector();
+      if (state.selection) {
+        const isTimeline = state.tab === "timeline";
+        const index = isTimeline
+          ? filteredRows.findIndex((r) => r.id === state.selection.rowId)
+          : filteredPackages.findIndex((n) => n.id === state.selection.nodeId);
+        if (index >= 0) {
+          $(isTimeline ? "timeline-scroll" : "package-scroll").scrollTop =
+            index * (isTimeline ? TIMELINE_ROW_HEIGHT : PACKAGE_ROW_HEIGHT);
+          renderVisible();
+        }
+      }
+      restoringView = false;
+    }
+    global.addEventListener("hashchange", () => {
+      if (!global.location.hash || readView(global.location.hash, model))
+        restoreView();
+    });
+    document.querySelector(".skip-link").addEventListener("click", (event) => {
+      event.preventDefault();
+      $("workspace").tabIndex = -1;
+      $("workspace").focus();
+      $("workspace").scrollIntoView({ block: "start" });
+    });
+    if (global.innerWidth <= 700) $("facet-disclosure").open = false;
     renderOverview();
-    renderKindFilters();
-    setWindow(model.start, model.end);
+    restoreView();
     drawOverview();
     // A small read-only handle supports deterministic browser checks and makes
     // it possible to inspect the loaded model without any server or framework.
@@ -2353,6 +2924,8 @@
     diagnosticCause,
     duration,
     bytes,
+    viewFragment,
+    readView,
   };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   if (typeof document !== "undefined") {

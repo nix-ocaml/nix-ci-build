@@ -6,7 +6,7 @@
 
 (rule
  (targets report_assets.ml)
- (deps ../report/template.html ../report/style.css ../report/app.js)
+ (deps ../report/template.html ../report/style.css ../report/query.js ../report/app.js)
  (action
   (with-stdout-to %{targets}
    (run %{exe:../report/embed.exe} %{deps}))))

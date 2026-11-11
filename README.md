@@ -157,7 +157,25 @@ alongside it to follow links to complete logs.
 The timeline separates package requests from observed Nix builds, downloads,
 waits, cache imports, and uploads. Filter by package or activity, narrow the
 time window, and select work to see phases, dependencies, consumers, failures,
-and reproduction commands. Concurrency represents observed Nix activities,
+and reproduction commands. The explorer uses compact outcome and activity
+facets, a waterfall with hover timing, and a resizable detail panel with
+Overview, Dependencies, and Metadata tabs. Double-click an activity to focus
+its time window, drag the overview to select a range, or use Ctrl/Command +
+scroll over the waterfall to zoom. Drag empty waterfall space to pan; the
+time sliders, zoom buttons, and arrow-key navigation also work by keyboard.
+
+Search supports literal words and quoted phrases, plus `kind:`, `status:`,
+`name:`, `needed-by:`, and `duration:` fields. For example,
+`kind:build duration:>30s -name:source` finds long builds excluding source
+fetchers. Terms are combined with AND; prefix a term with `-` to exclude it.
+Durations accept `ms`, `s`, `m`, and `h`. Invalid queries show an explanation;
+each valid term can be removed individually. A `kind:` query overrides the
+activity-type checkboxes; changing those checkboxes replaces the query's kind
+terms. In Packages, `kind:request` and `duration:` refer to the package request.
+Copy view preserves filters, time window, and selected activity in the URL
+fragment so a hosted report can be shared at the exact point of investigation.
+
+Concurrency represents observed Nix activities,
 not CPU utilization. Slow activities and dependency paths help investigate
 bottlenecks; they do not establish that eliminating one activity would shorten
 the run by its entire duration.

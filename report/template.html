@@ -14,7 +14,7 @@
     <a class="skip-link" href="#workspace">Skip to build report</a>
     <header class="masthead">
       <div class="brand">
-        <span class="brand-mark" aria-hidden="true">N</span
+        <span class="brand-mark" aria-hidden="true">n</span
         ><span
           >nix-ci-build <span class="brand-divider">/</span>
           <strong>Build explorer</strong></span
@@ -23,6 +23,12 @@
       <div class="header-actions">
         <span class="offline-label"
           ><span class="offline-dot"></span>Offline report</span
+        ><button
+          id="copy-view"
+          class="button secondary compact"
+          title="Copy a link to the current filters, time window, and selection"
+        >
+          Copy view link</button
         ><button
           id="theme-toggle"
           class="icon-button"
@@ -36,8 +42,8 @@
     <main id="workspace">
       <section class="run-heading" aria-labelledby="run-title">
         <div>
-          <div class="eyebrow">PACKAGE SET / RUN REPORT</div>
-          <h1 id="run-title">Your build, explained.</h1>
+          <div class="eyebrow">PACKAGE SET / BUILD REPORT</div>
+          <h1 id="run-title">Build report</h1>
           <div class="run-meta" id="run-meta"></div>
         </div>
         <div class="run-heading-actions">
@@ -59,6 +65,52 @@
         aria-label="Notable observations"
       ></section>
       <div class="workspace-grid" id="workspace-grid">
+        <aside
+          class="facet-sidebar"
+          id="facet-sidebar"
+          aria-label="Filter activities and packages"
+        >
+          <details id="facet-disclosure" class="facet-disclosure" open>
+            <summary>
+              <span>Filters</span
+              ><span id="facet-summary" class="facet-summary"></span>
+            </summary>
+            <div class="facet-body">
+              <div class="facet-heading">
+                <span>Refine this view</span
+                ><button id="facet-reset" class="text-button">Reset</button>
+              </div>
+              <section
+                id="facet-kinds"
+                class="facet-section"
+                aria-labelledby="facet-kind-title"
+              >
+                <h2 id="facet-kind-title">Activity type</h2>
+                <div
+                  id="kind-filters"
+                  class="kind-filters"
+                  aria-label="Activity types"
+                ></div>
+                <p class="facet-note">Alt-click to isolate a type</p>
+              </section>
+              <section
+                class="facet-section"
+                aria-labelledby="facet-state-title"
+              >
+                <h2 id="facet-state-title">Outcome</h2>
+                <div id="facet-states" class="facet-states"></div>
+              </section>
+              <div class="facet-guide">
+                <span class="facet-guide-mark" aria-hidden="true">⌁</span>
+                <p>
+                  Start with the longest activity, then follow its inputs and
+                  consumers.
+                </p>
+                <p>Drag the overview to inspect a time window.</p>
+              </div>
+            </div>
+          </details>
+        </aside>
         <section class="main-panel">
           <div class="panel-navigation">
             <div class="tabs" role="tablist" aria-label="Report views">
@@ -69,7 +121,7 @@
                 id="tab-timeline"
                 data-tab="timeline"
               >
-                Timeline</button
+                Waterfall</button
               ><button
                 role="tab"
                 aria-selected="false"
@@ -94,26 +146,73 @@
               Reset filters
             </button>
           </div>
-          <div class="filters">
-            <label class="search-field"
-              ><span aria-hidden="true">⌕</span
-              ><input
-                type="search"
-                id="search"
-                placeholder="Find a package, derivation, or consumer…"
-                autocomplete="off"
-                aria-label="Search packages and activities"
-              /><kbd>/</kbd></label
-            ><label class="select-label"
-              >Outcome<select id="state-filter">
-                <option value="all">All outcomes</option>
-                <option value="failed">Failed or blocked</option>
-                <option value="active">In progress</option>
-                <option value="built">Built</option>
-                <option value="cached">Cached</option>
-                <option value="cancelled">Cancelled</option>
-              </select></label
-            >
+          <div class="query-toolbar">
+            <div class="filters">
+              <label class="search-field"
+                ><span class="search-icon" aria-hidden="true"></span
+                ><input
+                  type="search"
+                  id="search"
+                  placeholder="Search activities… e.g. kind:build duration:>30s"
+                  autocomplete="off"
+                  spellcheck="false"
+                  aria-label="Search packages and activities"
+                  aria-describedby="query-help"
+                /><kbd>/</kbd></label
+              >
+              <label class="select-label outcome-select"
+                >Outcome<select
+                  id="state-filter"
+                  aria-label="Filter by outcome"
+                >
+                  <option value="all">All outcomes</option>
+                  <option value="failed">Failed or blocked</option>
+                  <option value="active">In progress</option>
+                  <option value="built">Built</option>
+                  <option value="cached">Cached</option>
+                  <option value="cancelled">Cancelled</option>
+                </select></label
+              >
+            </div>
+            <div class="query-meta">
+              <div
+                id="active-filters"
+                class="active-filters"
+                aria-label="Active filters"
+              ></div>
+              <details id="query-help" class="query-help">
+                <summary>
+                  Search syntax <span aria-hidden="true">?</span>
+                </summary>
+                <div class="query-help-panel">
+                  <strong>Find the work that matters</strong>
+                  <p>
+                    Combine terms to narrow your view. Click a filter to add or
+                    remove it.
+                  </p>
+                  <dl>
+                    <dt><code>kind:build</code></dt>
+                    <dd>Activity type</dd>
+                    <dt><code>status:failed</code></dt>
+                    <dd>Outcome</dd>
+                    <dt><code>duration:&gt;30s</code></dt>
+                    <dd>Observed duration</dd>
+                    <dt><code>name:postgresql</code></dt>
+                    <dd>Package or derivation name</dd>
+                    <dt><code>needed-by:caqti</code></dt>
+                    <dd>Requested consumer</dd>
+                    <dt><code>-kind:download</code></dt>
+                    <dd>Exclude a term</dd>
+                  </dl>
+                  <p>
+                    Bare text matches across searchable fields. Quote values
+                    with spaces; combine terms with spaces to require all of
+                    them.
+                  </p>
+                </div>
+              </details>
+            </div>
+            <div id="query-error" class="query-error" role="alert" hidden></div>
           </div>
           <section
             id="timeline-panel"
@@ -123,10 +222,9 @@
           >
             <div class="section-heading">
               <div>
-                <h2>Where the time went</h2>
+                <h2>Run timeline</h2>
                 <p>
-                  Observed work across the run. Select a bar to follow its
-                  dependencies.
+                  Select an activity to inspect its phases and dependencies.
                 </p>
               </div>
               <div class="zoom-controls">
@@ -185,11 +283,14 @@
               ><output id="window-label"></output>
             </div>
             <div class="timeline-options">
-              <div
-                id="kind-filters"
-                class="kind-filters"
-                aria-label="Activity types"
-              ></div>
+              <div class="timeline-legend">
+                <span><i style="--kind-color:var(--build)"></i>Builds</span
+                ><span
+                  ><i style="--kind-color:var(--download)"></i>Downloads</span
+                ><span class="timeline-hint"
+                  >Double-click to focus · Ctrl/⌘-scroll to zoom</span
+                >
+              </div>
               <label class="select-label"
                 >Sort<select id="timeline-sort">
                   <option value="start">Start time</option>
@@ -221,8 +322,8 @@
             </div>
             <div class="panel-footnote">
               <span
-                ><span class="sample estimated"></span>Dashed bars: timing
-                inferred from older or incomplete data</span
+                ><span class="sample estimated"></span>Dashed bars: inferred
+                timing</span
               ><span id="timeline-footnote"></span>
             </div>
           </section>
@@ -290,7 +391,7 @@
         >
           <div class="inspector-placeholder">
             <span class="inspect-illustration" aria-hidden="true">↳</span>
-            <div class="eyebrow">FOLLOW THE WORK</div>
+            <div class="eyebrow">ACTIVITY DETAILS</div>
             <h2 id="inspector-title">Select an activity</h2>
             <p>
               Inspect its timing, build phases, consumers, and dependency links.
@@ -321,8 +422,8 @@
       </details>
       <footer>
         <span
-          >nix-ci-build <span class="footer-divider">/</span> Make the next
-          build easier to understand.</span
+          >nix-ci-build <span class="footer-divider">/</span> Build
+          explorer</span
         ><span id="generated-note">Self-contained report</span>
       </footer>
     </main>

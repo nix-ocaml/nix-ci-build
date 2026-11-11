@@ -7,4 +7,7 @@ let read path =
 let () =
   List.iter
     (fun (name, path) -> Printf.printf "let %s = %S\n" name (read path))
-    [ "template", Sys.argv.(1); "style", Sys.argv.(2); "script", Sys.argv.(3) ]
+    [ "template", Sys.argv.(1); "style", Sys.argv.(2) ];
+  Printf.printf
+    "let script = %S\n"
+    (read Sys.argv.(3) ^ "\n;\n" ^ read Sys.argv.(4))

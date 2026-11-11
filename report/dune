@@ -4,5 +4,8 @@
 
 (rule
  (alias runtest)
- (deps app.js app.test.js)
- (action (run %{bin:node} %{dep:app.test.js})))
+ (deps app.js app.test.js query.js query.test.js)
+ (action
+  (progn
+   (run %{bin:node} %{dep:query.test.js})
+   (run %{bin:node} %{dep:app.test.js}))))

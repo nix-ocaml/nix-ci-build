@@ -5,6 +5,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { test } = require("node:test");
 const report = require("./app.js");
+const query = require("./query.js");
 
 const drv = (name) => `/nix/store/${"a".repeat(32)}-${name}.drv`;
 const output = (name) => `/nix/store/${"b".repeat(32)}-${name}`;
@@ -603,4 +604,242 @@ test("template is self-contained and has exactly one of each embedding token", (
     /\.innerHTML\s*=|insertAdjacentHTML\s*\(/,
     "untrusted report data must stay text, not markup",
   );
+});
+
+function queryModel() {
+  return report.buildModel(
+    envelope(
+      {
+        jobs: [
+          job("app", { attrs: ["packages.piaf"] }),
+          job("other", { attrs: ["packages.other"] }),
+        ],
+        derivations: [
+          {
+            drvPath: drv("curl"),
+            name: "curl library",
+            state: "built",
+            neededBy: ["packages.piaf"],
+          },
+          {
+            drvPath: drv("short"),
+            name: "short library",
+            state: "built",
+            neededBy: ["packages.piaf"],
+          },
+          {
+            drvPath: drv("curl-tls"),
+            name: "curl TLS",
+            state: "failed",
+            neededBy: ["packages.other"],
+          },
+        ],
+      },
+      [
+        activity("activity-start", 102, "curl", "curl", "build", {
+          name: "curl library",
+        }),
+        activity("activity-start", 103, "short", "short"),
+        activity("activity-start", 104, "curl-tls", "tls"),
+        activity("activity-stop", 105, "short", "short"),
+        activity("activity-stop", 112, "curl", "curl", "build", {
+          name: "curl library",
+        }),
+        activity("activity-stop", 117, "curl-tls", "tls"),
+      ],
+    ),
+  );
+}
+
+test("structured query filters combine actual activity kind, outcome, consumers, and elapsed seconds", () => {
+  const model = queryModel();
+  const source =
+    "kind:build status:built name:curl needed-by:piaf duration:>=5s";
+  const matches = report.filterRows(model, { search: source });
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].nodeId, drv("curl"));
+  assert.equal(matches[0].seconds, 10);
+  assert.deepEqual(
+    report
+      .filterRows(model, { search: "kind:build -status:built" })
+      .map((r) => r.nodeId),
+    [drv("curl-tls")],
+  );
+  assert.equal(report.filterRows(model, { search: "unknown:curl" }).length, 0);
+  assert.equal(
+    report.filterRows(model, { search: 'name:"unclosed' }).length,
+    0,
+  );
+  const compiled = query.compile(source);
+  assert.deepEqual(
+    report.filterRows(model, { query: compiled }).map((r) => r.id),
+    matches.map((r) => r.id),
+  );
+});
+
+test("structured queries preserve explicit lane, time-window, outcome, and consumer-focus filters", () => {
+  const model = queryModel(),
+    compiled = query.compile("kind:build name:curl");
+  assert.deepEqual(
+    report
+      .filterRows(model, { query: compiled, focus: drv("app") })
+      .map((r) => r.nodeId),
+    [drv("curl")],
+  );
+  assert.deepEqual(
+    report
+      .filterRows(model, { query: compiled, state: "failed" })
+      .map((r) => r.nodeId),
+    [drv("curl-tls")],
+  );
+  assert.deepEqual(
+    report
+      .filterRows(model, { query: compiled, start: 113, end: 120 })
+      .map((r) => r.nodeId),
+    [drv("curl-tls")],
+  );
+  assert.equal(
+    report.filterRows(model, { query: compiled, kinds: new Set(["download"]) })
+      .length,
+    0,
+  );
+  assert.equal(
+    report.filterRows(model, {
+      search: "curl packages.piaf",
+      focus: drv("other"),
+    }).length,
+    0,
+  );
+});
+
+test("view fragments round-trip a query, chosen lanes, zoom, focus, and inspector selection", () => {
+  const model = queryModel(),
+    row = model.rows.find(
+      (r) => r.kind === "build" && r.nodeId === drv("curl"),
+    );
+  const state = {
+    tab: "timeline",
+    search: 'name:"curl library" -status:failed needed-by:piaf duration:>250ms',
+    outcome: "built",
+    kinds: new Set(["build", "download"]),
+    from: 104.125,
+    to: 117.5,
+    sort: "duration",
+    packageSort: "time",
+    focus: drv("app"),
+    selection: { nodeId: row.nodeId, rowId: row.id },
+    inspectorTab: "dependencies",
+  };
+  const fragment = report.viewFragment(state, model);
+  assert.ok(fragment.startsWith("#view=timeline&"));
+  assert.ok(!fragment.includes('"'));
+  assert.deepEqual(report.readView(fragment, model), state);
+  assert.deepEqual(
+    report
+      .filterRows(model, { search: report.readView(fragment, model).search })
+      .map((r) => r.nodeId),
+    [drv("curl")],
+  );
+});
+
+test("view fragments preserve a deliberately empty kind selection and node-only package details", () => {
+  const model = queryModel();
+  const state = {
+    tab: "packages",
+    search: "",
+    outcome: "all",
+    kinds: new Set(),
+    from: model.start,
+    to: model.end,
+    sort: "start",
+    packageSort: "attention",
+    focus: null,
+    selection: { nodeId: drv("app"), rowId: null },
+    inspectorTab: "metadata",
+  };
+  assert.deepEqual(
+    report.readView(report.viewFragment(state, model), model),
+    state,
+  );
+  const defaults = report.readView("#view=timeline", model);
+  assert.equal(defaults.kinds.has("build"), true);
+  assert.equal(defaults.kinds.has("request"), false);
+  assert.equal(defaults.kinds.has("wait"), false);
+  assert.equal(defaults.selection, null);
+});
+
+test("malformed view choices and stale report identities cannot select nonexistent data", () => {
+  const model = queryModel();
+  const fragment =
+    "#view=unknown&status=unknown&kinds=build,__proto__,unknown&sort=unknown&packages=unknown&detail=unknown&row=missing&node=missing&focus=missing&from=-500&to=500";
+  const state = report.readView(fragment, model);
+  assert.equal(state.tab, "timeline");
+  assert.equal(state.outcome, "all");
+  assert.deepEqual([...state.kinds], ["build"]);
+  assert.equal(state.sort, "start");
+  assert.equal(state.packageSort, "attention");
+  assert.equal(state.inspectorTab, "overview");
+  assert.equal(state.selection, null);
+  assert.equal(state.focus, null);
+  assert.equal(state.from, model.start);
+  assert.equal(state.to, model.end);
+  const row = model.rows.find(
+    (r) => r.kind === "build" && r.nodeId === drv("curl"),
+  );
+  const contradictory = new URLSearchParams({
+    view: "timeline",
+    row: row.id,
+    node: drv("other"),
+  });
+  assert.deepEqual(report.readView("#" + contradictory, model).selection, {
+    nodeId: drv("curl"),
+    rowId: row.id,
+  });
+  const fallback = new URLSearchParams({
+    view: "packages",
+    row: "stale",
+    node: drv("app"),
+  });
+  assert.deepEqual(report.readView("#" + fallback, model).selection, {
+    nodeId: drv("app"),
+    rowId: null,
+  });
+});
+
+test("view parsing bounds inputs and handles non-finite times, bad encoding, and an empty report", () => {
+  const model = queryModel();
+  for (const value of [
+    null,
+    undefined,
+    "",
+    "#section",
+    "#q=curl",
+    "#view=timeline&" + "x".repeat(32768),
+  ]) {
+    assert.equal(
+      report.readView(value, model),
+      null,
+      String(value).slice(0, 30),
+    );
+  }
+  const state = report.readView(
+    "#view=timeline&from=NaN&to=Infinity&q=%E0%A4%A",
+    model,
+  );
+  assert.equal(state.from, model.start);
+  assert.equal(state.to, model.end);
+  assert.equal(typeof state.search, "string");
+  const bounded = report.readView(
+    "#view=timeline&q=" + "x".repeat(9000),
+    model,
+  );
+  assert.equal(bounded.search.length, query.limits.characters);
+  const empty = report.buildModel({});
+  const emptyState = report.readView(
+    "#view=timeline&from=-10&to=10&row=missing",
+    empty,
+  );
+  assert.equal(emptyState.from, empty.start);
+  assert.equal(emptyState.to, empty.end);
+  assert.equal(emptyState.selection, null);
 });
