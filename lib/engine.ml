@@ -124,6 +124,22 @@ let set_availability t path value =
 
 let full_log t path = Filename.concat t.config.report_dir path
 
+let log_basename path =
+  (* Nix store names can contain '?', which Actions rejects in artifact paths.
+     Escape bytes (including '~') so distinct names stay distinct, and leave
+     room for prefixes and suffixes within the 255-byte filename limit. *)
+  let output = Buffer.create 128 in
+  String.iter (Filename.basename path) ~f:(function
+    | ('a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '-' | '_' | '.' | '+' | '=') as c
+      ->
+      Buffer.add_char output c
+    | c -> Buffer.add_string output (Printf.sprintf "~%02X" (Char.code c)));
+  let name = Buffer.contents output in
+  if String.length name <= 160
+  then name
+  else
+    String.sub name ~pos:0 ~len:160 ^ "-" ^ Digest.to_hex (Digest.string path)
+
 let duration start finish =
   match start with
   | None -> 0.
@@ -764,7 +780,7 @@ let get_activity t drv =
       ; active = 0
       ; active_builds = 0
       ; active_downloads = 0
-      ; log = "logs/" ^ Filename.basename drv ^ ".log"
+      ; log = "logs/" ^ log_basename drv ^ ".log"
       ; tail = []
       }
     in
@@ -1448,7 +1464,7 @@ let cache_follower t process_mgr clock stores =
         ; log =
             Printf.sprintf
               "logs/cache-import-%s-%d.log"
-              (Filename.basename drv)
+              (log_basename drv)
               !serial
         }
       in
@@ -1715,7 +1731,7 @@ let uploader t process_mgr clock =
                ; state = "queued"
                ; seconds = 0.
                ; error = None
-               ; log = "logs/upload-" ^ name ^ ".log"
+               ; log = "logs/upload-" ^ log_basename path ^ ".log"
                }
              in
              Hashtbl.add t.uploads path u;
