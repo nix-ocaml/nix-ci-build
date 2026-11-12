@@ -150,9 +150,13 @@ class RealFixture:
             self.ledger.read_text().splitlines() if self.ledger.exists() else []
         )
 
-    def execute(self, name, group, plan=None, expect_success=True, cache=None):
+    def execute(self, name, group, plan=None, expect_success=True, cache=None, environment=None):
         report = self.directory / "reports" / name
-        with self.store(name, worker=True) as environment:
+        store = (
+            self.store(name, worker=True)
+            if environment is None else contextlib.nullcontext(environment)
+        )
+        with store as environment:
             result = self.run(
                 name,
                 [
@@ -182,6 +186,88 @@ class RealFixture:
             return execution, results
         error = read_json(report / "execution-error.json")
         return error, result
+
+    def no_substitute_scenario(self, fixture, system):
+        baseline = self.builds()
+        name = "non-substitutable-consumer"
+        sets = self.directory / "no-substitute-sets.json"
+        write_json(
+            sets,
+            {
+                "sets": [
+                    {"id": "no-substitute", "flake": "path:" + str(fixture) + "#noSubstitute"},
+                ],
+                "runners": {system: "local-real-nix-fixture"},
+            },
+        )
+
+        def make_plan(label):
+            plan = self.directory / label
+            with self.store(label) as environment:
+                self.run(
+                    label,
+                    [
+                        self.executable,
+                        "--plan-sets", str(sets),
+                        "--copy-from", self.cache_url,
+                        "--report-dir", str(plan),
+                        "--jobs", "1",
+                    ],
+                    environment,
+                )
+            manifest = read_json(plan / "execution-plan.json")
+            groups = manifest["plan"]["groups"]
+            check(
+                len(groups) == 1 and groups[0]["kind"] == "package",
+                "non-substitutable root must retain its owned execution group",
+            )
+            return plan, groups[0], manifest
+
+        plan, group, _ = make_plan("no-substitute-plan")
+        check(self.builds() == baseline, "policy planning must not execute builders")
+        execution, results = self.execute("no-substitute-cold", group, plan=plan)
+        check(
+            self.builds() == baseline + collections.Counter({name: 1}),
+            "cold non-substitutable root must build once",
+        )
+        check(
+            len(results["jobs"]) == 1 and results["jobs"][0]["state"] == "built",
+            "cold policy root must be reported as built",
+        )
+        check(len(execution["published"]) == 1, "policy root must be published for the remote-hit test")
+
+        with self.store("no-substitute-remote-hit", worker=True) as environment:
+            _, results = self.execute(
+                "no-substitute-remote-hit", group, plan=plan, environment=environment,
+            )
+            expected = baseline + collections.Counter({name: 2})
+            check(
+                self.builds() == expected,
+                "allowSubstitutes=false must rebuild in a fresh worker despite a remote hit",
+            )
+            check(
+                len(results["jobs"]) == 1 and results["jobs"][0]["state"] == "built",
+                "remote-cached non-substitutable root must be reported as built",
+            )
+            _, results = self.execute(
+                "no-substitute-local-hit", group, plan=plan, environment=environment,
+            )
+            check(self.builds() == expected, "an existing local policy output must not rebuild")
+            check(
+                len(results["jobs"]) == 1 and results["jobs"][0]["state"] == "cached",
+                "an existing local policy output must be reported as reused",
+            )
+
+        _, cached_group, cached_manifest = make_plan("no-substitute-cached-plan")
+        check(
+            cached_group == group,
+            "remote availability must not remove or change a non-substitutable execution group",
+        )
+        check(
+            execution["published"][0] in cached_manifest["cachedPaths"],
+            "policy replan must actually observe the published remote hit",
+        )
+        check(self.builds() == expected, "policy replan must not execute builders")
 
     def scenario(self):
         fixture = self.directory / "fixture"
@@ -335,6 +421,7 @@ class RealFixture:
                 "fully cached plan must expose an empty " + filename,
             )
         check(self.builds() == expected, "cached planning must not invoke builders")
+        self.no_substitute_scenario(fixture, system)
         write_json(
             self.directory / "verification.json",
             {
@@ -343,6 +430,7 @@ class RealFixture:
                 "builders": dict(self.builds()),
                 "sharedGroups": 1,
                 "packageGroups": 2,
+                "nonSubstitutableRootBuilds": 2,
                 "isolatedStores": len(list((self.directory / "workers").iterdir())),
             },
         )
