@@ -121,8 +121,10 @@ package runner builds only its owned derivations.
 
 The demo passes tiny `file://` output caches through artifacts from the same
 workflow run. It needs no external cache credentials. It disables sandboxing
-for its host-shell fixture and signatures for those temporary caches only;
-those settings are not a production cache configuration. The ordinary
+for its host-shell fixture and signature checking on its temporary worker
+runners. The latter is set in the Nix installation configuration, before the
+daemon opens its store; a per-step `NIX_CONFIG` override is insufficient.
+Those settings are not a production cache configuration. The ordinary
 derivation bundle is separate from the built-output cache artifacts.
 
 For a package-set workflow, keep the job and matrix structure, replace the
