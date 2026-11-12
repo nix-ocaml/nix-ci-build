@@ -199,7 +199,15 @@ let complete_outputs t (edge : Plan.edge) predicate =
     in
     outputs <> []
     && List.for_all outputs ~f:(fun (_, p) ->
-      match p with Some p -> predicate (availability t p) | None -> false)
+      match p with
+      | None -> false
+      | Some p ->
+        let available =
+          match availability t p with
+          | Plan.Cached _ when not node.allow_substitutes -> Plan.Missing
+          | available -> available
+        in
+        predicate available)
 
 let local = function Plan.Local -> true | _ -> false
 let cached = function Plan.Local | Cached _ -> true | Missing -> false
@@ -236,8 +244,9 @@ let job_json t (j : job) =
     ; "buildSeconds", `Float build_seconds
     ; "logPath", `String j.log
     ; ( "reproduction"
-      , `String ("nix build -L --no-link " ^ Json.quote (j.edge.drv_path ^ "^*"))
-      )
+      , `String
+          ("nix build -L --no-link "
+          ^ Json.quote (Backend.edge_installable j.edge)) )
     ; "failure", j.failure
     ]
 
@@ -746,6 +755,92 @@ let evaluate t process_mgr =
   t.roots <- List.map (roots t) ~f:(fun j -> j.edge);
   checkpoint t
 
+let load_prepared t process_mgr (graph, requests) =
+  let module Requests = Map.Make (String) in
+  t.graph <- graph;
+  let requests =
+    List.fold_left
+      requests
+      ~init:Requests.empty
+      ~f:(fun requests ((edge : Plan.edge), attrs) ->
+        let edge =
+          { Plan.drv_path = Plan.normalize_drv_path edge.drv_path
+          ; outputs = List.sort_uniq ~cmp:String.compare edge.outputs
+          }
+        in
+        let node =
+          match Plan.find graph edge.drv_path with
+          | Some node -> node
+          | None ->
+            failwith ("Prepared root is absent from the graph: " ^ edge.drv_path)
+        in
+        let outputs =
+          if List.mem "*" ~set:edge.outputs
+          then List.map node.outputs ~f:fst
+          else edge.outputs
+        in
+        if outputs = []
+        then failwith ("Prepared root selects no outputs: " ^ edge.drv_path);
+        List.iter outputs ~f:(fun output ->
+          if not (List.mem_assoc output ~map:node.outputs)
+          then
+            failwith ("Unknown prepared output: " ^ edge.drv_path ^ "^" ^ output));
+        let attrs = if attrs = [] then [ node.name ] else attrs in
+        let previous_outputs, previous_attrs =
+          match Requests.find_opt edge.drv_path requests with
+          | None -> [], []
+          | Some ((previous : Plan.edge), attrs) -> previous.outputs, attrs
+        in
+        let edge =
+          { edge with
+            outputs =
+              List.sort_uniq ~cmp:String.compare (outputs @ previous_outputs)
+          }
+        in
+        Requests.add
+          edge.drv_path
+          (edge, List.sort_uniq ~cmp:String.compare (attrs @ previous_attrs))
+          requests)
+  in
+  Requests.iter
+    (fun drv ((edge : Plan.edge), attrs) ->
+       let node = Option.get (Plan.find graph drv) in
+       let job =
+         { edge
+         ; attrs
+         ; name = node.name
+         ; system = node.system
+         ; cache = "unknown"
+         ; queued = now ()
+         ; started = None
+         ; finished = None
+         ; state = "queued"
+         ; failure = `Null
+         ; log = ""
+         }
+       in
+       Hashtbl.add t.jobs drv job;
+       t.eval_attrs <- t.eval_attrs + List.length attrs;
+       List.iter attrs ~f:(fun attr ->
+         event
+           t
+           "evaluated"
+           [ "drvPath", `String drv
+           ; "attr", `String attr
+           ; "prepared", `Bool true
+           ]))
+    requests;
+  t.roots <- List.map (roots t) ~f:(fun j -> j.edge);
+  (* The evaluator normally pins these files. Prepared execution has no
+     evaluator process, so retain the imported recipe closure ourselves. No
+     availability from the planner is reused; make_plan probes this worker. *)
+  Backend.pin_derivations
+    process_mgr
+    ~root:(Filename.concat t.gc_dir "prepared")
+    (List.map t.roots ~f:(fun (edge : Plan.edge) -> edge.drv_path));
+  t.eval_complete <- true;
+  checkpoint t
+
 let get_activity t drv =
   match Hashtbl.find_opt t.activities drv with
   | Some a -> a
@@ -861,7 +956,7 @@ let record_failure t (j : job) drv kind message =
       ];
   transition t j (if drv = j.edge.drv_path then "failed" else "blocked")
 
-let run_build t process_mgr clock batch =
+let run_build t process_mgr clock stores batch =
   let request_id =
     Digest.to_hex
       (Digest.string
@@ -1023,11 +1118,12 @@ let run_build t process_mgr clock batch =
         ~finally:(fun () ->
           Hashtbl.to_seq_keys wait_ids |> List.of_seq |> List.iter ~f:stop_wait)
         (fun () ->
-           Backend.build
+           Backend.build_edges
              process_mgr
+             ~substituters:stores
              ~log_path:(full_log t log)
              ~on_stderr
-             (List.map remaining ~f:(fun j -> j.edge.drv_path)))
+             (List.map remaining ~f:(fun j -> j.edge)))
     in
     let paths =
       List.concat_map remaining ~f:(fun j -> root_paths t j.edge)
@@ -1350,7 +1446,7 @@ let scheduler t process_mgr clock stores =
                   ~finally:(fun () ->
                     decr active;
                     changed t)
-                  (fun () -> run_build t process_mgr clock batch)));
+                  (fun () -> run_build t process_mgr clock stores batch)));
             loop ()
     in
     loop ());
@@ -1827,7 +1923,7 @@ let uploader t process_mgr clock =
     in
     loop ())
 
-let run config env =
+let run ?prepared ?substituters config env =
   Json.mkdir config.report_dir;
   Json.mkdir (Filename.concat config.report_dir "logs");
   let gc_dir = Filename.temp_file "nix-ci-build-" "" in
@@ -1924,11 +2020,16 @@ let run config env =
                     t.context <-
                       ("nixVersion", `String (Backend.version process_mgr "nix"))
                       :: ( "nixEvalJobsVersion"
-                         , `String (Backend.version process_mgr "nix-eval-jobs")
-                         )
+                         , `String
+                             (match prepared with
+                             | None ->
+                               Backend.version process_mgr "nix-eval-jobs"
+                             | Some _ -> "not used (prepared plan)") )
                       :: t.context;
                     let evaluation_started = now () in
-                    evaluate t process_mgr;
+                    (match prepared with
+                    | None -> evaluate t process_mgr
+                    | Some prepared -> load_prepared t process_mgr prepared);
                     t.context <-
                       ( "evaluationSeconds"
                       , `Float (now () -. evaluation_started) )
@@ -1939,7 +2040,10 @@ let run config env =
                     let stores =
                       if pending_roots t = []
                       then []
-                      else Backend.substituters process_mgr
+                      else
+                        match substituters with
+                        | Some stores -> stores
+                        | None -> Backend.substituters process_mgr
                     in
                     make_plan t process_mgr stores;
                     t.context <-
