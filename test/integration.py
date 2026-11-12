@@ -219,6 +219,49 @@ class Integration(unittest.TestCase):
     def assert_cached(self, job):
         self.assertIn(job["state"], ("cached", "local", "substituted"), job)
 
+    def assert_artifact_safe_logs(self, snapshot):
+        for path in self.fixture.report.rglob("*"):
+            self.assertFalse(set(path.name) & set('\"<>:|*?\\\r\n'), path)
+            self.assertLessEqual(len(path.name.encode()), 255, path)
+        for section in ("jobs", "derivations", "uploads", "cacheReuse", "rootFailures"):
+            for entry in snapshot[section]:
+                if entry.get("logPath"):
+                    self.assertTrue((self.fixture.report / entry["logPath"]).is_file(), entry)
+
+    def test_report_log_filenames_are_safe_for_artifacts(self):
+        f = self.fixture
+        names = [
+            "cf50e29c358ece3a417cb47bf7d17b06b6219d65.patch?full_index=1",
+            "cf50e29c358ece3a417cb47bf7d17b06b6219d65.patch~3Ffull_index=1",
+            "source-" + "?" * 100,
+            "plain-package",
+        ]
+        drvs = [f.job("packages.item%d" % i, f.node(name, log=["log-%d" % i]))
+                for i, name in enumerate(names)]
+        runtime = store_path("runtime?full_index=1")
+        f.config["runtime_downloads"] = [{"path": runtime, "seconds": 0}]
+        snapshot = self.success(f.run("--copy-to", DESTINATION))
+        self.assert_artifact_safe_logs(snapshot)
+        self.assertEqual({job["drvPath"] for job in snapshot["jobs"]}, set(drvs))
+        self.assertEqual({upload["path"] for upload in snapshot["uploads"]},
+                         {f.output(drv) for drv in drvs})
+        activities = {entry["drvPath"]: entry for entry in snapshot["derivations"]}
+        paths = [activities[drv]["logPath"] for drv in drvs]
+        self.assertEqual(len(set(paths)), len(drvs))
+        for i, path in enumerate(paths):
+            self.assertIn("log-%d" % i, (f.report / path).read_text())
+        self.assertTrue(any(entry["path"] == runtime for entry in snapshot["derivations"]))
+
+    def test_failure_summary_references_artifact_safe_log(self):
+        f = self.fixture
+        drv = f.job("packages.patch", f.node("source.patch?full_index=1", behavior="fail"))
+        snapshot = self.failure(f.run("--retries", "0"))
+        self.assert_artifact_safe_logs(snapshot)
+        failure, = snapshot["rootFailures"]
+        self.assertEqual(failure["drvPath"], drv)
+        self.assertIn(failure["logPath"], f.summary.read_text())
+        self.assertIn("fixture build output", (f.report / failure["logPath"]).read_text())
+
     def observe_snapshot(self, process, predicate, timeout=15):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -280,10 +323,10 @@ class Integration(unittest.TestCase):
         self.assertEqual(process.returncode, 0, log.read())
         return self.fixture.snapshot()
 
-    def waiting_cache_target(self, outputs=None):
+    def waiting_cache_target(self, outputs=None, name="target"):
         f = self.fixture
         blocker = f.node("blocker", barrier="blocker")
-        target = f.node("target", [blocker], **({"outputs": outputs} if outputs else {}))
+        target = f.node(name, [blocker], **({"outputs": outputs} if outputs else {}))
         app = f.job("packages.app", f.node("app", [target]))
         return blocker, target, app
 
@@ -299,7 +342,7 @@ class Integration(unittest.TestCase):
     def test_cache_reuse_imports_dependency_published_during_running_request(self):
         f = self.fixture
         f.config["path_info_missing_output"] = "none"
-        blocker, target, app = self.waiting_cache_target()
+        blocker, target, app = self.waiting_cache_target(name="source.patch?full_index=1")
         with self.running_fixture("--cache-refresh", "0.05") as (process, log):
             self.wait_for_build(process, blocker)
             self.assertTrue(any(event["kind"] == "substitution_miss" and event["drv"] == target for event in f.trace()))
@@ -330,6 +373,7 @@ class Integration(unittest.TestCase):
         kinds = [event["type"] for event in f.events()]
         self.assertIn("cache-import-start", kinds)
         self.assertIn("cache-import-finished", kinds)
+        self.assert_artifact_safe_logs(snapshot)
 
     def test_cache_reuse_only_imports_cached_roots_needed_by_active_work(self):
         f = self.fixture
