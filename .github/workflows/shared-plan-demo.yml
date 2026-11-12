@@ -16,6 +16,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: shared-plan-demo-${{ github.ref }}
+  cancel-in-progress: true
+
 defaults:
   run:
     shell: bash
@@ -97,7 +101,7 @@ jobs:
           retention-days: 7
 
   shared:
-    name: Prerequisite / ${{ matrix.group }}
+    name: Prerequisites / ${{ join(matrix.consumers, ', ') }}
     needs: plan
     if: ${{ needs.plan.outputs.has-shared == 'true' }}
     strategy:
@@ -182,7 +186,7 @@ jobs:
           retention-days: 7
 
   packages:
-    name: Packages / ${{ matrix.group }}
+    name: Packages / ${{ join(matrix.consumers, ', ') }}
     needs: [plan, shared]
     # A skipped empty matrix or one failed prerequisite must not suppress
     # independent packages. Each worker checks its own required cache outputs.

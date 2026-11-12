@@ -49,5 +49,8 @@
         alias = nativeApp;
       };
       cross.app = crossApp;
+      noSubstitute.app = mk "non-substitutable-consumer" [ ] {
+        allowSubstitutes = false;
+      };
     };
 }
