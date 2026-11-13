@@ -1,0 +1,71 @@
+name: Live reporting
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/live.yml'
+      - 'action/**'
+      - 'live/**'
+      - 'proto/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: live/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: live
+      - run: npm run build
+        working-directory: live
+      - run: npx playwright install --with-deps chromium
+        working-directory: live
+      - run: npm test
+        working-directory: live
+        env:
+          NIX_LIVE_BROWSER_TESTS: '1'
+      - run: npm run build:action
+        working-directory: live
+      - name: Verify the committed action bundle
+        run: git diff --exit-code -- action/dist action/proto
+      - name: Start the OIDC collector
+        id: collector
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        run: |
+          node live/gha-smoke.mjs serve > "$RUNNER_TEMP/live-collector.log" 2>&1 &
+          node live/gha-smoke.mjs wait
+      - name: Exercise the bundled action with GitHub OIDC
+        if: steps.collector.outcome == 'success'
+        uses: ./action
+        with:
+          executable: node
+          args: '["live/gha-smoke.mjs", "build"]'
+          endpoint: ${{ steps.collector.outputs.endpoint }}
+          report-url: ${{ steps.collector.outputs.report-url }}
+          report-dir: live-proof
+          name: Transport fixture
+      - name: Verify authenticated delivery
+        if: steps.collector.outcome == 'success'
+        run: node live/gha-smoke.mjs verify
+      - name: Upload transport evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: live-reporting-proof-${{ github.run_attempt }}
+          path: |
+            live-proof/
+            ${{ runner.temp }}/nix-ci-live-gha/evidence.json
+            ${{ runner.temp }}/live-collector.log
+          if-no-files-found: ignore
