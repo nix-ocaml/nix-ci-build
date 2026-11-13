@@ -181,6 +181,8 @@ store closure as an artifact. Every worker imports that closure and executes
 the same binary. Tool compilation and tool import timings are recorded
 separately from package work. This avoids asking every fresh runner to build
 the builder itself before it can execute its assigned group.
+All demo runners are `x86_64-linux`. For heterogeneous runners, publish a builder
+closure for each build system and select the matching artifact on each worker.
 
 The demo passes tiny `file://` output caches through artifacts from the same
 workflow run. It needs no external cache credentials. It disables sandboxing

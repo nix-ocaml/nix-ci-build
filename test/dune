@@ -26,6 +26,12 @@
  (libraries nix-ci-build yojson))
 
 (test
+ (name backend_test)
+ (modules backend_test)
+ (libraries nix-ci-build eio_main unix mtime)
+ (action (run %{test} %{bin:python3})))
+
+(test
  (name report_test)
  (modules report_test)
  (libraries nix-ci-build yojson unix)

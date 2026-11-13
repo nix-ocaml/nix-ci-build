@@ -54,6 +54,11 @@ jobs:
       - name: Publish measured results
         if: always()
         run: |
+          # Nix creates private report directories. Return this experiment's
+          # files to the runner before the unprivileged artifact action reads them.
+          if [[ -d benchmark ]]; then
+            sudo chown -R --no-dereference "$(id -u):$(id -g)" benchmark
+          fi
           if [[ -f benchmark/summary.md ]]; then
             cat benchmark/summary.md >> "$GITHUB_STEP_SUMMARY"
           fi
