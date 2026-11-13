@@ -284,6 +284,11 @@ require Linux mount and user namespaces; the Actions workflow runs this command
 as root to create its private stores. It does not delete or rebuild paths in
 the machine's ordinary store. Private cache artifacts are unsigned, with
 signature checking disabled only in the harness's own Nix configuration.
+Worker stores and build temporary directories use a fresh directory under
+`/tmp`, outside the runner's private home. This lets sandboxed processes reach
+their own store without inheriting host root permissions. The directory is
+retained on failure and recorded as `workerStoreDirectory` in `benchmark.json`;
+plans, logs, and reports stay in the chosen artifact directory.
 
 `benchmark.json` and `summary.md` report observed completed build activities,
 wall time, planning time, seed sizes, and published cache file sizes. The

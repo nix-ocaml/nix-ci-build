@@ -45,8 +45,8 @@ jobs:
       - name: Check bounded-work guards
         run: python3 -B test/shared_plan_benchmark.py --self-test
       - name: Compare independent and coordinated workers
-        # Root is used only to create Linux chroot stores beneath this new
-        # directory. The harness never deletes paths from the ordinary store.
+        # Root is used only for this experiment's Linux chroot stores under
+        # /tmp. The harness never deletes paths from the ordinary store.
         run: |
           sudo env "PATH=$PATH" "$(command -v python3)" -B \
             test/shared_plan_benchmark.py "$PWD/result/bin/nix-ci-build" \

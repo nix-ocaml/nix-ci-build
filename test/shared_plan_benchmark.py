@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import platform
 import subprocess
+import tempfile
 import threading
 import time
 
@@ -134,6 +135,14 @@ class Benchmark:
             "max-jobs = 1", "cores = 1", "connect-timeout = 15", "download-attempts = 2",
         ]) + "\n"
         self.summary = {"version": 1, "startedAt": time.time(), "status": "running"}
+        # A sandbox maps the calling UID but cannot use that UID's host
+        # capabilities to traverse somebody else's private home directory.
+        # Keep stores and builder temp dirs outside the runner-owned checkout;
+        # plans, logs, and reports still live in the requested artifact tree.
+        self.worker_directory = Path(tempfile.mkdtemp(
+            prefix="nix-ci-benchmark-workers-", dir="/tmp")).resolve()
+        self.summary["workerStoreDirectory"] = str(self.worker_directory)
+        print("Retained worker stores: " + str(self.worker_directory), flush=True)
         self.seed = new_cache(self.directory / "seed-cache")
 
     def run(self, label, command, env=None, allow_failure=False, timeout=900):
@@ -299,17 +308,21 @@ class Benchmark:
 
     def execute(self, plan, group, cache):
         name = plan["name"] + "-" + group["id"]
-        store = self.directory / "workers" / name
+        store = self.worker_directory / name
         require(not store.exists(), "Worker store must start empty: " + str(store))
+        temporary = self.worker_directory / "build-tmp" / name
+        temporary.mkdir(parents=True)
         environment = dict(self.env)
         environment["NIX_REMOTE"] = str(store)
+        environment["TMPDIR"] = str(temporary)
         environment["NIX_CI_BUILD_RUN_ID"] = plan["name"]
         environment["NIX_CI_BUILD_ATTEMPT_ID"] = "1"
         report = self.directory / "reports" / plan["name"] / group["id"]
         started = time.time()
         report.mkdir(parents=True)
         bootstrap = {"groupId": group["id"], "runId": plan["name"], "attemptId": "1",
-                     "startedAt": started, "operation": "verify-bounded-work", "status": "failed"}
+                     "startedAt": started, "operation": "verify-bounded-work", "status": "failed",
+                     "workerStore": str(store), "buildTemporaryDirectory": str(temporary)}
         try:
             # Only raw recipes/source paths are imported in preflight; dependency
             # outputs are fetched by the real worker and timed in its own trace.
