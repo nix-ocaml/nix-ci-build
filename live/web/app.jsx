@@ -525,7 +525,17 @@ function RunList({ runs, selected, onSelect, now, loading }) {
 function RunView({ payload, now, route, navigate, paused }) {
   const { run, jobs, activities, diagnostics } = payload;
   const current = useMemo(() => latestJobs(jobs), [jobs]);
-  const selected = jobs.find((job) => job.key === route.jobKey) || null;
+  const selected =
+    jobs.find((job) => job.key === route.jobKey) ||
+    (route.jobKey?.startsWith("planned:")
+      ? current.find((job) => job.id === route.jobKey.slice("planned:".length))
+      : null) ||
+    null;
+  const selectionKey = selected?.key;
+  useEffect(() => {
+    if (selectionKey && selectionKey !== route.jobKey)
+      navigate({ jobKey: selectionKey }, true);
+  }, [selectionKey, route.jobKey, navigate]);
   const counts = Object.fromEntries(
     STATUS_ORDER.map((status) => [
       status,

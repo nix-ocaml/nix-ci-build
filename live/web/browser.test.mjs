@@ -263,6 +263,62 @@ test(
         new URL(page.url()).searchParams.get("job") === "invocation-native-5.4",
       );
       await page
+        .getByRole("button", {
+          name: "Inspect musl-5.4: Planned",
+          exact: true,
+        })
+        .click();
+      await page
+        .locator('.job-detail[aria-label="Job details: musl-5.4"]')
+        .waitFor();
+      assert.equal(
+        new URL(page.url()).searchParams.get("job"),
+        "planned:musl-5.4",
+      );
+      const plannedHistoryLength = await page.evaluate(() => history.length);
+      jobs[3] = {
+        ...jobs[3],
+        key: "invocation-musl-5.4",
+        status: "running",
+        startedAt: now - 5,
+      };
+      revision++;
+      for (const stream of streams)
+        stream.write(
+          `event: invalidate\ndata: ${JSON.stringify({ revision, runId })}\n\n`,
+        );
+      await page
+        .getByRole("button", {
+          name: "Inspect musl-5.4: Running",
+          exact: true,
+        })
+        .waitFor();
+      assert.equal(
+        await page
+          .locator('.job-detail[aria-label="Job details: musl-5.4"]')
+          .count(),
+        1,
+        "the selected planned job remains open when its invocation registers",
+      );
+      await page.waitForURL(
+        (url) => url.searchParams.get("job") === "invocation-musl-5.4",
+      );
+      assert.equal(
+        await page.evaluate(() => history.length),
+        plannedHistoryLength,
+        "registration updates the current history entry",
+      );
+      assert.equal(
+        await page.locator(".job-card.selected").getAttribute("data-job-key"),
+        "invocation-musl-5.4",
+      );
+      await page
+        .getByRole("button", {
+          name: "Inspect native-5.4: Running",
+          exact: true,
+        })
+        .click();
+      await page
         .getByRole("button", { name: "Activity table", exact: true })
         .click();
       await page
