@@ -2,6 +2,15 @@ name: Shared dependency demo
 
 on:
   workflow_dispatch:
+    inputs:
+      live-endpoint:
+        description: Optional HTTPS gRPC collector endpoint (ngrok)
+        type: string
+        required: false
+      report-url:
+        description: Browser dashboard URL on your machine
+        type: string
+        default: http://127.0.0.1:8799
   pull_request:
     paths:
       - '.github/workflows/shared-plan-demo.yml'
@@ -12,9 +21,12 @@ on:
       - 'flake.nix'
       - 'flake.lock'
       - 'dune-project'
+      - 'action/**'
+      - 'proto/**'
 
 permissions:
   contents: read
+  id-token: write
 
 concurrency:
   group: shared-plan-demo-${{ github.ref }}
@@ -146,10 +158,14 @@ jobs:
             sandbox = false
             substituters =
             extra-substituters =
-        run: |
-          ./result/bin/nix-ci-build \
-            --plan-sets demo-sets.json \
-            --report-dir plan
+        uses: ./action
+        with:
+          executable: ./result/bin/nix-ci-build
+          endpoint: ${{ inputs.live-endpoint || vars.NIX_CI_LIVE_ENDPOINT }}
+          report-url: ${{ inputs.report-url || 'http://127.0.0.1:8799' }}
+          name: Plan package sets
+          report-dir: plan
+          args: '["--plan-sets", "demo-sets.json"]'
       - name: Publish the plan summary
         if: always()
         run: |
@@ -239,12 +255,18 @@ jobs:
           NIX_CONFIG: |
             experimental-features = nix-command flakes
             sandbox = false
-        run: |
-          nix-ci-build \
-            --execute-plan plan --group "$GROUP_ID" \
-            --copy-from "file://$PWD/cache" \
-            --copy-to "file://$PWD/cache" \
-            --report-dir report
+        uses: ./action
+        with:
+          executable: nix-ci-build
+          endpoint: ${{ inputs.live-endpoint || vars.NIX_CI_LIVE_ENDPOINT }}
+          report-url: ${{ inputs.report-url || 'http://127.0.0.1:8799' }}
+          name: Prerequisites / ${{ join(matrix.consumers, ', ') }}
+          matrix: ${{ toJSON(matrix) }}
+          report-dir: report
+          args: >-
+            ["--execute-plan", "plan", "--group", "${{ matrix.group }}",
+             "--copy-from", "file://${{ github.workspace }}/cache",
+             "--copy-to", "file://${{ github.workspace }}/cache"]
       - name: Verify which builders ran
         run: |
           python3 - <<'PY'
@@ -369,12 +391,18 @@ jobs:
           NIX_CONFIG: |
             experimental-features = nix-command flakes
             sandbox = false
-        run: |
-          nix-ci-build \
-            --execute-plan plan --group "$GROUP_ID" \
-            --copy-from "file://$PWD/prerequisites" \
-            --copy-to "file://$PWD/cache" \
-            --report-dir report
+        uses: ./action
+        with:
+          executable: nix-ci-build
+          endpoint: ${{ inputs.live-endpoint || vars.NIX_CI_LIVE_ENDPOINT }}
+          report-url: ${{ inputs.report-url || 'http://127.0.0.1:8799' }}
+          name: Packages / ${{ join(matrix.consumers, ', ') }}
+          matrix: ${{ toJSON(matrix) }}
+          report-dir: report
+          args: >-
+            ["--execute-plan", "plan", "--group", "${{ matrix.group }}",
+             "--copy-from", "file://${{ github.workspace }}/prerequisites",
+             "--copy-to", "file://${{ github.workspace }}/cache"]
       - name: Verify the shared tool was imported
         run: |
           python3 - <<'PY'

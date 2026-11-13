@@ -1,0 +1,136 @@
+syntax = "proto3";
+
+package nix_ci_build.v1;
+
+// Only the ingestion endpoint is exposed to runners. Browser clients use the
+// collector's read API. A bearer GitHub OIDC token authenticates every RPC.
+service Reporting {
+  rpc RegisterInvocation(RegisterRequest) returns (RegisterResponse);
+  rpc Publish(EventBatch) returns (Acknowledgement);
+}
+
+message RunMetadata {
+  string repository = 1;
+  string repository_id = 2;
+  string run_id = 3;
+  uint32 run_attempt = 4;
+  string workflow = 5;
+  string branch = 6;
+  // PR head and the actual checkout (often a synthetic merge) are distinct.
+  string head_sha = 7;
+  string sha = 8;
+  uint32 pull_request_number = 9;
+  string title = 10;
+  string actor = 11;
+  string run_url = 12;
+  string commit_message = 13;
+  string event_name = 14;
+  int64 started_at_ms = 15;
+}
+
+message JobMetadata {
+  string job_id = 1;
+  string name = 2;
+  string logical_job = 3;
+  map<string, string> matrix = 4;
+  string system = 5;
+  string group_id = 6;
+  string plan_id = 7;
+  repeated string dependencies = 8;
+  string kind = 9;
+  string github_job_url = 10;
+  uint32 job_attempt = 11;
+  int64 started_at_ms = 12;
+  string check_run_id = 13;
+}
+
+message RegisterRequest {
+  // A UUID for this invocation, persisted alongside its spool. Multiple action
+  // steps in one GitHub job have separate invocation IDs.
+  string invocation_id = 1;
+  RunMetadata run = 2;
+  JobMetadata job = 3;
+}
+
+message RegisterResponse {
+  string invocation_id = 1;
+  string run_key = 2;
+  string report_url = 3;
+}
+
+message MatrixJob {
+  string id = 1;
+  string name = 2;
+  string kind = 3;
+  string system = 4;
+  string runner = 5;
+  repeated string dependencies = 6;
+  repeated string consumers = 7;
+  uint32 stage = 8;
+  map<string, string> matrix = 9;
+  repeated string roots = 10;
+  string plan_id = 11;
+}
+
+message Derivation {
+  string drv_path = 1;
+  string name = 2;
+  repeated string outputs = 3;
+  repeated string dependencies = 4;
+  repeated string attributes = 5;
+  string system = 6;
+}
+
+// A compact normalized event. Metadata dictionaries (matrixJobs/derivations)
+// are sent once when discovered; activity/progress events carry only deltas.
+// No arbitrary environment variables, command output, or raw build logs travel
+// in this protocol. Strings and repeated fields are bounded by the collector.
+message Event {
+  // Monotonic, contiguous, starting at 1 within each producer stream. Timestamps
+  // are for display; identity and ordering always use stream + sequence.
+  uint64 sequence = 1;
+  int64 occurred_at_ms = 2;
+  string kind = 3;
+  string entity_id = 4;
+  string parent_id = 5;
+  string name = 6;
+  string status = 7;
+  string drv_path = 8;
+  double elapsed_seconds = 9;
+  optional double duration_seconds = 10;
+  uint64 current = 11;
+  uint64 total = 12;
+  string phase = 13;
+  string message = 14;
+  string output_path = 15;
+  repeated string dependencies = 16;
+  repeated string attributes = 17;
+  repeated string outputs = 18;
+  repeated MatrixJob matrix_jobs = 19;
+  repeated Derivation derivations = 20;
+  string activity_type = 21;
+  string result = 22;
+  map<string, string> labels = 23;
+  // Only an invocation_finish from the wrapper is an authoritative invocation
+  // terminal state. A phase/activity finishing does not finish the whole job.
+  bool terminal = 24;
+  // Snapshot recovery preserves measured time bounds instead of making an
+  // old completed activity appear to finish when a snapshot is uploaded.
+  optional int64 started_at_ms = 25;
+  optional int64 finished_at_ms = 26;
+}
+
+message EventBatch {
+  string invocation_id = 1;
+  // Distinct IDs for wrapper, scheduler, and every worker/engine event file;
+  // their original sequence spaces must never be conflated.
+  string stream_id = 2;
+  repeated Event events = 3;
+}
+
+message Acknowledgement {
+  // Highest contiguous sequence committed durably for this stream. Resending
+  // identical events is idempotent. Gaps and conflicting duplicates reject the
+  // complete batch without advancing the acknowledgement.
+  uint64 last_sequence = 1;
+}

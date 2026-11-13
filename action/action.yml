@@ -1,0 +1,65 @@
+name: Nix CI build with live reporting
+description: Build a Nix package set and stream its structured progress to a live report.
+author: nix-ocaml
+inputs:
+  endpoint:
+    description: TLS gRPC collector origin. Leave empty to build with local reports only.
+    required: false
+  report-url:
+    description: Browser URL of the local visualizer, used to print its link immediately.
+    required: false
+  executable:
+    description: Existing nix-ci-build executable. Otherwise use the pinned builder flake.
+    required: false
+  builder-flake:
+    description: Immutable builder flake reference, used when executable is not supplied.
+    default: github:nix-ocaml/nix-ci-build/639073f40b0f35d68db7d386a25f40bd06ef52b6
+  flake:
+    description: Package set to build, equivalent to --flake.
+    required: false
+  args:
+    description: JSON array of additional nix-ci-build arguments; supports every shared-plan mode.
+    default: '[]'
+  report-dir:
+    description: Directory for structured local reports and the durable telemetry spool.
+    default: report
+  matrix:
+    description: Matrix coordinates as JSON, usually toJSON(matrix).
+    default: '{}'
+  name:
+    description: Display name for this builder invocation.
+    required: false
+  system:
+    description: Nix execution system, if known.
+    required: false
+  audience:
+    description: GitHub OIDC audience accepted by the collector.
+    default: nix-ci-build
+  final-flush-seconds:
+    description: Maximum time to deliver pending metadata after the builder exits.
+    default: '5'
+outputs:
+  report-url:
+    description: Live report link.
+  report-directory:
+    description: Absolute path of the local structured report.
+  telemetry-spool:
+    description: Durable protobuf spool; retain it as an artifact if delivery is incomplete.
+  telemetry-status:
+    description: complete, incomplete, or disabled.
+  exit-code:
+    description: Original builder exit code.
+  shared:
+    description: Shared prerequisite matrix from --plan-sets.
+  packages:
+    description: Package matrix from --plan-sets.
+  has-shared:
+    description: Whether the prerequisite matrix is nonempty.
+  has-packages:
+    description: Whether the package matrix is nonempty.
+runs:
+  using: node24
+  main: dist/index.js
+branding:
+  icon: activity
+  color: purple
