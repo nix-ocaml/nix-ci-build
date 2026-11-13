@@ -38,11 +38,13 @@ Create a JSON file such as `ci-sets.json`:
 ```
 
 Use the actual attribute paths exposed by your flake. Set IDs must be unique.
-Runner entries can be a GitHub runner label or an array of labels. The map is
+For GitHub Actions, runner entries can be a label or an array of labels. The map is
 keyed by the derivation's **build system**, so a cross compilation job normally
 runs on the machine that executes its compiler, not on its output target.
 Configure runner capacity, Nix system features, sandbox policy, and any remote
 builders separately. The planner does not discover those capabilities.
+Omit `runners` when using the local executor; the execution plan is independent
+of GitHub's matrix format.
 
 Plan the work:
 
@@ -64,8 +66,8 @@ The directory contains:
 | Path | Purpose |
 | --- | --- |
 | `execution-plan.json` | Versioned graph, exact output selections, group ownership, prerequisites, and evaluated attributes. |
-| `matrix-shared.json` | GitHub matrix with one entry per shared prerequisite group. |
-| `matrix-packages.json` | GitHub matrix with one entry per package execution group. |
+| `matrix-shared.json` | With GitHub runners configured, one entry per shared prerequisite group. |
+| `matrix-packages.json` | With GitHub runners configured, one entry per package execution group. |
 | `evaluation.json` | Evaluated attributes and evaluation errors. |
 | `store/` | A portable file binary cache containing the derivation and source closure. |
 | `summary.md`, `logs/` | The human-readable plan and planning diagnostics. |
@@ -105,6 +107,60 @@ its destination cache. A successful local build with an unsuccessful upload
 does not release its consumers. Completed outputs and normal build reports are
 retained even when another build or upload fails.
 
+## Run the plan locally
+
+The local executor starts a group as soon as its own prerequisites have
+succeeded and published their outputs:
+
+```sh
+nix-ci-build \
+  --run-plan shared-plan \
+  --workers 4 \
+  --copy-from https://cache.example.org \
+  --copy-to 's3://example-nix-cache' \
+  --report-dir shared-reports
+```
+
+`--workers` limits concurrent groups. `--jobs` controls the build concurrency
+inside each worker. Unrelated groups continue after a failure; descendants of
+a failed group are recorded as blocked. Every worker uses the saved derivations
+and the same publication checks as an explicitly invoked `--execute-plan`.
+
+This adapter runs child processes on the current machine. It accepts systems
+listed in Nix's `system` and `extra-platforms` configuration; it does not create
+remote machines or discover a runner fleet. Concurrent groups share the local
+Nix store, while the publication cache provides the explicit handoff between
+their assigned work.
+
+The report directory retains scheduler events and run state, with worker
+attempts under `runs/RUN/GROUP/ATTEMPT/`. The executor also creates an aggregate
+report under `aggregate/`. This provides durable evidence of what happened;
+automatic resume, leases, and coordination between separate runs are not yet
+implemented.
+
+## Combine worker reports
+
+Collect the plan and the reports from every worker, including failed attempts:
+
+```sh
+nix-ci-build \
+  --aggregate-plan shared-plan \
+  --reports downloaded-reports \
+  --report-dir combined-report
+```
+
+Report discovery is recursive, so each downloaded artifact can keep its own
+directory. The combined report relates execution attempts to plan ownership,
+prerequisites, and observed outcomes. Worker execution traces time recipe
+imports, cache refresh, prerequisite imports, execution, and publication.
+Per-derivation activity remains available in the original worker reports.
+
+Bootstrap work outside the executable can be recorded in `bootstrap.json` in
+an attempt's report directory. Include `groupId`, `runId`, `attemptId`, `status`,
+`startedAt`, `finishedAt` (Unix seconds), and `durationSeconds`; include `error`
+when bootstrap fails. The planner can place its own bootstrap metadata at
+`shared-plan/bootstrap.json`.
+
 ## GitHub Actions
 
 The planner appends `shared`, `packages`, `has-shared`, and `has-packages` to
@@ -112,12 +168,19 @@ The planner appends `shared`, `packages`, `has-shared`, and `has-packages` to
 values. Both matrix values are compact JSON objects with an `include` array;
 entries contain `group`, `system`, `runner`, and `consumers`.
 
-The [runnable demo](../.github/workflows/shared-plan-demo.yml) uses three jobs:
-one planner, a shared-prerequisite matrix, and a package matrix. Its fixture has
+The [runnable demo](../.github/workflows/shared-plan-demo.yml) uses four stages:
+one planner, a shared-prerequisite matrix, a package matrix, and an always-run
+aggregate report. Its fixture has
 two named sets that share different outputs of one tool, two private branches,
 and an attribute alias. The fixture uses shell builtins rather than a real
 compiler. Builder ledgers verify that the shared tool runs once and that each
 package runner builds only its owned derivations.
+
+The planner builds this revision of `nix-ci-build` once and exports its exact
+store closure as an artifact. Every worker imports that closure and executes
+the same binary. Tool compilation and tool import timings are recorded
+separately from package work. This avoids asking every fresh runner to build
+the builder itself before it can execute its assigned group.
 
 The demo passes tiny `file://` output caches through artifacts from the same
 workflow run. It needs no external cache credentials. It disables sandboxing
@@ -144,6 +207,9 @@ Keep these workflow rules when adapting it:
   Each worker checks its own required outputs, so unaffected groups can finish.
 - Upload reports with `if: always()` and unique group names, including reports
   from failed groups. A failed producer remains visible as a failed job.
+- Run aggregation with `if: always()` after all stages, downloading the plan
+  and all available worker reports. A missing report must remain visible;
+  aggregation does not convert a failed worker into a successful build.
 
 These conditions follow GitHub's [job dependency and matrix rules](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idif)
 and [status check functions](https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#status-check-functions).
@@ -159,10 +225,11 @@ package needs only part of that component. This guarantees one owner without
 introducing dependencies between prerequisite jobs, but a large shared
 toolchain can become one large job.
 
-Package jobs wait for the entire shared matrix to finish. GitHub's static job
+In the GitHub template, package jobs wait for the entire shared matrix to finish. GitHub's static job
 graph does not give individual dynamic matrix entries arbitrary `needs`
 relationships. The plan records each group's real prerequisites, and workers
-enforce those boundaries, but this initial workflow uses a stage barrier.
+enforce those boundaries. The local executor instead dispatches according to
+each group's individual prerequisites.
 
 Shared components spanning incompatible build systems fail planning. Unknown
 required output paths and missing graph nodes also fail rather than producing
@@ -183,3 +250,45 @@ nix develop -c dune build bin/main.exe
 nix develop -c python3 -B test/shared_plan_real.py \
   _build/default/bin/main.exe --directory "$PWD/shared-plan-test-reports"
 ```
+
+## Bounded comparison with real packages
+
+The [comparison workflow](../.github/workflows/shared-plan-benchmark.yml) builds
+the unmodified OCaml 5.5 `fmt` and `astring` packages from this repository's
+locked nix-overlays revision. Both consume the exact same `topkg` derivation.
+It compares two independent package workers with a shared prerequisite worker
+followed by two package workers. Each worker receives a fresh Linux chroot
+store, preserving the original `/nix/store` identities.
+
+The harness copies compiler, tools, libraries, and source archives from the
+read caches into a private seed cache. It never builds those prerequisites. It
+stops if any prerequisite is unavailable, if the seed exceeds 2 GiB of NAR
+content, or if a plan or worker would build anything except the exact three
+selected derivations. Only the independent workers receive separate output
+caches; coordinated workers share a publication cache. Upstream caches cannot
+supply the deliberately withheld outputs during either case.
+
+Run it on Linux after building the tool:
+
+```sh
+nix build --accept-flake-config
+python3 -B test/shared_plan_benchmark.py result/bin/nix-ci-build \
+  --directory "$PWD/shared-plan-benchmark"
+```
+
+The chosen directory must not exist. Nix's
+[chroot stores](https://nix.dev/manual/nix/2.35/store/types/local-store#local-chroot-store)
+require Linux mount and user namespaces; the Actions workflow runs this command
+as root to create its private stores. It does not delete or rebuild paths in
+the machine's ordinary store. Private cache artifacts are unsigned, with
+signature checking disabled only in the harness's own Nix configuration.
+
+`benchmark.json` and `summary.md` report observed completed build activities,
+wall time, planning time, seed sizes, and published cache file sizes. The
+expected result is four builds independently (`topkg` twice) and three with
+coordination (`topkg` once); the experiment verifies this against worker
+activity. It also retains the exact recipe identities, command logs,
+preflight checks, phase timings, and combined reports. Cache sizes are bytes on
+disk, not measured network traffic, and build activity is elapsed build time,
+not CPU time. For these small packages, an extra worker handoff can outweigh
+the avoided build; the report presents the measured tradeoff.

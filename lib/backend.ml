@@ -34,6 +34,7 @@ let run
       ?(capture = true)
       ?(on_stdout = fun _ -> ())
       ?(on_stderr = fun _ -> ())
+      ?cancel_grace
       args
   =
   let log =
@@ -99,14 +100,37 @@ let run
            in
            loop ()
          in
-         Eio.Fiber.both
-           (fun () -> consume out_r on_stdout true)
-           (fun () -> consume err_r on_stderr false);
-         let status = Eio.Process.await child in
-         { status
-         ; stdout = Buffer.contents stdout
-         ; tail = List.of_seq (Queue.to_seq tail)
-         }))
+         let drain () =
+           Eio.Fiber.both
+             (fun () -> consume out_r on_stdout true)
+             (fun () -> consume err_r on_stderr false)
+         in
+         match
+           drain ();
+           let status = Eio.Process.await child in
+           { status
+           ; stdout = Buffer.contents stdout
+           ; tail = List.of_seq (Queue.to_seq tail)
+           }
+         with
+         | result -> result
+         | exception exn ->
+           let backtrace = Printexc.get_raw_backtrace () in
+           Option.iter
+             (fun (clock, seconds) ->
+                (* A worker owns nested Nix processes. Give it time to handle
+                   SIGTERM and close those processes before Eio's switch cleanup
+                   sends its unconditional SIGKILL. Keep draining its pipes so
+                   final diagnostics cannot block graceful shutdown. The process
+                   reaper also belongs to the cancelled switch, so awaiting the
+                   child here would deadlock. Pipe EOF or the deadline ends the
+                   grace period; switch cleanup then reaps. *)
+                Eio.Cancel.protect (fun () ->
+                  Eio.Process.signal child Sys.sigterm;
+                  Eio.Fiber.first drain (fun () ->
+                    Eio.Time.Mono.sleep clock seconds)))
+             cancel_grace;
+           Printexc.raise_with_backtrace exn backtrace))
 
 let nix args =
   [ "nix"; "--extra-experimental-features"; "nix-command flakes" ] @ args
@@ -408,7 +432,14 @@ let edge_installable (edge : Plan.edge) =
   then "*"
   else String.concat ~sep:"," edge.outputs
 
-let build_edges process_mgr ?substituters ~log_path ~on_stderr edges =
+let build_edges
+      process_mgr
+      ?substituters
+      ?cancel_grace
+      ~log_path
+      ~on_stderr
+      edges
+  =
   let cache_options =
     match substituters with
     | None -> []
@@ -417,6 +448,7 @@ let build_edges process_mgr ?substituters ~log_path ~on_stderr edges =
   in
   run
     process_mgr
+    ?cancel_grace
     ~capture:false
     ~log_path
     ~on_stderr

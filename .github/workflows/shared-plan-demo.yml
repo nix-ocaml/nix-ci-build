@@ -45,8 +45,74 @@ jobs:
           extra_nix_config: |
             extra-substituters = https://anmonteiro.nix-cache.workers.dev
             extra-trusted-public-keys = ocaml.nix-cache.com-1:/xI2h2+56rwFfKyyFVbkJSeGqSIYMC/Je+7XXqGKDIY=
-      - name: Build this revision of nix-ci-build
-        run: nix build --accept-flake-config -L
+      - name: Build and export this revision of nix-ci-build
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          import subprocess
+          import time
+
+          started = time.time()
+          tool = subprocess.check_output(
+              ['nix', 'build', '--accept-flake-config', '-L', '--print-out-paths'],
+              text=True,
+          ).strip()
+          built = time.time()
+          directory = Path('tool')
+          directory.mkdir()
+          (directory / 'path').write_text(tool + '\n')
+          closure = json.loads(subprocess.check_output(
+              ['nix', 'path-info', '--recursive', '--json', tool], text=True,
+          ))
+          (directory / 'closure.json').write_text(json.dumps(closure, indent=2) + '\n')
+          subprocess.run(
+              ['nix', 'copy', '--to', (directory / 'store').resolve().as_uri() + '?compression=zstd', tool],
+              check=True,
+          )
+          finished = time.time()
+          bootstrap = json.dumps({
+              'toolPath': tool, 'startedAt': started, 'finishedAt': finished,
+              'durationSeconds': finished - started, 'buildSeconds': built - started,
+              'exportSeconds': finished - built, 'status': 'success',
+          }, indent=2) + '\n'
+          (directory / 'bootstrap.json').write_text(bootstrap)
+          Path('plan').mkdir()
+          Path('plan/bootstrap.json').write_text(bootstrap)
+          PY
+      - name: Upload the exact builder closure
+        uses: actions/upload-artifact@v7
+        with:
+          name: nix-ci-build-tool
+          path: tool/
+          overwrite: true
+          compression-level: 0
+          retention-days: 7
+      - name: Exercise provider-neutral local execution
+        run: |
+          python3 -B test/shared_runner_real.py ./result/bin/nix-ci-build \
+            --directory "$RUNNER_TEMP/local-execution-smoke"
+      - name: Verify cancellation stops active work
+        run: |
+          python3 -B test/shared_cancel_real.py ./result/bin/nix-ci-build \
+            --directory "$RUNNER_TEMP/local-cancellation-smoke"
+      - name: Upload local execution evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: shared-plan-local-smoke-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/local-execution-smoke/*.json
+            ${{ runner.temp }}/local-execution-smoke/builders.log
+            ${{ runner.temp }}/local-execution-smoke/commands/
+            ${{ runner.temp }}/local-execution-smoke/plan/
+            ${{ runner.temp }}/local-execution-smoke/local-reports/
+            ${{ runner.temp }}/local-cancellation-smoke/*.json
+            ${{ runner.temp }}/local-cancellation-smoke/commands/
+            ${{ runner.temp }}/local-cancellation-smoke/plan/
+            ${{ runner.temp }}/local-cancellation-smoke/reports/
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Prepare the fixture package sets
         run: |
           python3 - <<'PY'
@@ -111,6 +177,8 @@ jobs:
     timeout-minutes: 30
     env:
       GROUP_ID: ${{ matrix.group }}
+      NIX_CI_BUILD_RUN_ID: github:${{ github.repository }}:${{ github.run_id }}
+      NIX_CI_BUILD_ATTEMPT_ID: ${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v7
       - uses: cachix/install-nix-action@v31
@@ -121,8 +189,41 @@ jobs:
             # Demo artifacts are unsigned. Set this before the daemon starts;
             # a client-side NIX_CONFIG override does not change its store policy.
             require-sigs = false
-      - name: Build this revision of nix-ci-build
-        run: nix build --accept-flake-config -L
+      - uses: actions/download-artifact@v8
+        with:
+          name: nix-ci-build-tool
+          path: tool
+      - name: Import the exact builder closure
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import time
+
+          started = time.time()
+          metadata = {
+              'groupId': os.environ['GROUP_ID'], 'runId': os.environ['NIX_CI_BUILD_RUN_ID'],
+              'attemptId': os.environ['NIX_CI_BUILD_ATTEMPT_ID'], 'startedAt': started,
+              'operation': 'import-builder', 'status': 'failed',
+          }
+          Path('report').mkdir(exist_ok=True)
+          try:
+              tool = Path('tool/path').read_text().strip()
+              metadata['toolPath'] = tool
+              subprocess.run(['nix', 'copy', '--from', Path('tool/store').resolve().as_uri(), tool], check=True)
+              with open(os.environ['GITHUB_PATH'], 'a') as path:
+                  path.write(tool + '/bin\n')
+              metadata['status'] = 'success'
+          except Exception as error:
+              metadata['error'] = str(error)
+              raise
+          finally:
+              metadata['finishedAt'] = time.time()
+              metadata['durationSeconds'] = metadata['finishedAt'] - started
+              Path('report/bootstrap.json').write_text(json.dumps(metadata, indent=2) + '\n')
+          PY
       - uses: actions/download-artifact@v8
         with:
           name: shared-plan
@@ -139,7 +240,7 @@ jobs:
             experimental-features = nix-command flakes
             sandbox = false
         run: |
-          ./result/bin/nix-ci-build \
+          nix-ci-build \
             --execute-plan plan --group "$GROUP_ID" \
             --copy-from "file://$PWD/cache" \
             --copy-to "file://$PWD/cache" \
@@ -198,6 +299,8 @@ jobs:
     timeout-minutes: 30
     env:
       GROUP_ID: ${{ matrix.group }}
+      NIX_CI_BUILD_RUN_ID: github:${{ github.repository }}:${{ github.run_id }}
+      NIX_CI_BUILD_ATTEMPT_ID: ${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v7
       - uses: cachix/install-nix-action@v31
@@ -208,8 +311,41 @@ jobs:
             # Demo artifacts are unsigned. Set this before the daemon starts;
             # a client-side NIX_CONFIG override does not change its store policy.
             require-sigs = false
-      - name: Build this revision of nix-ci-build
-        run: nix build --accept-flake-config -L
+      - uses: actions/download-artifact@v8
+        with:
+          name: nix-ci-build-tool
+          path: tool
+      - name: Import the exact builder closure
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import time
+
+          started = time.time()
+          metadata = {
+              'groupId': os.environ['GROUP_ID'], 'runId': os.environ['NIX_CI_BUILD_RUN_ID'],
+              'attemptId': os.environ['NIX_CI_BUILD_ATTEMPT_ID'], 'startedAt': started,
+              'operation': 'import-builder', 'status': 'failed',
+          }
+          Path('report').mkdir(exist_ok=True)
+          try:
+              tool = Path('tool/path').read_text().strip()
+              metadata['toolPath'] = tool
+              subprocess.run(['nix', 'copy', '--from', Path('tool/store').resolve().as_uri(), tool], check=True)
+              with open(os.environ['GITHUB_PATH'], 'a') as path:
+                  path.write(tool + '/bin\n')
+              metadata['status'] = 'success'
+          except Exception as error:
+              metadata['error'] = str(error)
+              raise
+          finally:
+              metadata['finishedAt'] = time.time()
+              metadata['durationSeconds'] = metadata['finishedAt'] - started
+              Path('report/bootstrap.json').write_text(json.dumps(metadata, indent=2) + '\n')
+          PY
       - uses: actions/download-artifact@v8
         with:
           name: shared-plan
@@ -234,7 +370,7 @@ jobs:
             experimental-features = nix-command flakes
             sandbox = false
         run: |
-          ./result/bin/nix-ci-build \
+          nix-ci-build \
             --execute-plan plan --group "$GROUP_ID" \
             --copy-from "file://$PWD/prerequisites" \
             --copy-to "file://$PWD/cache" \
@@ -278,5 +414,48 @@ jobs:
         with:
           name: package-report-${{ matrix.group }}-${{ github.run_attempt }}
           path: report/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  aggregate:
+    name: Combined build report
+    needs: [plan, shared, packages]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            # This job imports only the builder artifact from this demo run.
+            require-sigs = false
+      - uses: actions/download-artifact@v8
+        with:
+          name: nix-ci-build-tool
+          path: tool
+      - name: Import the exact builder closure
+        run: |
+          tool=$(cat tool/path)
+          nix copy --from "file://$PWD/tool/store" "$tool"
+          printf '%s/bin\n' "$tool" >> "$GITHUB_PATH"
+      - uses: actions/download-artifact@v8
+        with:
+          name: shared-plan
+          path: plan
+      - name: Download all group attempts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: '{shared,package}-report-*'
+          path: reports
+      - name: Aggregate planning, bootstrap, and group reports
+        run: |
+          mkdir -p reports
+          nix-ci-build --aggregate-plan plan --reports reports --report-dir aggregate
+      - name: Upload the combined report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: shared-plan-report-${{ github.run_attempt }}
+          path: aggregate/
           if-no-files-found: ignore
           retention-days: 7

@@ -4,6 +4,10 @@ let main
       flake
       plan_sets
       execute_plan
+      run_plan
+      aggregate_plan
+      reports
+      workers
       group
       copy_from
       github_output
@@ -23,6 +27,7 @@ let main
   =
   if
     jobs < 1
+    || workers < 1
     || batch_size < 1
     || retries < 0
     || heartbeat <= 0.
@@ -31,25 +36,33 @@ let main
     || not (Float.is_finite cache_refresh)
   then (
     prerr_endline
-      "jobs, batch-size and heartbeat must be positive; retries must be \
-       nonnegative; cache-refresh must be finite and nonnegative";
+      "jobs, workers, batch-size and heartbeat must be positive; retries must \
+       be nonnegative; cache-refresh must be finite and nonnegative";
     2)
   else if
     List.length
-      (List.filter ~f:Option.is_some [ flake; plan_sets; execute_plan ])
+      (List.filter
+         ~f:Option.is_some
+         [ flake; plan_sets; execute_plan; run_plan; aggregate_plan ])
     <> 1
   then (
     prerr_endline
-      "Choose exactly one of --flake, --plan-sets, or --execute-plan";
+      "Choose exactly one of --flake, --plan-sets, --execute-plan, --run-plan, \
+       or --aggregate-plan";
     2)
   else if execute_plan <> None <> (group <> None)
   then (
     prerr_endline "--execute-plan and --group must be used together";
     2)
-  else if execute_plan <> None && (dry_run || explain <> None)
+  else if
+    (execute_plan <> None || run_plan <> None) && (dry_run || explain <> None)
   then (
     prerr_endline
-      "--execute-plan cannot be combined with --dry-run or --explain";
+      "Saved-plan execution cannot be combined with --dry-run or --explain";
+    2)
+  else if aggregate_plan <> None <> (reports <> None)
+  then (
+    prerr_endline "--aggregate-plan and --reports must be used together";
     2)
   else
     let config =
@@ -71,29 +84,63 @@ let main
     in
     try
       Eio_main.run (fun env ->
-        match plan_sets, execute_plan with
-        | Some sets_file, None ->
+        match plan_sets, execute_plan, run_plan, aggregate_plan with
+        | Some sets_file, None, None, None ->
           Nix_ci_build.Shared_run.plan
             ~sets_file
             ~directory:report_dir
             ~jobs
             ~copy_from
-            ~github_output:
-              (match github_output with
-              | Some _ -> github_output
-              | None -> Sys.getenv_opt "GITHUB_OUTPUT")
+            ~github_output
             env
-        | None, Some directory ->
+        | None, Some directory, None, None ->
           Nix_ci_build.Shared_run.execute
             ~directory
             ~group_id:(Option.get group)
             ~copy_from
             config
             env
+        | None, None, Some directory, None ->
+          let render () =
+            Nix_ci_build.Shared_report.render
+              ~directory
+              ~reports:report_dir
+              ~output:(Filename.concat report_dir "aggregate")
+          in
+          (match
+             Nix_ci_build.Local_runner.run
+               ~directory
+               ~workers
+               ~copy_from
+               config
+               env
+           with
+          | code ->
+            render ();
+            code
+          | exception exn ->
+            let backtrace = Printexc.get_raw_backtrace () in
+            (try render () with
+            | report_error ->
+              prerr_endline
+                ("Cannot render partial report: "
+                ^ Printexc.to_string report_error));
+            Printexc.raise_with_backtrace exn backtrace)
+        | None, None, None, Some directory ->
+          Nix_ci_build.Shared_report.render
+            ~directory
+            ~reports:(Option.get reports)
+            ~output:report_dir;
+          0
         | _ -> Nix_ci_build.Engine.run config env)
     with
     | exn ->
       let message = Printexc.to_string exn in
+      let status =
+        match exn with
+        | Nix_ci_build.Local_runner.Cancelled -> "cancelled"
+        | _ -> Nix_ci_build.Shared_trace.exception_status exn
+      in
       prerr_endline ("Cannot complete build plan: " ^ message);
       (try
          Nix_ci_build.Json.mkdir report_dir;
@@ -106,14 +153,28 @@ let main
                ]);
          Option.iter
            (fun id ->
+              let previous =
+                try
+                  Nix_ci_build.Json.read
+                    (Filename.concat report_dir "execution.json")
+                  |> Nix_ci_build.Json.assoc
+                  |> List.filter ~f:(fun (key, _) ->
+                    not
+                      (List.mem
+                         key
+                         ~set:[ "group"; "status"; "error"; "version" ]))
+                with
+                | _ -> []
+              in
               Nix_ci_build.Json.atomic_write
                 (Filename.concat report_dir "execution.json")
                 (`Assoc
-                    [ "version", `Int 1
-                    ; "group", `String id
-                    ; "status", `String "failed"
-                    ; "error", `String message
-                    ]);
+                    ([ "version", `Int 1
+                     ; "group", `String id
+                     ; "status", `String status
+                     ; "error", `String message
+                     ]
+                    @ previous));
               let append path =
                 let channel =
                   open_out_gen
@@ -143,7 +204,7 @@ let main
            group
        with
       | _ -> ());
-      1
+      if status = "cancelled" then 130 else 1
 
 let command =
   let flake =
@@ -176,6 +237,48 @@ let command =
           ~doc:
             "Execute one owned group from a saved plan and derivation bundle; \
              requires --group and --copy-to.")
+  in
+  let run_plan =
+    Arg.(
+      value
+      & opt (some string) None
+      & info
+          [ "run-plan" ]
+          ~docv:"DIR"
+          ~doc:
+            "Run a saved plan locally, dispatching groups when their \
+             prerequisites succeed; requires --copy-to.")
+  in
+  let aggregate_plan =
+    Arg.(
+      value
+      & opt (some string) None
+      & info
+          [ "aggregate-plan" ]
+          ~docv:"DIR"
+          ~doc:
+            "Render a replayable aggregate report from a saved plan and \
+             --reports, without building.")
+  in
+  let reports =
+    Arg.(
+      value
+      & opt (some string) None
+      & info
+          [ "reports" ]
+          ~docv:"DIR"
+          ~doc:"Tree of worker reports to combine with --aggregate-plan.")
+  in
+  let workers =
+    Arg.(
+      value
+      & opt int 2
+      & info
+          [ "workers" ]
+          ~docv:"N"
+          ~doc:
+            "Maximum simultaneous local execution groups for --run-plan \
+             (default 2).")
   in
   let group =
     Arg.(
@@ -343,6 +446,10 @@ let command =
       $ flake
       $ plan_sets
       $ execute_plan
+      $ run_plan
+      $ aggregate_plan
+      $ reports
+      $ workers
       $ group
       $ copy_from
       $ github_output

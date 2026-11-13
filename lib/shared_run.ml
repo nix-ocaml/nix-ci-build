@@ -166,30 +166,6 @@ let store_copy process_mgr ~log ~source ~destination drvs =
   in
   require_success "Cannot transfer derivation closure" result
 
-let matrix runners groups =
-  if List.length groups > 256
-  then
-    fail
-      "A stage exceeds GitHub Actions' 256-job matrix limit; combine \
-       package-set requests or plan fewer sets together";
-  `Assoc
-    [ ( "include"
-      , `List
-          (List.map groups ~f:(fun (group : Shared_plan.group) ->
-             let runner =
-               match List.assoc_opt group.system runners with
-               | Some runner -> runner
-               | None ->
-                 fail ("No runner configured for build system " ^ group.system)
-             in
-             `Assoc
-               [ "group", `String group.id
-               ; "system", `String group.system
-               ; "runner", runner
-               ; "consumers", strings group.consumers
-               ])) )
-    ]
-
 let append_outputs path values =
   let channel =
     open_out_gen
@@ -210,7 +186,17 @@ let plan ~sets_file ~directory ~jobs ~copy_from ~github_output env =
   Json.mkdir logs;
   let config = Json.read sets_file in
   let sets = array "sets" (Json.member "sets" config) in
-  let runners = fields "runners" (Json.member "runners" config) in
+  let runners =
+    match Json.member "runners" config with
+    | `Null -> []
+    | value -> fields "runners" value
+  in
+  let github_output =
+    match github_output with
+    | None when runners <> [] -> Sys.getenv_opt "GITHUB_OUTPUT"
+    | value -> value
+  in
+  let github = runners <> [] || github_output <> None in
   List.iter runners ~f:(fun (_, value) ->
     match value with
     | `String value when value <> "" -> ()
@@ -385,8 +371,14 @@ let plan ~sets_file ~directory ~jobs ~copy_from ~github_output env =
       List.partition planned.groups ~f:(fun (group : Shared_plan.group) ->
         group.kind = `Shared)
     in
-    let shared_matrix = matrix runners shared
-    and package_matrix = matrix runners packages in
+    let matrices =
+      if github
+      then
+        Some
+          ( Shared_github.matrix ~runners shared
+          , Shared_github.matrix ~runners packages )
+      else None
+    in
     let cached = Hashtbl.to_seq_keys available |> List.of_seq |> unique in
     let manifest =
       `Assoc
@@ -398,12 +390,15 @@ let plan ~sets_file ~directory ~jobs ~copy_from ~github_output env =
         ]
     in
     Json.atomic_write (Filename.concat directory "execution-plan.json") manifest;
-    Json.atomic_write
-      (Filename.concat directory "matrix-shared.json")
-      shared_matrix;
-    Json.atomic_write
-      (Filename.concat directory "matrix-packages.json")
-      package_matrix;
+    Option.iter
+      (fun (shared_matrix, package_matrix) ->
+         Json.atomic_write
+           (Filename.concat directory "matrix-shared.json")
+           shared_matrix;
+         Json.atomic_write
+           (Filename.concat directory "matrix-packages.json")
+           package_matrix)
+      matrices;
     let group_lines =
       List.map planned.groups ~f:(fun (group : Shared_plan.group) ->
         Printf.sprintf
@@ -447,6 +442,7 @@ let plan ~sets_file ~directory ~jobs ~copy_from ~github_output env =
         needed_drvs;
     Option.iter
       (fun path ->
+         let shared_matrix, package_matrix = Option.get matrices in
          append_outputs
            path
            [ "shared", Yojson.Safe.to_string shared_matrix
@@ -457,254 +453,474 @@ let plan ~sets_file ~directory ~jobs ~copy_from ~github_output env =
       github_output;
     0)
 
-let execute ~directory ~group_id ~copy_from (config : Engine.config) env =
+type refreshed =
+  { required_prerequisites : string list
+  ; cache_cuts : string list
+  ; cached_roots : string list
+  ; builds : string list
+  ; active_roots : Plan.edge list
+  }
+
+let refresh_group process_mgr ~log_dir ~stores graph (group : Shared_plan.group)
+  =
+  let available = Hashtbl.create 1024
+  and checked = Hashtbl.create 1024
+  and visited = Hashtbl.create 1024 in
+  let prerequisites = ref []
+  and cuts = ref []
+  and cached_roots = ref []
+  and builds = ref []
+  and active_roots = ref [] in
+  let query paths =
+    let paths =
+      unique paths
+      |> List.filter ~f:(fun path -> not (Hashtbl.mem checked path))
+    in
+    let local, warning = Backend.valid_paths process_mgr ~log_dir paths in
+    Option.iter fail warning;
+    List.iter local ~f:(fun path -> Hashtbl.replace available path Plan.Local);
+    let missing =
+      List.filter paths ~f:(fun path -> not (Hashtbl.mem available path))
+    in
+    let cached = probe process_mgr ~log_dir stores missing in
+    Hashtbl.iter (Hashtbl.replace available) cached;
+    List.iter paths ~f:(fun path -> Hashtbl.replace checked path ())
+  in
+  let rec walk edges =
+    let edges =
+      List.filter edges ~f:(fun (edge, root) ->
+        let key = edge, root in
+        if Hashtbl.mem visited key
+        then false
+        else (
+          Hashtbl.add visited key ();
+          true))
+    in
+    if edges <> []
+    then (
+      query (List.concat_map edges ~f:(fun (edge, _) -> selected graph edge));
+      let next =
+        List.concat_map edges ~f:(fun ((edge : Plan.edge), root) ->
+          let node = Option.get (Plan.find graph edge.drv_path) in
+          let paths = selected graph edge in
+          if not (List.mem node.drv_path ~set:group.members)
+          then (
+            (* Stop at the ownership boundary even if the producer has not
+               published yet. Descending would authorize a duplicate build. *)
+            List.iter paths ~f:(fun path ->
+              if not (List.mem path ~set:group.required_paths)
+              then fail ("Unplanned prerequisite output: " ^ path));
+            prerequisites := paths @ !prerequisites;
+            cuts := paths @ !cuts;
+            [])
+          else
+            let ready =
+              paths <> []
+              && List.for_all paths ~f:(fun path ->
+                match availability available path with
+                | Plan.Local -> true
+                | Plan.Cached _ -> node.allow_substitutes
+                | Plan.Missing -> false)
+            in
+            if ready
+            then (
+              if root
+              then cached_roots := paths @ !cached_roots
+              else cuts := paths @ !cuts;
+              [])
+            else (
+              builds := node.drv_path :: !builds;
+              if root then active_roots := edge :: !active_roots;
+              List.map node.inputs ~f:(fun edge -> edge, false)))
+      in
+      walk next)
+  in
+  (* roots includes explicit output obligations to downstream groups. A cached
+     parent never removes one of those independent publication obligations. *)
+  walk (List.map group.roots ~f:(fun edge -> edge, true));
+  { required_prerequisites = unique !prerequisites
+  ; cache_cuts = unique !cuts
+  ; cached_roots = unique !cached_roots
+  ; builds = unique !builds
+  ; active_roots = List.sort_uniq !active_roots ~cmp:Stdlib.compare
+  }
+
+let import_outputs
+      process_mgr
+      ?(on_import = fun _ -> ())
+      ~logs
+      ~prefix
+      ~description
+      stores
+      paths
+  =
+  let local, warning = Backend.valid_paths process_mgr ~log_dir:logs paths in
+  Option.iter fail warning;
+  let pending =
+    ref (List.filter paths ~f:(fun path -> not (List.mem path ~set:local)))
+  in
+  let imported = ref [] in
+  List.iteri stores ~f:(fun index source ->
+    if !pending <> []
+    then
+      let available = probe process_mgr ~log_dir:logs [ source ] !pending in
+      let found = List.filter !pending ~f:(Hashtbl.mem available) in
+      if found <> []
+      then (
+        let result =
+          Backend.copy_from
+            process_mgr
+            ~log_path:
+              (Filename.concat logs (Printf.sprintf "%s-%d.log" prefix index))
+            ~source
+            found
+        in
+        require_success ("Cannot import " ^ description) result;
+        imported := found @ !imported;
+        on_import found;
+        pending :=
+          List.filter !pending ~f:(fun path -> not (List.mem path ~set:found))));
+  if !pending <> []
+  then
+    fail
+      (description
+      ^ " have not been published: "
+      ^ String.concat ~sep:", " !pending);
+  unique !imported
+
+let check_owned graph (group : Shared_plan.group) roots local =
+  let remaining =
+    Plan.compute graph ~roots ~availability:(fun path ->
+      if List.mem path ~set:local then Plan.Local else Plan.Missing)
+  in
+  if remaining.unknown <> []
+  then
+    fail
+      ("Unresolved execution requirements: "
+      ^ String.concat ~sep:", " remaining.unknown);
+  let outside =
+    List.filter remaining.builds ~f:(fun (node : Plan.node) ->
+      not (List.mem node.drv_path ~set:group.members))
+  in
+  if outside <> []
+  then
+    fail
+      ("Refusing to build another group's dependencies: "
+      ^ String.concat
+          ~sep:", "
+          (List.map outside ~f:(fun (node : Plan.node) -> node.drv_path)))
+
+let execute
+      ?run_id
+      ?attempt_id
+      ?worker_id
+      ~directory
+      ~group_id
+      ~copy_from
+      (config : Engine.config)
+      env
+  =
   let process_mgr = Eio.Stdenv.process_mgr env in
   Json.mkdir config.report_dir;
   let logs = Filename.concat config.report_dir "logs" in
   Json.mkdir logs;
+  (try
+     Unix.unlink (Filename.concat config.report_dir "execution-error.json")
+   with
+  | Unix.Unix_error (Unix.ENOENT, _, _) -> ());
   let manifest = Json.read (Filename.concat directory "execution-plan.json") in
-  if Json.member "version" manifest <> `Int 1
-  then fail "Unsupported execution plan version";
-  let graph = unwrap (Plan.of_yojson (Json.member "graph" manifest)) in
-  let saved = unwrap (Shared_plan.of_yojson (Json.member "plan" manifest)) in
-  let cached = Hashtbl.create 1024 in
-  List.iter
-    (Json.strings (Json.member "cachedPaths" manifest))
-    ~f:(fun path ->
-      Hashtbl.replace
-        cached
-        path
-        (Plan.Cached { references = []; download_size = None; nar_size = None }));
-  let planned =
-    unwrap
-      (Shared_plan.create
-         graph
-         ~requests:saved.requests
-         ~availability:(availability cached))
+  let trace =
+    Shared_trace.create
+      ~directory:config.report_dir
+      ~manifest
+      ~group_id
+      ?run_id
+      ?attempt_id
+      ?worker_id
+      env
   in
-  if Shared_plan.to_yojson planned <> Shared_plan.to_yojson saved
-  then fail "Execution plan does not match its dependency graph and ownership";
-  let group =
-    match
-      List.find_opt planned.groups ~f:(fun (g : Shared_plan.group) ->
-        g.id = group_id)
-    with
-    | Some group -> group
-    | None -> fail ("Unknown execution group " ^ group_id)
+  let imported = ref []
+  and published = ref []
+  and required = ref []
+  and original = ref []
+  and cached_roots = ref []
+  and refreshed_builds = ref [] in
+  let write status extra =
+    Json.atomic_write
+      (Filename.concat config.report_dir "execution.json")
+      (`Assoc
+          ([ "version", `Int 1
+           ; "group", `String group_id
+           ; "status", `String status
+           ; "imported", strings !imported
+           ; "published", strings !published
+           ; "plannedPrerequisites", strings !original
+           ; "requiredPrerequisites", strings !required
+           ; "cachedRoots", strings !cached_roots
+           ; "refreshedBuilds", strings !refreshed_builds
+           ]
+          @ Shared_trace.context trace
+          @ extra))
   in
-  let destination =
-    match config.copy_to with
-    | Some value -> value
-    | None ->
-      fail "--execute-plan requires --copy-to so completed work is published"
-  in
-  let stores =
-    if copy_from = [] then Backend.substituters process_mgr else copy_from
-  in
-  let drvs =
-    List.map group.roots ~f:(fun (edge : Plan.edge) -> edge.drv_path) |> unique
-  in
-  with_roots (fun gc_dir ->
-    store_copy
-      process_mgr
-      ~log:(Filename.concat logs "import-plan.log")
-      ~source:(Some ("file://" ^ absolute (Filename.concat directory "store")))
-      ~destination:None
-      drvs;
-    Backend.pin_derivations
-      process_mgr
-      ~root:(Filename.concat gc_dir "drv")
-      drvs;
-    let actual = Backend.graph process_mgr drvs in
-    List.iter (Plan.nodes actual) ~f:(fun (node : Plan.node) ->
-      match Plan.find graph node.drv_path with
-      | Some expected
-        when graph_json (Plan.of_nodes [ node ])
-             = graph_json (Plan.of_nodes [ expected ]) ->
-        ()
-      | _ -> fail ("Bundled derivation does not match plan: " ^ node.drv_path));
-    Printf.printf
-      "Group %s: %d owned derivations; importing %d prerequisite outputs\n%!"
-      group.id
-      (List.length group.members)
-      (List.length group.required_paths);
-    let pending = ref group.required_paths in
-    List.iteri stores ~f:(fun index source ->
-      if !pending <> []
-      then
-        let available = probe process_mgr ~log_dir:logs [ source ] !pending in
-        let paths = List.filter !pending ~f:(Hashtbl.mem available) in
-        if paths <> []
-        then (
-          let result =
-            Backend.copy_from
-              process_mgr
-              ~log_path:
-                (Filename.concat
-                   logs
-                   (Printf.sprintf "prerequisites-%d.log" index))
-              ~source
-              paths
-          in
-          require_success "Cannot import prerequisites" result;
-          pending :=
-            List.filter !pending ~f:(fun path -> not (List.mem path ~set:paths))));
-    if !pending <> []
-    then
-      fail
-        ("Prerequisites have not been published: "
-        ^ String.concat ~sep:", " !pending);
-    List.iteri group.required_paths ~f:(fun index path ->
-      Backend.pin
-        process_mgr
-        ~root:(Filename.concat gc_dir ("input-" ^ string_of_int index))
-        path);
-    let output_paths =
-      List.concat_map (Plan.nodes graph) ~f:(fun (node : Plan.node) ->
-        List.filter_map node.outputs ~f:snd)
+  let run () =
+    if Json.member "version" manifest <> `Int 1
+    then fail "Unsupported execution plan version";
+    let graph = unwrap (Plan.of_yojson (Json.member "graph" manifest)) in
+    let saved = unwrap (Shared_plan.of_yojson (Json.member "plan" manifest)) in
+    let cached = Hashtbl.create 1024 in
+    List.iter
+      (Json.strings (Json.member "cachedPaths" manifest))
+      ~f:(fun path ->
+        Hashtbl.replace
+          cached
+          path
+          (Plan.Cached
+             { references = []; download_size = None; nar_size = None }));
+    let planned =
+      unwrap
+        (Shared_plan.create
+           graph
+           ~requests:saved.requests
+           ~availability:(availability cached))
+    in
+    if Shared_plan.to_yojson planned <> Shared_plan.to_yojson saved
+    then fail "Execution plan does not match its dependency graph and ownership";
+    let group =
+      match
+        List.find_opt planned.groups ~f:(fun (g : Shared_plan.group) ->
+          g.id = group_id)
+      with
+      | Some group -> group
+      | None -> fail ("Unknown execution group " ^ group_id)
+    in
+    original := group.required_paths;
+    let destination =
+      match config.copy_to with
+      | Some value -> value
+      | None ->
+        fail "--execute-plan requires --copy-to so completed work is published"
+    in
+    let stores =
+      if copy_from = [] then Backend.substituters process_mgr else copy_from
+    in
+    let drvs =
+      List.map group.roots ~f:(fun (edge : Plan.edge) -> edge.drv_path)
       |> unique
     in
-    let local, warning =
-      Backend.valid_paths process_mgr ~log_dir:logs output_paths
-    in
-    Option.iter fail warning;
-    let local_table = Hashtbl.create (List.length local) in
-    List.iter local ~f:(fun path -> Hashtbl.add local_table path ());
-    let remaining =
-      Plan.compute graph ~roots:group.roots ~availability:(fun path ->
-        if Hashtbl.mem local_table path then Plan.Local else Plan.Missing)
-    in
-    let outside =
-      List.filter remaining.builds ~f:(fun (node : Plan.node) ->
-        not (List.mem node.drv_path ~set:group.members))
-    in
-    if outside <> []
-    then
-      fail
-        ("Refusing to build another group's dependencies: "
-        ^ String.concat
-            ~sep:", "
-            (List.map outside ~f:(fun (node : Plan.node) -> node.drv_path)));
-    let prepared =
-      ( graph
-      , List.map group.roots ~f:(fun (edge : Plan.edge) ->
-          let attrs =
-            Json.list (Json.member "attributes" manifest)
-            |> List.filter_map ~f:(fun record ->
-              if Json.string (Json.member "drvPath" record) = edge.drv_path
-              then
-                Some
-                  (Json.string (Json.member "set" record)
-                  ^ ":"
-                  ^ Json.string (Json.member "attr" record))
-              else None)
+    with_roots (fun gc_dir ->
+      Shared_trace.phase trace "import_plan" (fun () ->
+        store_copy
+          process_mgr
+          ~log:(Filename.concat logs "import-plan.log")
+          ~source:
+            (Some ("file://" ^ absolute (Filename.concat directory "store")))
+          ~destination:None
+          drvs;
+        Backend.pin_derivations
+          process_mgr
+          ~root:(Filename.concat gc_dir "drv")
+          drvs;
+        let actual = Backend.graph process_mgr drvs in
+        List.iter (Plan.nodes actual) ~f:(fun (node : Plan.node) ->
+          match Plan.find graph node.drv_path with
+          | Some expected
+            when graph_json (Plan.of_nodes [ node ])
+                 = graph_json (Plan.of_nodes [ expected ]) ->
+            ()
+          | _ ->
+            fail ("Bundled derivation does not match plan: " ^ node.drv_path));
+        (), "success", [ "derivationCount", `Int (List.length drvs) ]);
+      let refreshed =
+        Shared_trace.phase trace "refresh_cache" (fun () ->
+          let refreshed =
+            refresh_group process_mgr ~log_dir:logs ~stores graph group
           in
-          edge, if attrs = [] then [ edge.drv_path ] else unique attrs) )
-    in
-    let code =
-      Engine.run
-        ~prepared
-        ~substituters:stores
-        { config with flake = "execution-plan#" ^ group.id }
-        env
-    in
-    if code <> 0
-    then (
-      Json.atomic_write
-        (Filename.concat config.report_dir "execution.json")
-        (`Assoc
-            [ "version", `Int 1
-            ; "group", `String group.id
-            ; "status", `String "failed"
-            ; "exitCode", `Int code
-            ; "imported", strings group.required_paths
-            ]);
-      code)
-    else
-      (* A root can already exist locally and be skipped by the engine.
-         Explicitly publish every owned output needed by another group, then
-         verify remotely. *)
-      let boundary =
-        List.concat_map planned.groups ~f:(fun (other : Shared_plan.group) ->
-          if List.mem group.id ~set:other.needs
-          then other.required_paths
-          else [])
+          required := refreshed.required_prerequisites;
+          cached_roots := refreshed.cached_roots;
+          refreshed_builds := refreshed.builds;
+          write "running" [];
+          ( refreshed
+          , "success"
+          , [ "plannedPrerequisites", strings group.required_paths
+            ; "requiredPrerequisites", strings refreshed.required_prerequisites
+            ; "cacheCuts", strings refreshed.cache_cuts
+            ; "cachedRoots", strings refreshed.cached_roots
+            ; "refreshedBuilds", strings refreshed.builds
+            ] ))
       in
-      let owned_paths =
-        List.concat_map group.members ~f:(fun drv ->
-          let node = Option.get (Plan.find graph drv) in
-          List.filter_map node.outputs ~f:snd)
+      Printf.printf
+        "Group %s: %d remaining owned derivations; %d of %d prerequisites \
+         still needed\n\
+         %!"
+        group.id
+        (List.length refreshed.builds)
+        (List.length refreshed.required_prerequisites)
+        (List.length group.required_paths);
+      Shared_trace.phase trace "import_prerequisites" (fun () ->
+        imported :=
+          import_outputs
+            process_mgr
+            ~logs
+            ~prefix:"prerequisites"
+            ~description:"Prerequisites"
+            ~on_import:(fun paths ->
+              imported := unique (paths @ !imported);
+              write "running" [])
+            stores
+            refreshed.cache_cuts;
+        List.iteri refreshed.cache_cuts ~f:(fun index path ->
+          Backend.pin
+            process_mgr
+            ~root:(Filename.concat gc_dir ("input-" ^ string_of_int index))
+            path);
+        let output_paths =
+          let possible =
+            Plan.compute
+              graph
+              ~roots:refreshed.active_roots
+              ~availability:(fun _ -> Plan.Missing)
+          in
+          List.concat_map possible.builds ~f:(fun (node : Plan.node) ->
+            List.filter_map node.outputs ~f:snd)
+          |> unique
+        in
+        let local, warning =
+          Backend.valid_paths process_mgr ~log_dir:logs output_paths
+        in
+        Option.iter fail warning;
+        check_owned graph group refreshed.active_roots local;
+        write "running" [];
+        ( ()
+        , "success"
+        , [ "imported", strings !imported
+          ; "requiredPrerequisites", strings refreshed.required_prerequisites
+          ; "pinned", strings refreshed.cache_cuts
+          ] ));
+      let prepared =
+        ( graph
+        , List.map group.roots ~f:(fun (edge : Plan.edge) ->
+            let attrs =
+              Json.list (Json.member "attributes" manifest)
+              |> List.filter_map ~f:(fun record ->
+                if Json.string (Json.member "drvPath" record) = edge.drv_path
+                then
+                  Some
+                    (Json.string (Json.member "set" record)
+                    ^ ":"
+                    ^ Json.string (Json.member "attr" record))
+                else None)
+            in
+            edge, if attrs = [] then [ edge.drv_path ] else unique attrs) )
       in
-      let publish =
-        unique
-          (List.concat_map group.roots ~f:(selected graph)
-          @ List.filter boundary ~f:(fun path -> List.mem path ~set:owned_paths)
-          )
+      let code =
+        Shared_trace.phase trace "build" (fun () ->
+          let code =
+            Engine.run
+              ~prepared
+              ~substituters:stores
+              ~allowed_builds:group.members
+              ~event_context:(Shared_trace.identity trace)
+              { config with flake = "execution-plan#" ^ group.id }
+              env
+          in
+          ( code
+          , (if code = 0
+             then "success"
+             else if code = 130
+             then "cancelled"
+             else "failed")
+          , [ "exitCode", `Int code ] ))
       in
-      let published = probe process_mgr ~log_dir:logs [ destination ] publish in
-      let missing =
-        List.filter publish ~f:(fun path -> not (Hashtbl.mem published path))
-      in
-      let local, warning =
-        Backend.valid_paths process_mgr ~log_dir:logs missing
-      in
-      Option.iter fail warning;
-      let pending =
-        ref
-          (List.filter missing ~f:(fun path -> not (List.mem path ~set:local)))
-      in
-      List.iteri stores ~f:(fun index source ->
-        if !pending <> []
-        then
-          let available = probe process_mgr ~log_dir:logs [ source ] !pending in
-          let paths = List.filter !pending ~f:(Hashtbl.mem available) in
-          if paths <> []
-          then (
+      if code <> 0
+      then code
+      else (
+        Shared_trace.phase trace "publish" (fun () ->
+          (* A skipped root can still be a publication obligation. Preserve
+             every explicit root and output consumed by a downstream group. *)
+          let boundary =
+            List.concat_map
+              planned.groups
+              ~f:(fun (other : Shared_plan.group) ->
+                if List.mem group.id ~set:other.needs
+                then other.required_paths
+                else [])
+          in
+          let owned_paths =
+            List.concat_map group.members ~f:(fun drv ->
+              let node = Option.get (Plan.find graph drv) in
+              List.filter_map node.outputs ~f:snd)
+          in
+          let publish =
+            unique
+              (List.concat_map group.roots ~f:(selected graph)
+              @ List.filter boundary ~f:(fun path ->
+                List.mem path ~set:owned_paths))
+          in
+          let present =
+            probe process_mgr ~log_dir:logs [ destination ] publish
+          in
+          let missing =
+            List.filter publish ~f:(fun path -> not (Hashtbl.mem present path))
+          in
+          ignore
+            (import_outputs
+               process_mgr
+               ~logs
+               ~prefix:"publish-import"
+               ~description:"Completed outputs"
+               stores
+               missing);
+          List.iteri missing ~f:(fun index path ->
+            Backend.pin
+              process_mgr
+              ~root:(Filename.concat gc_dir ("publish-" ^ string_of_int index))
+              path;
             let result =
-              Backend.copy_from
+              Backend.copy
                 process_mgr
                 ~log_path:
-                  (Filename.concat
-                     logs
-                     (Printf.sprintf "publish-import-%d.log" index))
-                ~source
-                paths
+                  (Filename.concat logs (Printf.sprintf "publish-%d.log" index))
+                ~destination
+                path
             in
-            require_success
-              "Cannot import completed outputs for publication"
-              result;
-            pending :=
-              List.filter !pending ~f:(fun path ->
-                not (List.mem path ~set:paths))));
-      if !pending <> []
-      then
-        fail
-          ("Completed outputs are unavailable: "
-          ^ String.concat ~sep:", " !pending);
-      List.iteri missing ~f:(fun index path ->
-        let result =
-          Backend.copy
-            process_mgr
-            ~log_path:
-              (Filename.concat logs (Printf.sprintf "publish-%d.log" index))
-            ~destination
-            path
-        in
-        require_success "Cannot publish owned outputs" result);
-      let available = probe process_mgr ~log_dir:logs [ destination ] publish in
-      if List.exists publish ~f:(fun path -> not (Hashtbl.mem available path))
-      then fail "Published outputs are not visible in the destination cache";
-      Json.atomic_write
-        (Filename.concat config.report_dir "execution.json")
-        (`Assoc
-            [ "version", `Int 1
-            ; "group", `String group.id
-            ; "status", `String "success"
-            ; "published", strings publish
-            ; "imported", strings group.required_paths
-            ]);
-      Printf.printf
-        "Published and verified %d outputs for %s\n%!"
-        (List.length publish)
-        group.id;
-      0)
+            require_success "Cannot publish owned outputs" result);
+          let available =
+            probe process_mgr ~log_dir:logs [ destination ] publish
+          in
+          if
+            List.exists publish ~f:(fun path ->
+              not (Hashtbl.mem available path))
+          then fail "Published outputs are not visible in the destination cache";
+          published := publish;
+          Printf.printf
+            "Published and verified %d outputs for %s\n%!"
+            (List.length publish)
+            group.id;
+          ( ()
+          , "success"
+          , [ "published", strings publish; "copied", strings missing ] ));
+        0))
+  in
+  Fun.protect
+    ~finally:(fun () -> Shared_trace.close trace)
+    (fun () ->
+       write "running" [];
+       match Shared_trace.with_signals env run with
+       | code ->
+         let status =
+           if code = 0
+           then "success"
+           else if code = 130
+           then "cancelled"
+           else "failed"
+         in
+         Shared_trace.finish trace ~status [ "exitCode", `Int code ];
+         write status [ "exitCode", `Int code ];
+         code
+       | exception exn ->
+         let backtrace = Printexc.get_raw_backtrace () in
+         let error = [ "error", `String (Printexc.to_string exn) ] in
+         let status = Shared_trace.exception_status exn in
+         Shared_trace.finish trace ~status error;
+         write status error;
+         Printexc.raise_with_backtrace exn backtrace)

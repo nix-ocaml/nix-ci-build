@@ -9,6 +9,18 @@
  (libraries nix-ci-build yojson))
 
 (test
+ (name local_runner_test)
+ (modules local_runner_test)
+ (libraries nix-ci-build eio_main yojson unix)
+ (flags :standard -open StdLabels))
+
+(test
+ (name shared_report_test)
+ (modules shared_report_test)
+ (libraries nix-ci-build yojson unix)
+ (flags :standard -open StdLabels))
+
+(test
  (name activity_test)
  (modules activity_test)
  (libraries nix-ci-build yojson))
