@@ -159,7 +159,8 @@ class Benchmark:
             self.commands.append(record)
             write_json(self.logs / "index.json", self.commands)
         require(allow_failure or result.returncode == 0,
-                "%s exited %d; see %s\n%s" % (label, result.returncode, prefix, error[-8000:]))
+                "%s exited %d; see %s\nstdout:\n%s\nstderr:\n%s"
+                % (label, result.returncode, prefix, output[-8000:], error[-8000:]))
         return output, record
 
     def resolve(self):

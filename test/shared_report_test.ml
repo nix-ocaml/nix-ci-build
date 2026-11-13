@@ -554,6 +554,166 @@ let test_workflow_bootstrap () =
          && get "durationSeconds" phase = `Float 9.))
       "actual bootstrap timing should appear on worker timeline")
 
+let test_scheduler_terminal_outcomes () =
+  temporary (fun directory ->
+    let plan, plan_id, _ = fixture directory in
+    seed directory plan_id plan;
+    let start =
+      obj
+        [ "planId", `String plan_id
+        ; "runId", `String "run-one"
+        ; "time", `Float 95.
+        ; "type", `String "run_start"
+        ]
+    in
+    let finish status =
+      obj
+        [ "planId", `String plan_id
+        ; "runId", `String "run-one"
+        ; "time", `Float 140.
+        ; "type", `String "run_finish"
+        ; "status", `String status
+        ]
+    in
+    events (directory ^ "/reports/scheduler-events.jsonl") [ start ];
+    check
+      (text "status" (render directory) = "incomplete")
+      "all worker successes cannot complete a scheduler run with no terminal \
+       event";
+    List.iter [ "cancelled"; "failed"; "success" ] ~f:(fun status ->
+      events
+        (directory ^ "/reports/scheduler-events.jsonl")
+        [ start; finish status ];
+      let report = render directory in
+      check
+        (text "status" report = status)
+        "scheduler terminal outcome must survive otherwise successful worker \
+         reports";
+      check
+        (text "status" (get "runTerminal" report) = status)
+        "the run-level outcome evidence should remain inspectable"))
+
+let test_cancelled_worker_and_run () =
+  temporary (fun directory ->
+    let plan, plan_id, group = fixture directory in
+    seed directory plan_id plan;
+    let native = group "native" in
+    let path =
+      worker
+        directory
+        ~plan_id
+        ~run:"run-one"
+        ~attempt:"cancelled"
+        native
+        ~start:400.
+        "cancelled"
+    in
+    events
+      (path ^ "/execution-events.jsonl")
+      [ event
+          ~plan_id
+          ~run:"run-one"
+          ~attempt:"cancelled"
+          ~group:native.id
+          ~time:400.
+          "attempt_start"
+          []
+      ; event
+          ~plan_id
+          ~run:"run-one"
+          ~attempt:"cancelled"
+          ~group:native.id
+          ~time:408.
+          "phase_finish"
+          [ "phase", `String "build"; "status", `String "failed" ]
+      ; event
+          ~plan_id
+          ~run:"run-one"
+          ~attempt:"cancelled"
+          ~group:native.id
+          ~time:409.
+          "attempt_finish"
+          [ "status", `String "cancelled" ]
+      ];
+    events
+      (directory ^ "/reports/scheduler-events.jsonl")
+      [ obj
+          [ "planId", `String plan_id
+          ; "runId", `String "run-one"
+          ; "time", `Float 100.
+          ; "type", `String "run_start"
+          ]
+      ; obj
+          [ "planId", `String plan_id
+          ; "runId", `String "run-one"
+          ; "time", `Float 410.
+          ; "type", `String "run_finish"
+          ; "status", `String "cancelled"
+          ]
+      ];
+    write
+      (directory ^ "/reports/execution-error.json")
+      (obj [ "group", `Null; "error", `String "Local_runner.Cancelled" ]);
+    let report = render directory in
+    check
+      (text "status" report = "cancelled")
+      "cancellation should not be mislabeled as a package failure";
+    check
+      (text "status" (group_json report native) = "cancelled")
+      "worker cancellation remains distinct from the failed phase it \
+       interrupted";
+    check
+      (Json.number (get "cancelled" (get "counts" report)) = 1.)
+      "cancelled groups should have an explicit count";
+    check
+      (List.exists
+         (Json.strings (get "diagnostics" report))
+         ~f:(fun value -> String.starts_with value ~prefix:"Run-level error:"))
+      "the runner error should not appear as an unassociated worker")
+
+let test_unfinished_worker_timing () =
+  temporary (fun directory ->
+    let _, plan_id, group = fixture directory in
+    let native = group "native" in
+    let path = directory ^ "/reports/interrupted" in
+    let context =
+      [ "planId", `String plan_id
+      ; "runId", `String "run-one"
+      ; "groupId", `String native.id
+      ; "attemptId", `String "interrupted"
+      ]
+    in
+    write
+      (path ^ "/execution.json")
+      (obj
+         (context @ [ "status", `String "running"; "startedAt", `Float 100. ]));
+    write
+      (path ^ "/bootstrap.json")
+      (obj
+         (context
+         @ [ "status", `String "success"
+           ; "startedAt", `Float 80.
+           ; "finishedAt", `Float 90.
+           ]));
+    write
+      (path ^ "/results.json")
+      (obj
+         [ "status", `String "success"
+         ; ( "context"
+           , obj
+               (context
+               @ [ "startedAt", `Float 101.; "finishedAt", `Float 110. ]) )
+         ]);
+    let report = render directory in
+    let attempt = group_json report native |> items "attempts" |> List.hd in
+    check
+      (text "status" attempt = "incomplete")
+      "engine completion is not worker publication completion";
+    check
+      (get "finishedAt" attempt = `Null && get "durationSeconds" attempt = `Null)
+      "bootstrap or engine completion must not fabricate an interrupted worker \
+       end time")
+
 let () =
   test_complete_and_missing ();
   test_failure_and_retry ();
@@ -564,4 +724,7 @@ let () =
   test_xss ();
   test_duplicate_attempts ();
   test_workflow_bootstrap ();
-  print_endline "shared report tests passed (9 scenarios)"
+  test_scheduler_terminal_outcomes ();
+  test_cancelled_worker_and_run ();
+  test_unfinished_worker_timing ();
+  print_endline "shared report tests passed (12 scenarios)"
