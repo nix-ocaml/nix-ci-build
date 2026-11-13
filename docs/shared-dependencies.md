@@ -117,6 +117,7 @@ nix-ci-build \
   --run-plan shared-plan \
   --workers 4 \
   --copy-from https://cache.example.org \
+  --copy-from https://cache.nixos.org \
   --copy-to 's3://example-nix-cache' \
   --report-dir shared-reports
 ```
@@ -160,6 +161,12 @@ an attempt's report directory. Include `groupId`, `runId`, `attemptId`, `status`
 `startedAt`, `finishedAt` (Unix seconds), and `durationSeconds`; include `error`
 when bootstrap fails. The planner can place its own bootstrap metadata at
 `shared-plan/bootstrap.json`.
+
+Export `NIX_CI_BUILD_RUN_ID` and `NIX_CI_BUILD_ATTEMPT_ID` before invoking
+`--execute-plan`, and use those exact values in the bootstrap JSON. Use one run
+ID across its groups and a new attempt ID for each retry. Without these
+variables, the worker chooses its own IDs, so independently chosen bootstrap
+IDs would describe a separate attempt.
 
 ## GitHub Actions
 
@@ -299,3 +306,11 @@ preflight checks, phase timings, and combined reports. Cache sizes are bytes on
 disk, not measured network traffic, and build activity is elapsed build time,
 not CPU time. For these small packages, an extra worker handoff can outweigh
 the avoided build; the report presents the measured tradeoff.
+
+The [first successful Linux comparison](https://github.com/nix-ocaml/nix-ci-build/actions/runs/43441414870)
+observed four builds independently and three with coordination: `topkg` ran
+twice versus once. Total observed build activity fell from 13.59 s to 8.15 s,
+while worker wall time rose from 12.04 s to 14.55 s. This is one small workload,
+with seed and tool bootstrap costs excluded; it demonstrates avoided duplicate
+work, not a general wall-time speedup. All five workers passed their ownership
+and publication checks.
