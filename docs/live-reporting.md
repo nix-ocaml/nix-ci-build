@@ -106,12 +106,13 @@ builder invocations alone cannot establish the result of a whole workflow.
 
 ## Expose ingestion with ngrok
 
-Configure your ngrok account locally. Add the endpoint from
+The project's Nix shell includes ngrok. Configure your account locally from
+`nix develop`, then add the endpoint from
 [`live/ngrok.example.yml`](../live/ngrok.example.yml) to your private ngrok v3
 configuration, optionally setting your reserved domain, and start it:
 
 ```sh
-ngrok start nix-ci-build
+nix develop -c ngrok start nix-ci-build
 ```
 
 The endpoint forwards to `http://127.0.0.1:50051` with

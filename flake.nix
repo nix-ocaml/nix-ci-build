@@ -81,6 +81,7 @@
           nativeBuildInputs = [
             pkgs.python3
             pkgs.nodejs_24
+            pkgs.ngrok
           ]
           ++ (with pkgs.ocamlPackages; [
             merlin
