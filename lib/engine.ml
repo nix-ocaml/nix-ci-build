@@ -77,6 +77,8 @@ type cache_check =
 type state =
   { config : config
   ; report : Report.t
+  ; event_context : (string * Yojson.Safe.t) list
+  ; allowed_builds : string list option
   ; jobs : (string, job) Hashtbl.t
   ; activities : (string, activity) Hashtbl.t
   ; uploads : (string, upload) Hashtbl.t
@@ -147,7 +149,10 @@ let event t kind fields =
       :: fields
   in
   let json =
-    `Assoc (("time", `Float (now ())) :: ("type", `String kind) :: fields)
+    `Assoc
+      (("time", `Float (now ()))
+      :: ("type", `String kind)
+      :: (t.event_context @ fields))
   in
   Report.append_event t.report json;
   Report.emit_event t.report json
@@ -940,7 +945,7 @@ let record_failure t (j : job) drv kind message =
       ];
   transition t j (if drv = j.edge.drv_path then "failed" else "blocked")
 
-let run_build t process_mgr clock stores batch =
+let run_build t process_mgr clock stores ~cancel_grace batch =
   let request_id =
     Digest.to_hex
       (Digest.string
@@ -1102,9 +1107,63 @@ let run_build t process_mgr clock stores batch =
         ~finally:(fun () ->
           Hashtbl.to_seq_keys wait_ids |> List.of_seq |> List.iter ~f:stop_wait)
         (fun () ->
+           Option.iter
+             (fun allowed ->
+                (* Prepared workers may only build their own derivations. Check
+                   the local graph at every actual dispatch (including retries),
+                   so a vanished remote hit cannot turn into an unowned fallback
+                   build. Live cache cuts have been imported and pinned by the
+                   orchestrator before reaching this point. *)
+                let paths =
+                  let possible =
+                    Plan.compute
+                      t.graph
+                      ~roots:(List.map remaining ~f:(fun j -> j.edge))
+                      ~availability:(fun _ -> Plan.Missing)
+                  in
+                  List.concat_map possible.builds ~f:(fun (node : Plan.node) ->
+                    List.filter_map node.outputs ~f:snd)
+                  |> List.sort_uniq ~cmp:String.compare
+                in
+                let local = Hashtbl.create (List.length paths) in
+                let valid, warning =
+                  Backend.valid_paths
+                    process_mgr
+                    ~log_dir:(Filename.concat t.config.report_dir "logs")
+                    paths
+                in
+                Option.iter failwith warning;
+                List.iter valid ~f:(fun path -> Hashtbl.replace local path ());
+                let plan =
+                  Plan.compute
+                    t.graph
+                    ~roots:(List.map remaining ~f:(fun j -> j.edge))
+                    ~availability:(fun path ->
+                      if Hashtbl.mem local path
+                      then Plan.Local
+                      else Plan.Missing)
+                in
+                if plan.unknown <> []
+                then
+                  failwith
+                    ("Unresolved prepared execution requirements: "
+                    ^ String.concat ~sep:", " plan.unknown);
+                let outside =
+                  List.filter_map plan.builds ~f:(fun (node : Plan.node) ->
+                    if List.mem node.drv_path ~set:allowed
+                    then None
+                    else Some node.drv_path)
+                in
+                if outside <> []
+                then
+                  failwith
+                    ("Refusing to build another group's dependencies: "
+                    ^ String.concat ~sep:", " outside))
+             t.allowed_builds;
            Backend.build_edges
              process_mgr
              ~substituters:stores
+             ~cancel_grace
              ~log_path:(full_log t log)
              ~on_stderr
              (List.map remaining ~f:(fun j -> j.edge)))
@@ -1285,7 +1344,7 @@ let history_duration config graph =
       Option.bind (Plan.find graph drv) (fun n ->
         Hashtbl.find_opt by_name (n.system, n.name))
 
-let scheduler t process_mgr clock stores =
+let scheduler t process_mgr clock stores ~cancel_grace =
   let max_active = 2 * t.config.jobs in
   let active = ref 0
   and duration = history_duration t.config t.graph in
@@ -1430,7 +1489,8 @@ let scheduler t process_mgr clock stores =
                   ~finally:(fun () ->
                     decr active;
                     changed t)
-                  (fun () -> run_build t process_mgr clock stores batch)));
+                  (fun () ->
+                     run_build t process_mgr clock stores ~cancel_grace batch)));
             loop ()
     in
     loop ());
@@ -1907,7 +1967,8 @@ let uploader t process_mgr clock =
     in
     loop ())
 
-let run ?prepared ?substituters config env =
+let run ?prepared ?substituters ?allowed_builds ?(event_context = []) config env
+  =
   Json.mkdir config.report_dir;
   Json.mkdir (Filename.concat config.report_dir "logs");
   let gc_dir = Filename.temp_file "nix-ci-build-" "" in
@@ -1947,10 +2008,13 @@ let run ?prepared ?substituters config env =
     ; "runAttempt", `String (env_string "GITHUB_RUN_ATTEMPT")
     ; "jobs", `Int config.jobs
     ]
+    @ event_context
   in
   let t =
     { config
     ; report
+    ; event_context
+    ; allowed_builds
     ; jobs = Hashtbl.create 128
     ; activities = Hashtbl.create 128
     ; uploads = Hashtbl.create 128
@@ -2038,7 +2102,13 @@ let run ?prepared ?substituters config env =
                     else (
                       t.status <- "building";
                       Eio.Fiber.all
-                        [ (fun () -> scheduler t process_mgr clock stores)
+                        [ (fun () ->
+                            scheduler
+                              t
+                              process_mgr
+                              clock
+                              stores
+                              ~cancel_grace:(Eio.Stdenv.mono_clock env, 5.))
                         ; (fun () -> uploader t process_mgr clock)
                         ; (fun () -> cache_follower t process_mgr clock stores)
                         ];

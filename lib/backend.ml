@@ -23,6 +23,21 @@ let error r =
       Printf.sprintf "Command terminated by signal %d" signal)
   | lines -> String.concat ~sep:"\n" lines
 
+let with_process_switch cancel_grace f =
+  match cancel_grace with
+  | None -> Eio.Switch.run (fun sw -> f sw (fun () -> ()))
+  | Some _ ->
+    Eio.Cancel.sub (fun caller ->
+      (* The Linux process reaper sends SIGKILL as soon as its switch is
+         cancelled. Keep ownership alive while the command's I/O observes caller
+         cancellation, so graceful shutdown runs before that reaper. *)
+      let result =
+        Eio.Cancel.protect (fun () ->
+          Eio.Switch.run (fun sw -> f sw (fun () -> Eio.Cancel.check caller)))
+      in
+      Eio.Cancel.check caller;
+      result)
+
 (* Every child belongs to a switch: cancellation closes its pipes, terminates
    it, and waits for it. Only small diagnostic tails are retained for build
    commands. *)
@@ -34,6 +49,7 @@ let run
       ?(capture = true)
       ?(on_stdout = fun _ -> ())
       ?(on_stderr = fun _ -> ())
+      ?cancel_grace
       args
   =
   let log =
@@ -52,7 +68,7 @@ let run
   Fun.protect
     ~finally:(fun () -> Option.iter close_out_noerr log)
     (fun () ->
-       Eio.Switch.run (fun sw ->
+       with_process_switch cancel_grace (fun sw check_cancelled ->
          let out_r, out_w = Eio.Process.pipe process_mgr ~sw in
          let err_r, err_w = Eio.Process.pipe process_mgr ~sw in
          let child =
@@ -99,14 +115,59 @@ let run
            in
            loop ()
          in
-         Eio.Fiber.both
-           (fun () -> consume out_r on_stdout true)
-           (fun () -> consume err_r on_stderr false);
-         let status = Eio.Process.await child in
-         { status
-         ; stdout = Buffer.contents stdout
-         ; tail = List.of_seq (Queue.to_seq tail)
-         }))
+         let drain () =
+           Eio.Fiber.both
+             (fun () -> consume out_r on_stdout true)
+             (fun () -> consume err_r on_stderr false)
+         in
+         let collect () =
+           check_cancelled ();
+           drain ();
+           let status = Eio.Process.await child in
+           check_cancelled ();
+           { status
+           ; stdout = Buffer.contents stdout
+           ; tail = List.of_seq (Queue.to_seq tail)
+           }
+         in
+         match
+           match cancel_grace with
+           | None -> collect ()
+           | Some (clock, _) ->
+             Eio.Fiber.first collect (fun () ->
+               let rec monitor () =
+                 check_cancelled ();
+                 Eio.Time.Mono.sleep clock 0.01;
+                 monitor ()
+               in
+               monitor ())
+         with
+         | result -> result
+         | exception exn ->
+           let backtrace = Printexc.get_raw_backtrace () in
+           Option.iter
+             (fun (clock, seconds) ->
+                (* A worker owns nested Nix processes. Give it time to handle
+                   SIGTERM and close those processes while its protected reaper
+                   remains alive. Discard remaining output here: invoking a
+                   failed log writer or callback again could abort cleanup and
+                   replace the original exception. Wait for actual process exit;
+                   closing stdout alone is not completion. *)
+                Eio.Cancel.protect (fun () ->
+                  Eio.Process.signal child Sys.sigterm;
+                  Eio.Fiber.first
+                    (fun () ->
+                       Eio.Fiber.all
+                         [ (fun () -> Eio.Flow.copy out_r Eio.Flow.null)
+                         ; (fun () -> Eio.Flow.copy err_r Eio.Flow.null)
+                         ; (fun () -> ignore (Eio.Process.await child))
+                         ])
+                    (fun () ->
+                       Eio.Time.Mono.sleep clock seconds;
+                       Eio.Process.signal child Sys.sigkill;
+                       ignore (Eio.Process.await child))))
+             cancel_grace;
+           Printexc.raise_with_backtrace exn backtrace))
 
 let nix args =
   [ "nix"; "--extra-experimental-features"; "nix-command flakes" ] @ args
@@ -408,7 +469,14 @@ let edge_installable (edge : Plan.edge) =
   then "*"
   else String.concat ~sep:"," edge.outputs
 
-let build_edges process_mgr ?substituters ~log_path ~on_stderr edges =
+let build_edges
+      process_mgr
+      ?substituters
+      ?cancel_grace
+      ~log_path
+      ~on_stderr
+      edges
+  =
   let cache_options =
     match substituters with
     | None -> []
@@ -417,6 +485,7 @@ let build_edges process_mgr ?substituters ~log_path ~on_stderr edges =
   in
   run
     process_mgr
+    ?cancel_grace
     ~capture:false
     ~log_path
     ~on_stderr
