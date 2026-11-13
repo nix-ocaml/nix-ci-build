@@ -1,0 +1,74 @@
+name: Shared dependency real-package comparison
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/shared-plan-benchmark.yml'
+      - 'test/shared_plan_benchmark.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: shared-plan-benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            extra-substituters = https://anmonteiro.nix-cache.workers.dev
+            extra-trusted-public-keys = ocaml.nix-cache.com-1:/xI2h2+56rwFfKyyFVbkJSeGqSIYMC/Je+7XXqGKDIY=
+      - name: Build this revision of nix-ci-build once
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          import subprocess
+          import time
+
+          started = time.time()
+          subprocess.run(['nix', 'build', '--accept-flake-config', '-L'], check=True)
+          finished = time.time()
+          Path('benchmark-bootstrap.json').write_text(json.dumps({
+              'startedAt': started, 'finishedAt': finished,
+              'durationSeconds': finished - started,
+              'toolPath': str(Path('result').resolve()), 'status': 'success',
+          }, indent=2) + '\n')
+          PY
+      - name: Check bounded-work guards
+        run: python3 -B test/shared_plan_benchmark.py --self-test
+      - name: Compare independent and coordinated workers
+        # Root is used only to create Linux chroot stores beneath this new
+        # directory. The harness never deletes paths from the ordinary store.
+        run: |
+          sudo env "PATH=$PATH" "$(command -v python3)" -B \
+            test/shared_plan_benchmark.py "$PWD/result/bin/nix-ci-build" \
+            --directory "$PWD/benchmark"
+      - name: Publish measured results
+        if: always()
+        run: |
+          if [[ -f benchmark/summary.md ]]; then
+            cat benchmark/summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload comparison evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: shared-plan-benchmark-${{ github.run_attempt }}
+          path: |
+            benchmark-bootstrap.json
+            benchmark/*.json
+            benchmark/summary.md
+            benchmark/commands/
+            benchmark/plans/
+            benchmark/reports/
+            benchmark/aggregate/
+          if-no-files-found: ignore
+          retention-days: 7
