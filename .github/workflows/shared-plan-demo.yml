@@ -1,0 +1,282 @@
+name: Shared dependency demo
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/shared-plan-demo.yml'
+      - 'bin/**'
+      - 'lib/**'
+      - 'test/shared-plan-fixture/**'
+      - 'test/shared_plan*'
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'dune-project'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: shared-plan-demo-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Stable across reruns, unique across workflow runs. This path is part of the
+  # fixture derivations and must exist on each runner that executes a builder.
+  LEDGER_DIR: /tmp/nix-ci-shared-${{ github.run_id }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      shared: ${{ steps.plan.outputs.shared }}
+      packages: ${{ steps.plan.outputs.packages }}
+      has-shared: ${{ steps.plan.outputs.has-shared }}
+      has-packages: ${{ steps.plan.outputs.has-packages }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            extra-substituters = https://anmonteiro.nix-cache.workers.dev
+            extra-trusted-public-keys = ocaml.nix-cache.com-1:/xI2h2+56rwFfKyyFVbkJSeGqSIYMC/Je+7XXqGKDIY=
+      - name: Build this revision of nix-ci-build
+        run: nix build --accept-flake-config -L
+      - name: Prepare the fixture package sets
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+
+          fixture = Path(os.environ['RUNNER_TEMP']) / 'shared-plan-fixture'
+          fixture.mkdir()
+          shutil.copy('test/shared-plan-fixture/flake.nix', fixture / 'flake.nix')
+          ledger = str(Path(os.environ['LEDGER_DIR']) / 'builders.log')
+          (fixture / 'settings.nix').write_text(
+              '{ system = "x86_64-linux"; ledger = ' + json.dumps(ledger) + '; }\n'
+          )
+          config = {
+              'sets': [
+                  {'id': name, 'flake': f'path:{fixture}#{name}'}
+                  for name in ['native', 'cross']
+              ],
+              'runners': {'x86_64-linux': 'ubuntu-latest'},
+          }
+          Path('demo-sets.json').write_text(json.dumps(config))
+          PY
+      - name: Plan both sets and export the derivations
+        id: plan
+        env:
+          # Fixture only: every run starts cold, and its builder is /bin/sh.
+          NIX_CONFIG: |
+            experimental-features = nix-command flakes
+            sandbox = false
+            substituters =
+            extra-substituters =
+        run: |
+          ./result/bin/nix-ci-build \
+            --plan-sets demo-sets.json \
+            --report-dir plan
+      - name: Publish the plan summary
+        if: always()
+        run: |
+          if [[ -f plan/summary.md ]]; then
+            cat plan/summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload the portable execution plan
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: shared-plan
+          path: plan/
+          overwrite: true
+          if-no-files-found: ignore
+          retention-days: 7
+
+  shared:
+    name: Prerequisites / ${{ join(matrix.consumers, ', ') }}
+    needs: plan
+    if: ${{ needs.plan.outputs.has-shared == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.shared) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      GROUP_ID: ${{ matrix.group }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            extra-substituters = https://anmonteiro.nix-cache.workers.dev
+            extra-trusted-public-keys = ocaml.nix-cache.com-1:/xI2h2+56rwFfKyyFVbkJSeGqSIYMC/Je+7XXqGKDIY=
+            # Demo artifacts are unsigned. Set this before the daemon starts;
+            # a client-side NIX_CONFIG override does not change its store policy.
+            require-sigs = false
+      - name: Build this revision of nix-ci-build
+        run: nix build --accept-flake-config -L
+      - uses: actions/download-artifact@v8
+        with:
+          name: shared-plan
+          path: plan
+      - name: Prepare the fixture ledger and cache
+        run: |
+          mkdir -p "$LEDGER_DIR" cache
+          touch "$LEDGER_DIR/builders.log"
+          chmod 0666 "$LEDGER_DIR/builders.log"
+          printf 'StoreDir: /nix/store\nWantMassQuery: 1\n' > cache/nix-cache-info
+      - name: Build and publish the prerequisite
+        env:
+          NIX_CONFIG: |
+            experimental-features = nix-command flakes
+            sandbox = false
+        run: |
+          ./result/bin/nix-ci-build \
+            --execute-plan plan --group "$GROUP_ID" \
+            --copy-from "file://$PWD/cache" \
+            --copy-to "file://$PWD/cache" \
+            --report-dir report
+      - name: Verify which builders ran
+        run: |
+          python3 - <<'PY'
+          from collections import Counter
+          import json
+          import os
+          from pathlib import Path
+
+          manifest = json.loads(Path('plan/execution-plan.json').read_text())
+          group = next(g for g in manifest['plan']['groups'] if g['id'] == os.environ['GROUP_ID'])
+          expected = Counter(manifest['graph'][drv]['name'] for drv in group['members'])
+          observed = Counter((Path(os.environ['LEDGER_DIR']) / 'builders.log').read_text().splitlines())
+          assert observed == expected, (observed, expected)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('\nVerified builders: ' + ', '.join(sorted(observed)) + '.\n')
+          PY
+      - name: Preserve the builder ledger
+        if: always()
+        run: |
+          if [[ -f "$LEDGER_DIR/builders.log" ]]; then
+            mkdir -p report
+            cp "$LEDGER_DIR/builders.log" report/builders.log
+          fi
+      - name: Upload available prerequisite outputs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: shared-cache-${{ matrix.group }}
+          path: cache/
+          overwrite: true
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Upload the prerequisite report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: shared-report-${{ matrix.group }}-${{ github.run_attempt }}
+          path: report/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  packages:
+    name: Packages / ${{ join(matrix.consumers, ', ') }}
+    needs: [plan, shared]
+    # A skipped empty matrix or one failed prerequisite must not suppress
+    # independent packages. Each worker checks its own required cache outputs.
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.has-packages == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.packages) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      GROUP_ID: ${{ matrix.group }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            extra-substituters = https://anmonteiro.nix-cache.workers.dev
+            extra-trusted-public-keys = ocaml.nix-cache.com-1:/xI2h2+56rwFfKyyFVbkJSeGqSIYMC/Je+7XXqGKDIY=
+            # Demo artifacts are unsigned. Set this before the daemon starts;
+            # a client-side NIX_CONFIG override does not change its store policy.
+            require-sigs = false
+      - name: Build this revision of nix-ci-build
+        run: nix build --accept-flake-config -L
+      - uses: actions/download-artifact@v8
+        with:
+          name: shared-plan
+          path: plan
+      - name: Download the available prerequisite caches
+        if: ${{ needs.plan.outputs.has-shared == 'true' }}
+        uses: actions/download-artifact@v8
+        with:
+          pattern: shared-cache-*
+          path: prerequisites
+          merge-multiple: true
+      - name: Prepare the fixture ledger and caches
+        run: |
+          mkdir -p "$LEDGER_DIR" prerequisites cache
+          touch "$LEDGER_DIR/builders.log"
+          chmod 0666 "$LEDGER_DIR/builders.log"
+          printf 'StoreDir: /nix/store\nWantMassQuery: 1\n' > prerequisites/nix-cache-info
+          printf 'StoreDir: /nix/store\nWantMassQuery: 1\n' > cache/nix-cache-info
+      - name: Import prerequisites, build packages, and publish
+        env:
+          NIX_CONFIG: |
+            experimental-features = nix-command flakes
+            sandbox = false
+        run: |
+          ./result/bin/nix-ci-build \
+            --execute-plan plan --group "$GROUP_ID" \
+            --copy-from "file://$PWD/prerequisites" \
+            --copy-to "file://$PWD/cache" \
+            --report-dir report
+      - name: Verify the shared tool was imported
+        run: |
+          python3 - <<'PY'
+          from collections import Counter
+          import json
+          import os
+          from pathlib import Path
+
+          manifest = json.loads(Path('plan/execution-plan.json').read_text())
+          group = next(g for g in manifest['plan']['groups'] if g['id'] == os.environ['GROUP_ID'])
+          expected = Counter(manifest['graph'][drv]['name'] for drv in group['members'])
+          observed = Counter((Path(os.environ['LEDGER_DIR']) / 'builders.log').read_text().splitlines())
+          assert observed == expected, (observed, expected)
+          assert 'opaque-shared-tool' not in observed, observed
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('\nVerified shared tool import; builders: ' + ', '.join(sorted(observed)) + '.\n')
+          PY
+      - name: Preserve the builder ledger
+        if: always()
+        run: |
+          if [[ -f "$LEDGER_DIR/builders.log" ]]; then
+            mkdir -p report
+            cp "$LEDGER_DIR/builders.log" report/builders.log
+          fi
+      - name: Upload package outputs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: package-cache-${{ matrix.group }}
+          path: cache/
+          overwrite: true
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Upload the package report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: package-report-${{ matrix.group }}-${{ github.run_attempt }}
+          path: report/
+          if-no-files-found: ignore
+          retention-days: 7

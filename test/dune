@@ -4,6 +4,11 @@
  (libraries nix-ci-build yojson))
 
 (test
+ (name shared_plan_test)
+ (modules shared_plan_test)
+ (libraries nix-ci-build yojson))
+
+(test
  (name activity_test)
  (modules activity_test)
  (libraries nix-ci-build yojson))

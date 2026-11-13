@@ -54,6 +54,19 @@ by running requests continue because Nix may already be waiting on those inputs.
 Running builds are never cancelled to pursue a cache import.
 `--dry-run` does not import outputs.
 
+## Sharing dependencies across runner jobs
+
+`--plan-sets sets.json` evaluates several package sets together and assigns
+each missing derivation to one worker. Shared prerequisites run first; package
+workers import their published outputs and build only their remaining work.
+The plan includes the derivation closure, so workers do not evaluate the flakes
+again. Existing caches are checked again on each worker.
+
+See [shared dependency builds](docs/shared-dependencies.md) for the configuration,
+execution commands, cache requirements, and current limits. The
+[GitHub Actions demo](.github/workflows/shared-plan-demo.yml) runs a small fixture
+on separate runners and verifies that its shared tool is built once.
+
 ## Understanding progress
 
 A compact plan summarizes the work, followed by new requests, actual builds,

@@ -23,7 +23,10 @@ let normalize_path path =
   let path = String.trim path in
   if path = "" || not (Filename.is_relative path)
   then path
-  else "/nix/store/" ^ path
+  else
+    Filename.concat
+      (Option.value (Sys.getenv_opt "NIX_STORE_DIR") ~default:"/nix/store")
+      path
 
 let normalize_drv_path path =
   let path =
@@ -303,13 +306,14 @@ let selected_outputs (node : node) names =
     in
     name, path)
 
-let needs_build ~availability outputs =
+let needs_build ~availability ~allow_substitutes outputs =
   List.exists outputs ~f:(function
     | _, None -> true
     | _, Some path ->
       (match availability path with
       | Missing -> true
-      | Local | Cached _ -> false))
+      | Cached _ -> not allow_substitutes
+      | Local -> false))
 
 let requirements graph ~roots ~availability =
   let wanted = ref Paths.empty in
@@ -334,7 +338,11 @@ let requirements graph ~roots ~availability =
         match find graph edge.drv_path with
         | None -> ()
         | Some node ->
-          if needs_build ~availability (selected_outputs node names)
+          if
+            needs_build
+              ~availability
+              ~allow_substitutes:node.allow_substitutes
+              (selected_outputs node names)
           then List.iter node.inputs ~f:(fun edge -> Queue.add edge pending))
   done;
   !wanted
@@ -352,7 +360,12 @@ let compute graph ~roots ~availability =
        | None -> unknown := Strings.add drv_path !unknown
        | Some node ->
          let outputs = selected_outputs node names in
-         let build = needs_build ~availability outputs in
+         let build =
+           needs_build
+             ~availability
+             ~allow_substitutes:node.allow_substitutes
+             outputs
+         in
          if build then builds := node :: !builds;
          List.iter outputs ~f:(fun (name, path) ->
            match path with
@@ -429,7 +442,11 @@ let explain graph ~availability ~root ~target =
           let outputs = selected_outputs node names in
           if List.exists outputs ~f:(fun (_, output) -> output = Some target)
           then found := Some (List.rev (target :: path))
-          else if needs_build ~availability outputs
+          else if
+            needs_build
+              ~availability
+              ~allow_substitutes:node.allow_substitutes
+              outputs
           then
             List.iter node.inputs ~f:(fun input ->
               Queue.add (input, path) pending))
@@ -445,7 +462,11 @@ let failed_ancestors graph ~availability ~root ~failed =
     | Some names ->
       (match find graph path with
       | Some node
-        when not (needs_build ~availability (selected_outputs node names)) ->
+        when not
+               (needs_build
+                  ~availability
+                  ~allow_substitutes:node.allow_substitutes
+                  (selected_outputs node names)) ->
         None
       | _ -> Some path))
   |> List.sort_uniq ~cmp:String.compare
