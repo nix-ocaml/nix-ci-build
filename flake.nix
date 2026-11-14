@@ -80,6 +80,8 @@
           inputsFrom = [ self.packages.${pkgs.stdenv.hostPlatform.system}.default ];
           nativeBuildInputs = [
             pkgs.python3
+            pkgs.nodejs_24
+            pkgs.ngrok
           ]
           ++ (with pkgs.ocamlPackages; [
             merlin
