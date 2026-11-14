@@ -20,7 +20,14 @@ import "./style.css";
 import Waterfall from "./waterfall.jsx";
 import TimelineOverview from "./timeline-overview.jsx";
 import { clampWindow, zoomWindow } from "./timeline-math.js";
-import { useClock, useLiveData, useLocation } from "./data.jsx";
+import { useClock, useLiveData, useLocation, useSession } from "./data.jsx";
+import {
+  Avatar,
+  ConnectionsPanel,
+  SessionScreen,
+  WorkspaceSwitcher,
+} from "./connections.jsx";
+import { filterWorkspaceRuns, overallStatus } from "./workspaces.js";
 import {
   KINDS,
   Query,
@@ -195,10 +202,23 @@ function App() {
     }
   });
   const [route, navigate] = useLocation();
+  const account = useSession();
+  const session = account.session;
+  const authorized =
+    !account.loading &&
+    !account.error &&
+    !!session &&
+    (session.mode === "local" || !!session.user);
   const [paused, setPaused] = useState(false);
   const [sidebar, setSidebar] = useState(false);
   const [toast, setToast] = useState("");
-  const live = useLiveData(route.runId, paused);
+  const live = useLiveData(
+    route.runId,
+    paused,
+    authorized,
+    account.expire,
+    account.load,
+  );
   const now = useClock(
     live.serverTime,
     live.receivedAt,
@@ -207,16 +227,21 @@ function App() {
   );
   const runs = useMemo(
     () =>
-      [...live.runs].sort(
+      filterWorkspaceRuns(
+        live.runs,
+        session,
+        route.workspace,
+        route.repository,
+      ).sort(
         (a, b) =>
           (b.startedAt || b.updatedAt || 0) - (a.startedAt || a.updatedAt || 0),
       ),
-    [live.runs],
+    [live.runs, session, route.workspace, route.repository],
   );
   useEffect(() => {
-    if (!route.runId && runs.length)
+    if (authorized && route.page === "runs" && !route.runId && runs.length)
       navigate({ runId: runs[0].id, jobKey: null }, true);
-  }, [runs, route.runId, navigate]);
+  }, [runs, route.runId, route.page, authorized, navigate]);
   useEffect(() => {
     try {
       localStorage.setItem("nix-live-theme", theme);
@@ -229,7 +254,7 @@ function App() {
   }, [toast]);
   const changeRun = (id) => {
     setPaused(false);
-    navigate({ runId: id, jobKey: null, tab: "pipeline" });
+    navigate({ page: "runs", runId: id, jobKey: null, tab: "pipeline" });
     setSidebar(false);
   };
   const copy = async () => {
@@ -245,6 +270,40 @@ function App() {
     : live.error
       ? "unavailable"
       : live.connection;
+  const openConnections = () => {
+    navigate({ page: "connections" });
+    setSidebar(false);
+  };
+  const changeWorkspace = (workspace, repository = "all") => {
+    setPaused(false);
+    navigate({
+      page: "runs",
+      workspace,
+      repository,
+      runId: null,
+      jobKey: null,
+      tab: "pipeline",
+    });
+    setSidebar(false);
+  };
+  const selectedAccessible =
+    live.payload?.run &&
+    (session?.mode === "local" ||
+      filterWorkspaceRuns([live.payload.run], session).length > 0);
+  if (!authorized)
+    return (
+      <DruidsEnvironment defaultThemePreference={theme}>
+        <SessionScreen
+          session={session}
+          loading={account.loading}
+          error={account.error}
+          retry={account.load}
+          expired={account.expired}
+          theme={theme}
+          toggleTheme={() => setTheme(theme === "light" ? "dark" : "light")}
+        />
+      </DruidsEnvironment>
+    );
   return (
     <DruidsEnvironment defaultThemePreference={theme}>
       <div className="observatory">
@@ -258,12 +317,38 @@ function App() {
               <path d="m10 12 6 4 6-4M16 16v8M10 12V8m12 4V8" />
             </svg>
           </div>
-          <div className="rail-item active" title="Build runs">
+          <button
+            className={`rail-item ${route.page === "runs" ? "active" : ""}`}
+            title="Build runs"
+            aria-label="Build runs"
+            onClick={() => navigate({ page: "runs" })}
+          >
             <Icon name="runs" />
-          </div>
-          <div className="rail-foot" title="Local live collector">
-            L
-          </div>
+          </button>
+          {session.mode === "github" && (
+            <button
+              className={`rail-item ${route.page === "connections" ? "active" : ""}`}
+              title="Connections"
+              aria-label="Connections"
+              onClick={openConnections}
+            >
+              <Icon name="branch" />
+            </button>
+          )}
+          {session.user ? (
+            <button
+              className="rail-account"
+              title={`Signed in as ${session.user.login}`}
+              aria-label="Your GitHub connections"
+              onClick={openConnections}
+            >
+              <Avatar account={session.user} />
+            </button>
+          ) : (
+            <div className="rail-foot" title="Local workspace">
+              L
+            </div>
+          )}
         </nav>
         <header className="app-header">
           <div className="header-title">
@@ -279,7 +364,9 @@ function App() {
             </Text>
             <span className="header-divider" />
             <span className="header-section">CI visibility</span>
-            <span className="local-badge">LOCAL</span>
+            {session.mode === "local" && (
+              <span className="local-badge">LOCAL</span>
+            )}
           </div>
           <div className="header-actions">
             <span className={`connection ${connection}`} role="status">
@@ -291,7 +378,7 @@ function App() {
                   : connection === "reconnecting"
                     ? "Reconnecting"
                     : connection === "unavailable"
-                      ? "Collector unavailable"
+                      ? "Updates unavailable"
                       : "Connecting"}
               {paused && live.pending ? " · new activity" : ""}
             </span>
@@ -308,12 +395,52 @@ function App() {
               isBorderless
               onClick={() => setTheme(theme === "light" ? "dark" : "light")}
             />
+            {session.user && (
+              <details className="account-menu">
+                <summary aria-label={`Account: ${session.user.login}`}>
+                  <Avatar account={session.user} />
+                  <span>{session.user.login}</span>
+                  <span className="account-caret">▾</span>
+                </summary>
+                <div>
+                  <div className="account-menu-identity">
+                    <strong>{session.user.name || session.user.login}</strong>
+                    <span>@{session.user.login}</span>
+                  </div>
+                  <button
+                    onClick={(event) => {
+                      event.currentTarget.closest("details").open = false;
+                      openConnections();
+                    }}
+                  >
+                    Connections & workspaces
+                  </button>
+                  <button
+                    disabled={account.signingOut}
+                    onClick={account.signOut}
+                  >
+                    {account.signingOut ? "Signing out…" : "Sign out"}
+                  </button>
+                </div>
+              </details>
+            )}
           </div>
         </header>
         <aside
           className={`run-sidebar ${sidebar ? "mobile-open" : ""}`}
           aria-label="Build runs"
         >
+          <WorkspaceSwitcher
+            session={session}
+            workspace={route.workspace}
+            repository={route.repository}
+            runs={live.runs}
+            changeWorkspace={(workspace) => changeWorkspace(workspace)}
+            changeRepository={(repository) =>
+              changeWorkspace(route.workspace, repository)
+            }
+            openConnections={openConnections}
+          />
           <RunList
             runs={runs}
             selected={route.runId}
@@ -322,7 +449,9 @@ function App() {
             loading={live.loading}
           />
           <footer className="sidebar-footer">
-            <span>Collector snapshot</span>
+            <span>
+              {session.mode === "local" ? "Collector snapshot" : "Last update"}
+            </span>
             <code>r{live.revision}</code>
             <span>
               {live.receivedAt ? ago(live.receivedAt) : "Waiting for events"}
@@ -337,58 +466,95 @@ function App() {
           />
         )}
         <main className="run-main" id="main" tabIndex={-1}>
-          {live.error && (
+          {account.mutationError && route.page !== "connections" && (
             <div className="notice danger" role="alert">
-              <Icon name="alert" />
-              <div>
-                <strong>{live.error}</strong>
-                <span>
-                  {live.payload
-                    ? "Showing the last confirmed snapshot. Timers are paused until the collector reconnects."
-                    : "The collector may still be starting. Your selected view is preserved."}
-                </span>
-              </div>
-              <Button label="Retry" size="sm" onClick={live.refresh} />
+              {account.mutationError}
             </div>
           )}
-          {paused && (
-            <div className="notice muted">
-              <Icon name="pause" />
-              <span>
-                Updates paused. This view is fixed to the last received
-                snapshot.
-              </span>
-              <Button
-                label="Resume live"
-                size="xs"
-                isBorderless
-                onClick={() => setPaused(false)}
-              />
-            </div>
-          )}
-          {live.payload?.run && live.payload.run.id === route.runId ? (
-            <RunView
-              payload={live.payload}
-              now={now}
-              route={route}
-              navigate={navigate}
-              paused={paused || !!live.error || live.connection !== "live"}
+          {route.page === "connections" && session.mode === "github" ? (
+            <ConnectionsPanel
+              session={session}
+              refresh={account.refreshConnections}
+              refreshing={account.refreshing}
+              error={account.mutationError}
+              notice={account.notice}
+              openWorkspace={changeWorkspace}
             />
-          ) : live.loading ? (
-            <div className="loading-state">
-              <div className="loading-bar" />
-              Loading observed build activity…
-            </div>
           ) : (
-            <Empty
-              title={
-                runs.length ? "Choose a build run" : "Ready for your next build"
-              }
-            >
-              {runs.length
-                ? "Select a run to explore its jobs, dependencies, and package activity."
-                : "Runs appear here as soon as a GitHub Actions wrapper connects. Planned matrix jobs and live Nix activities will fill in as the build progresses."}
-            </Empty>
+            <>
+              {live.error && (
+                <div className="notice danger" role="alert">
+                  <Icon name="alert" />
+                  <div>
+                    <strong>{live.error}</strong>
+                    <span>
+                      {live.payload
+                        ? "Showing the last confirmed snapshot. Timers are paused until the collector reconnects."
+                        : "Your selected view is preserved. Choose another run or try again."}
+                    </span>
+                  </div>
+                  <Button label="Retry" size="sm" onClick={live.refresh} />
+                </div>
+              )}
+              {paused && (
+                <div className="notice muted">
+                  <Icon name="pause" />
+                  <span>
+                    Updates paused. This view is fixed to the last received
+                    snapshot.
+                  </span>
+                  <Button
+                    label="Resume live"
+                    size="xs"
+                    isBorderless
+                    onClick={() => setPaused(false)}
+                  />
+                </div>
+              )}
+              {live.payload?.run &&
+              live.payload.run.id === route.runId &&
+              selectedAccessible ? (
+                <RunView
+                  payload={live.payload}
+                  now={now}
+                  route={route}
+                  navigate={navigate}
+                  paused={paused || !!live.error || live.connection !== "live"}
+                />
+              ) : live.loading ? (
+                <div className="loading-state">
+                  <div className="loading-bar" />
+                  Loading observed build activity…
+                </div>
+              ) : session.mode === "github" && !session.connections.length ? (
+                <ConnectionsPanel
+                  session={session}
+                  refresh={account.refreshConnections}
+                  refreshing={account.refreshing}
+                  error={account.mutationError}
+                  notice={account.notice}
+                  openWorkspace={changeWorkspace}
+                />
+              ) : (
+                <Empty
+                  title={
+                    live.payload?.run && !selectedAccessible
+                      ? "Repository access has changed"
+                      : runs.length
+                        ? "Choose a build run"
+                        : "Ready for your next build"
+                  }
+                >
+                  {live.payload?.run && !selectedAccessible
+                    ? "This repository is no longer available in your connected workspaces. Choose another run or refresh your connections."
+                    : runs.length
+                      ? "Select a run to explore its jobs, dependencies, and package activity."
+                      : session.mode === "github"
+                        ? "Workflow runs from your selected repositories appear here as they start. Try another repository or return when the next build begins."
+                        : "Runs appear here as soon as a build connects. Planned matrix jobs and live package activities fill in as the build progresses."}
+                </Empty>
+              )}
+            </>
           )}
         </main>
         {toast && (
@@ -410,8 +576,10 @@ function RunList({ runs, selected, onSelect, now, loading }) {
         .toLowerCase()
         .includes(search.toLowerCase()) &&
       (filter === "all" || filter === "active"
-        ? filter === "all" || !TERMINAL.has(statusOf(run))
-        : ["failed", "incomplete", "stale", "blocked"].includes(statusOf(run))),
+        ? filter === "all" || !TERMINAL.has(overallStatus(run, statusOf(run)))
+        : ["failed", "incomplete", "stale", "blocked"].includes(
+            overallStatus(run, statusOf(run)),
+          )),
   );
   return (
     <>
@@ -475,7 +643,7 @@ function RunList({ runs, selected, onSelect, now, loading }) {
               </span>
             </div>
             <div className="run-item-title">
-              <Status state={run} compact />
+              <Status state={overallStatus(run, statusOf(run))} compact />
               <strong>{run.workflow || "Build"}</strong>
             </div>
             <div className="run-item-ref">
@@ -487,7 +655,8 @@ function RunList({ runs, selected, onSelect, now, loading }) {
             </div>
             <div className="run-item-footer">
               <span>
-                {STATUS_LABEL[statusOf(run)] || statusOf(run)}
+                {STATUS_LABEL[overallStatus(run, statusOf(run))] ||
+                  overallStatus(run, statusOf(run))}
                 <span className="dot-separator">·</span>
                 {duration(elapsed(run, now))}
               </span>
@@ -562,6 +731,22 @@ function RunView({ payload, now, route, navigate, paused }) {
   const githubSnapshot = run.github || payload.github;
   const github = githubSnapshot?.run || githubSnapshot;
   const githubJobs = payload.githubJobs || githubSnapshot?.jobs || [];
+  const workflowState = overallStatus(
+    run,
+    github
+      ? statusOf({
+          status:
+            github.conclusion ||
+            (github.status === "completed" ? "unknown" : github.status),
+        })
+      : statusOf(run),
+  );
+  const waitingForTelemetry =
+    current.length === 0 &&
+    (["waiting", "not_reported"].includes(run.telemetryStatus) ||
+      !!github ||
+      githubJobs.length > 0);
+  const workflowFinished = TERMINAL.has(workflowState) || !!github?.conclusion;
   const githubFailures = githubJobs.filter((job) =>
     ["failure", "timed_out", "startup_failure", "action_required"].includes(
       job.conclusion,
@@ -600,7 +785,9 @@ function RunView({ payload, now, route, navigate, paused }) {
           ? "danger"
           : "default",
     },
-  ];
+  ].filter(
+    (tab) => !waitingForTelemetry || !["jobs", "activity"].includes(tab.value),
+  );
   const validTab = tabs.some((tab) => tab.value === route.tab)
     ? route.tab
     : "pipeline";
@@ -663,8 +850,10 @@ function RunView({ payload, now, route, navigate, paused }) {
           </div>
           <div className="run-heading-status">
             <div>
-              <span className="eyebrow">Observed builds</span>
-              <Status state={run} />
+              <span className="eyebrow">
+                {run.workflowStatus || github ? "Workflow" : "Observed builds"}
+              </span>
+              <Status state={workflowState} />
             </div>
             {safeUrl(run.url) && (
               <External href={run.url}>GitHub Actions</External>
@@ -675,7 +864,18 @@ function RunView({ payload, now, route, navigate, paused }) {
       <div className="workflow-evidence">
         <span className="evidence-marker" />
         <span>
-          {github?.conclusion ? (
+          {waitingForTelemetry ? (
+            workflowFinished ? (
+              "No build reports received"
+            ) : (
+              "Workflow discovered · awaiting package activity"
+            )
+          ) : github && current.length ? (
+            <>
+              Build reports:{" "}
+              <strong>{STATUS_LABEL[statusOf(run)] || statusOf(run)}</strong>
+            </>
+          ) : github?.conclusion ? (
             <>
               GitHub workflow:{" "}
               <strong className={githubFailures.length ? "failure-text" : ""}>
@@ -710,70 +910,113 @@ function RunView({ payload, now, route, navigate, paused }) {
           </strong>
         )}
       </div>
-      <section className="run-metrics" aria-label="Run metrics">
-        <Metric
-          label="Observed wall time"
-          value={duration(elapsed(run, now))}
-          hint={
-            run.finishedAt
-              ? "Completed observation"
-              : paused
-                ? "Snapshot time"
-                : "Since first observation"
-          }
-        />
-        <Metric
-          label="Jobs completed"
-          value={`${counts.success + counts.failed + counts.cancelled + counts.blocked} / ${current.length}`}
-          hint="Of currently known jobs"
-        />
-        <Metric
-          label="Running / queued"
-          value={`${counts.running} / ${counts.queued + counts.planned}`}
-          hint={
-            counts.stale
-              ? `${counts.stale} without a heartbeat`
-              : "Matrix fills in as discovered"
-          }
-          color={counts.running ? "var(--report-accent)" : undefined}
-        />
-        <Metric
-          label="Roots built / cached"
-          value={`${number(metric("built"))} / ${number(metric("cached"))}`}
-          hint={
-            metric("actualBuilds") === null
-              ? "Reported root request counts"
-              : `${number(metric("actualBuilds"))} actual derivation builds`
-          }
-        />
-        <Metric
-          label="Downloads"
-          value={number(metric("downloads"))}
-          hint={
-            metric("uploads") === null
-              ? "Unreported values show —"
-              : `${number(metric("uploads"))} publications`
-          }
-        />
-        <Metric
-          label="Needs attention"
-          value={attention.length + additionalWorkflowFailures}
-          hint={
-            githubFailures.length
-              ? `${githubFailures.length} GitHub job failures`
-              : counts.failed
-                ? `${counts.failed} failed jobs`
-                : counts.stale
-                  ? "Check producer connectivity"
-                  : "Failures and uncertain outcomes"
-          }
-          color={
-            counts.failed || githubFailures.length
-              ? "var(--status-failed)"
-              : undefined
-          }
-        />
-      </section>
+      {waitingForTelemetry ? (
+        <section
+          className="run-metrics workflow-metrics"
+          aria-label="Workflow metrics"
+        >
+          <Metric
+            label="Workflow time"
+            value={duration(elapsed(run, now))}
+            hint={
+              run.finishedAt ? "Completed workflow" : "Since workflow started"
+            }
+          />
+          <Metric
+            label="Runner jobs"
+            value={githubJobs.length}
+            hint="Jobs reported by GitHub"
+          />
+          <Metric
+            label="Running / queued"
+            value={`${githubJobs.filter((job) => job.status === "in_progress").length} / ${githubJobs.filter((job) => ["queued", "waiting", "requested", "pending"].includes(job.status)).length}`}
+            hint="Current runner status"
+          />
+          <Metric
+            label="Completed jobs"
+            value={
+              githubJobs.filter((job) => job.status === "completed").length
+            }
+            hint="Includes failures and skips"
+          />
+          <Metric
+            label="Build reports"
+            value={workflowFinished ? "None received" : "Awaiting"}
+            hint="No build reports received"
+          />
+          <Metric
+            label="Failed jobs"
+            value={githubFailures.length}
+            hint="Includes setup and upload"
+            color={githubFailures.length ? "var(--status-failed)" : undefined}
+          />
+        </section>
+      ) : (
+        <section className="run-metrics" aria-label="Run metrics">
+          <Metric
+            label="Observed wall time"
+            value={duration(elapsed(run, now))}
+            hint={
+              run.finishedAt
+                ? "Completed observation"
+                : paused
+                  ? "Snapshot time"
+                  : "Since first observation"
+            }
+          />
+          <Metric
+            label="Jobs completed"
+            value={`${counts.success + counts.failed + counts.cancelled + counts.blocked} / ${current.length}`}
+            hint="Of currently known jobs"
+          />
+          <Metric
+            label="Running / queued"
+            value={`${counts.running} / ${counts.queued + counts.planned}`}
+            hint={
+              counts.stale
+                ? `${counts.stale} without a heartbeat`
+                : "Matrix fills in as discovered"
+            }
+            color={counts.running ? "var(--report-accent)" : undefined}
+          />
+          <Metric
+            label="Roots built / cached"
+            value={`${number(metric("built"))} / ${number(metric("cached"))}`}
+            hint={
+              metric("actualBuilds") === null
+                ? "Reported root request counts"
+                : `${number(metric("actualBuilds"))} actual derivation builds`
+            }
+          />
+          <Metric
+            label="Downloads"
+            value={number(metric("downloads"))}
+            hint={
+              metric("uploads") === null
+                ? "Unreported values show —"
+                : `${number(metric("uploads"))} publications`
+            }
+          />
+          <Metric
+            label="Needs attention"
+            value={attention.length + additionalWorkflowFailures}
+            hint={
+              githubFailures.length
+                ? `${githubFailures.length} GitHub job failures`
+                : counts.failed
+                  ? `${counts.failed} failed jobs`
+                  : counts.stale
+                    ? "Check producer connectivity"
+                    : "Failures and uncertain outcomes"
+            }
+            color={
+              counts.failed || githubFailures.length
+                ? "var(--status-failed)"
+                : undefined
+            }
+          />
+        </section>
+      )}
       <section className="run-workspace">
         <ProminentTabList
           tabs={tabs}
@@ -782,47 +1025,79 @@ function RunView({ payload, now, route, navigate, paused }) {
           impact="low"
           hasRoundedTabs={false}
         />
-        {validTab === "pipeline" && (
+        {validTab === "pipeline" && waitingForTelemetry ? (
           <>
-            <div className="section-toolbar">
+            <div
+              className={`reporter-waiting ${workflowState === "failed" ? "workflow-failed" : ""}`}
+            >
+              <span className="reporter-waiting-icon">
+                <Icon name={workflowState === "failed" ? "alert" : "pulse"} />
+              </span>
               <div>
-                <Text size="sm" weight="bold">
-                  Dependency pipeline
-                </Text>
-                <span className="secondary">
-                  {stages.length} observed stages · {current.length} jobs
+                <h2>
+                  {workflowFinished
+                    ? "Workflow finished without build reports"
+                    : "Your workflow is underway"}
+                </h2>
+                <p>
+                  {workflowFinished
+                    ? "No build reports have arrived for this run. Inspect the runner jobs and steps below, including any failures before the build started."
+                    : "Runner jobs appear as GitHub starts them. Package timelines and the dependency pipeline will join this view when build reports arrive."}
+                </p>
+              </div>
+              <Status state={workflowState} />
+            </div>
+            <WorkflowSteps
+              github={github}
+              jobs={githubJobs}
+              invocations={jobs}
+              select={choose}
+              now={now}
+            />
+          </>
+        ) : (
+          validTab === "pipeline" && (
+            <>
+              <div className="section-toolbar">
+                <div>
+                  <Text size="sm" weight="bold">
+                    Dependency pipeline
+                  </Text>
+                  <span className="secondary">
+                    {stages.length} observed stages · {current.length} jobs
+                  </span>
+                </div>
+                <div className="legend">
+                  <Status state="running" compact />
+                  Running
+                  <Status state="success" compact />
+                  Succeeded
+                  <Status state="planned" compact />
+                  Planned
+                </div>
+              </div>
+              {current.length ? (
+                <Pipeline
+                  stages={stages}
+                  selected={selected?.key}
+                  select={choose}
+                  now={now}
+                />
+              ) : (
+                <Empty title="Waiting for the build plan">
+                  The planner will announce matrix jobs here. Dependency edges
+                  come from the submitted execution plan.
+                </Empty>
+              )}
+              <div className="pipeline-footnote">
+                <Icon name="branch" size={13} />
+                <span>
+                  Stages follow declared dependencies. New jobs appear as the
+                  plan arrives; an empty stage is not a successful stage.
                 </span>
               </div>
-              <div className="legend">
-                <Status state="running" compact />
-                Running
-                <Status state="success" compact />
-                Succeeded
-                <Status state="planned" compact />
-                Planned
-              </div>
-            </div>
-            {current.length ? (
-              <Pipeline
-                stages={stages}
-                selected={selected?.key}
-                select={choose}
-                now={now}
-              />
-            ) : (
-              <Empty title="Waiting for the build plan">
-                The planner will announce matrix jobs here. Dependency edges
-                come from the submitted execution plan.
-              </Empty>
-            )}
-            <div className="pipeline-footnote">
-              <Icon name="branch" size={13} />
-              <span>
-                Stages follow declared dependencies. New jobs appear as the plan
-                arrives; an empty stage is not a successful stage.
-              </span>
-            </div>
-          </>
+            </>
+          )
         )}
         {validTab === "jobs" && (
           <Jobs

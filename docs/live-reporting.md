@@ -86,12 +86,12 @@ gRPC on `127.0.0.1:50051`. Both listeners bind to loopback. Configuration:
 
 | Variable | Purpose |
 | --- | --- |
-| `NIX_CI_LIVE_REPOSITORIES` | Required comma-separated repository allowlist. |
+| `NIX_CI_LIVE_REPOSITORIES` | Required comma-separated repository allowlist in local mode; optional additional restriction in GitHub service mode. |
 | `NIX_CI_LIVE_OIDC_AUDIENCE` | Required OIDC audience; the action defaults to `nix-ci-build`. |
 | `NIX_CI_LIVE_DB` | SQLite file; defaults to `live/data/events.sqlite` in this checkout. |
 | `NIX_CI_LIVE_HTTP_PORT` | Browser/read API port; default `8799`. |
 | `NIX_CI_LIVE_GRPC_PORT` | Ingestion port; default `50051`. |
-| `NIX_CI_LIVE_GITHUB_TOKEN` | Optional collector-side token with Actions read access for job/step reconciliation. |
+| `NIX_CI_LIVE_GITHUB_TOKEN` | Optional collector-side token with Actions read access for local job/step reconciliation. Service mode uses installation tokens instead. |
 
 The local UI extends the existing Druids preview with repository/run browsing,
 PR/branch/commit metadata, workflow attempts, the evolving matrix, and per-job
@@ -146,10 +146,89 @@ not yet written or uploaded; missing heartbeats remain visibly stale, rather
 than being interpreted as success. GitHub reconciliation can establish the
 actual cancellation or job failure separately.
 
-The first service is a single local collector with durable storage. It does
-not yet schedule remote runners, provide multi-user dashboard authorization,
-or collect raw log streams. These can build on the same run/job identities and
-versioned protobuf service without changing the package-set planner.
+## Connect users and teams with a GitHub App
+
+The same collector can run as a signed-in service. A user signs in with GitHub,
+connects repositories through an App installation, and switches between personal
+and organization workspaces in the dashboard. GitHub controls membership: each
+viewer sees only the intersection of the installation's selected repositories
+and their own repository access. Installing an App in an organization does not
+give every member access to all of its builds.
+
+Signed workflow webhooks create runs before the first builder starts. Runner
+queueing, setup steps, failures, and cancellations remain visible even if the
+reporter never runs. The existing action then adds the package plan, dynamic
+matrix dependencies, and measured Nix activity to that same workflow attempt.
+All workflows observed in connected repositories are available; workflows that
+never report Nix activity retain their GitHub job view.
+
+Connecting also imports recent workflow attempts, so an existing repository
+does not start with an empty dashboard. A bounded background scan checks up to
+30 recent runs from one connected repository per tick, at most once per minute
+per repository. This repairs missed discovery webhooks; it does not backfill
+the repository's entire history or manufacture package telemetry for old runs.
+
+No App registration is required for local mode or the development tests. When
+ready to connect a real App, copy [`live/github-app.env.example`](../live/github-app.env.example)
+outside the checkout, fill in its values, and start from the repository root:
+
+```sh
+nix develop
+npm --prefix live ci
+npm --prefix live run build
+node --env-file=/absolute/path/to/github-app.env live/server.mjs
+```
+
+| App setting | Value |
+| --- | --- |
+| Callback URL | `<NIX_CI_LIVE_PUBLIC_URL>/auth/github/callback` |
+| Setup URL | `<NIX_CI_LIVE_PUBLIC_URL>/auth/github/installed` |
+| Webhook URL | `<NIX_CI_LIVE_PUBLIC_URL>/webhooks/github` |
+| Webhook secret | `NIX_CI_LIVE_GITHUB_WEBHOOK_SECRET` |
+| Repository permissions | Actions: read; Metadata: read |
+| Subscribed events | Workflow run; Workflow job |
+
+With a setup URL, leave **Request user authorization (OAuth) during
+installation** disabled; users sign in through the dashboard. Installation and
+repository-selection lifecycle events update the connections, and authorization
+revocation invalidates the user's sessions. The setup callback refreshes the
+user's actual GitHub permissions rather than trusting its `installation_id`
+query parameter. See GitHub's [App setup URL documentation](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/about-the-setup-url)
+and [user-accessible installation repositories endpoint](https://docs.github.com/en/rest/apps/installations#list-repositories-accessible-to-the-user-access-token).
+
+| Variable | Purpose |
+| --- | --- |
+| `NIX_CI_LIVE_ACCESS_MODE` | `local` (default) or `github`. GitHub mode requires complete App configuration and OIDC reporter authentication. |
+| `NIX_CI_LIVE_PUBLIC_URL` | Public HTTPS origin of the dashboard, OAuth callbacks, and webhooks. HTTP is accepted only for loopback development. |
+| `NIX_CI_LIVE_GITHUB_APP_ID` | Numeric GitHub App ID. |
+| `NIX_CI_LIVE_GITHUB_CLIENT_ID` | App OAuth client ID. |
+| `NIX_CI_LIVE_GITHUB_CLIENT_SECRET` | App OAuth client secret. |
+| `NIX_CI_LIVE_GITHUB_PRIVATE_KEY_FILE` | Path to the App's downloaded RSA PEM key. |
+| `NIX_CI_LIVE_GITHUB_WEBHOOK_SECRET` | Webhook HMAC secret, at least 32 bytes. |
+| `NIX_CI_LIVE_SESSION_SECRET` | Stable random secret, at least 32 bytes, used to encrypt stored GitHub credentials. Keep it with the database across restarts. |
+
+Both listeners still bind to loopback. Forward the public dashboard origin to
+HTTP port 8799 through a TLS reverse proxy, and use a separate HTTP/2 endpoint
+for gRPC port 50051 (or route the protobuf service path to that port).
+The existing ingestion-only ngrok example does not route the browser or webhook
+endpoints. Set the action's `report-url` to the dashboard origin and `endpoint`
+to the gRPC origin. Runner uploads still use GitHub OIDC; browser cookies and
+App secrets are never sent to the runner.
+
+OAuth uses browser-bound, one-use state and PKCE. Session cookies are HttpOnly,
+SameSite=Lax, and Secure on HTTPS. Connections and encrypted OAuth credentials
+persist in the same SQLite database as builds. API responses and live events
+are filtered by numeric repository ID. GitHub access is refreshed at most every
+five minutes while viewing; signed installation changes invalidate it immediately.
+If permission refresh fails, the service stops returning new private build data
+until it can verify access again. Installation tokens are short-lived and scoped
+to the repository being reconciled. A disconnected repository's historical data
+stays in SQLite but is not visible through its former connection.
+
+The service remains a single collector with durable SQLite storage. It does
+not yet schedule remote runners or collect raw log streams. Those can build on
+the same run/job identities and versioned protobuf service without changing
+the package-set planner.
 
 ## Development
 
@@ -178,3 +257,9 @@ numbers when evolving it.
 Local integration tests use an explicitly enabled development authenticator
 with a private token file. Production mode never falls back to development
 authentication when OIDC configuration is missing.
+
+The GitHub service tests simulate OAuth, App API responses, signed webhook
+deliveries, and two users with different permissions in the same organization.
+They exercise HTTP, SSE, OIDC/gRPC, revocation, and database restart together,
+without external credentials. The browser suite covers the sign-in and
+connection flow alongside the existing live timeline interactions.

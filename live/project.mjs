@@ -91,12 +91,13 @@ function newJob(invocation) {
 
 /** Rebuild projections from committed facts. Clock-based liveness is never a terminal outcome. */
 export function projectRun(store, runId, { now = Date.now(), staleAfterMs = 90_000 } = {}) {
+  const metadata = store.run(runId);
+  if (!metadata) return null;
+  runId = metadata.id;
   const invocations = store.invocations(runId);
-  if (!invocations.length) return null;
   const events = store.events(runId);
   const github = store.github(runId);
   const diagnostics = [];
-  const metadata = Object.assign({}, ...invocations.map(value => value.run));
   const jobs = new Map(invocations.map(invocation => [invocation.invocationId, newJob(invocation)]));
   const activityRows = [];
   const active = new Map();
@@ -371,8 +372,11 @@ export function projectRun(store, runId, { now = Date.now(), staleAfterMs = 90_0
   const counts = { total: rows.length, planned: 0, queued: 0, running: 0, success: 0, failed: 0, cancelled: 0, blocked: 0, unknown: 0, incomplete: 0, stale: 0 };
   for (const job of rows) counts[job.status] = (counts[job.status] || 0) + 1;
   const runStatus = evidenceStatus(rows);
-  const startedAt = min(rows.map(job => job.startedAt));
-  const finishedAt = rows.length && rows.every(job => job.terminal) ? max(rows.map(job => job.finishedAt)) : null;
+  const workflowStatus = githubStatus(github?.run);
+  const workflowStartedAt = seconds(github?.run?.startedAt);
+  const workflowFinishedAt = github?.run?.status === 'completed' ? seconds(github.run.updatedAt) : null;
+  const startedAt = invocations.length ? min(rows.map(job => job.startedAt)) : workflowStartedAt;
+  const finishedAt = invocations.length ? (rows.length && rows.every(job => job.terminal) ? max(rows.map(job => job.finishedAt)) : null) : workflowFinishedAt;
   const run = {
     id: runId, provider: 'github',
     repository: metadata.repository, repositoryId: metadata.repositoryId || null,
@@ -381,10 +385,15 @@ export function projectRun(store, runId, { now = Date.now(), staleAfterMs = 90_0
     pullRequest: metadata.pullRequestNumber || null, title: metadata.title || null,
     commitMessage: metadata.commitMessage || null, actor: metadata.actor || null,
     url: metadata.runUrl || null, githubRunId: metadata.runId, runAttempt: metadata.runAttempt,
-    status: runStatus, reportedStatus: runStatus, stale: rows.some(job => job.stale),
-    workflowStatus: githubStatus(github?.run), github: github ? { ...github.run, observedAtMs: github.observedAtMs } : null,
+    status: invocations.length ? runStatus : workflowStatus || 'queued', reportedStatus: runStatus, stale: rows.some(job => job.stale),
+    invocationCount: invocations.length,
+    telemetryStatus: !invocations.length ? (github?.run?.status === 'completed' ? 'not_reported' : 'waiting')
+      : rows.every(job => job.terminal) ? 'complete' : rows.some(job => job.stale) ? 'incomplete' : 'receiving',
+    workflowStatus, github: github ? { ...github.run, observedAtMs: github.observedAtMs } : null,
+    discoveredAt: seconds(metadata.registeredAtMs),
+    workflowStartedAt, workflowFinishedAt, workflowDurationSeconds: duration(workflowStartedAt, workflowFinishedAt),
     startedAt, finishedAt,
-    updatedAt: max([...invocations.map(value => seconds(value.registeredAtMs)), seconds(github?.observedAtMs), ...events.map(event => seconds(event.receivedAtMs))]),
+    updatedAt: max([seconds(metadata.updatedAtMs), ...invocations.map(value => seconds(value.registeredAtMs)), seconds(github?.observedAtMs), ...events.map(event => seconds(event.receivedAtMs))]),
     heartbeatAt: max(rows.map(job => job.heartbeatAt)),
     durationSeconds: duration(startedAt, finishedAt),
     counts, planId: rows.find(job => job.planId)?.planId || null,

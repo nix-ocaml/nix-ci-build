@@ -38,9 +38,10 @@ export function authConfigFromEnv(env = process.env) {
 }
 
 /** Verify credentials once per RPC. No token or unverified claim is persisted. */
-export function createAuthenticator(config, { keySet, now = () => Date.now() } = {}) {
+export function createAuthenticator(config, { keySet, now = () => Date.now(), authorizeRepository } = {}) {
   const repositories = new Set((config.repositories || []).map(repositoryName));
-  if (!repositories.size || repositories.has(null)) {
+  const installedRepositories = typeof authorizeRepository === 'function' && config.mode === 'oidc';
+  if ((!repositories.size && !installedRepositories) || repositories.has(null)) {
     throw new Error('NIX_CI_LIVE_REPOSITORIES must contain an explicit owner/repository allowlist');
   }
   if (!['oidc', 'dev'].includes(config.mode)) throw new Error('Unknown live reporter authentication mode');
@@ -96,9 +97,14 @@ export function createAuthenticator(config, { keySet, now = () => Date.now() } =
       const runAttempt = identifier(payload.run_attempt);
       const repositoryId = identifier(payload.repository_id);
       const checkRunId = identifier(payload.check_run_id);
-      if (!repository || !repositories.has(repository)) throw new AuthorizationError('Repository is not allowed');
+      if (!repository || (repositories.size && !repositories.has(repository))) throw new AuthorizationError('Repository is not allowed');
       if (!githubRunId || !runAttempt || !repositoryId || !checkRunId || typeof payload.sub !== 'string' || !payload.sub) {
         throw new AuthenticationError();
+      }
+      // In service mode the verified repository ID must belong to an active
+      // installation. An optional explicit allowlist can narrow that scope.
+      if (installedRepositories && !await authorizeRepository({ repository, repositoryId })) {
+        throw new AuthorizationError('Repository is not connected');
       }
       return {
         mode: 'oidc', repository, repositoryId, githubRunId, runAttempt, checkRunId,
@@ -110,7 +116,7 @@ export function createAuthenticator(config, { keySet, now = () => Date.now() } =
     },
     authorizeRun(principal, run) {
       const repository = repositoryName(run.repository);
-      if (!repository || !repositories.has(repository)) throw new AuthorizationError('Repository is not allowed');
+      if (!repository || (repositories.size && !repositories.has(repository))) throw new AuthorizationError('Repository is not allowed');
       if (principal.mode === 'dev') return;
       if (repository !== principal.repository || String(run.repositoryId) !== principal.repositoryId || String(run.githubRunId ?? run.runId) !== principal.githubRunId || String(run.runAttempt) !== principal.runAttempt) {
         throw new AuthorizationError();
