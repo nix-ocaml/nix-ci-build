@@ -52,13 +52,17 @@
                 fileset = fs.unions [
                   ./bin
                   ./lib
+                  ./report
                   ./test
                   ./dune-project
                   ./nix-ci-build.opam
                 ];
               };
             nativeBuildInputs = [ makeWrapper ];
-            nativeCheckInputs = [ pkgs.python3 ];
+            nativeCheckInputs = [
+              pkgs.python3
+              pkgs.nodejs
+            ];
             doCheck = true;
             buildInputs = [ nix-eval-jobs ];
             propagatedBuildInputs = with ocamlPackages; [

@@ -1,0 +1,445 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="data:," />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Build explorer · nix-ci-build</title>
+    <style>
+      __REPORT_STYLE__
+    </style>
+  </head>
+  <body>
+    <a class="skip-link" href="#workspace">Skip to build report</a>
+    <header class="masthead">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">n</span
+        ><span
+          >nix-ci-build <span class="brand-divider">/</span>
+          <strong>Build explorer</strong></span
+        >
+      </div>
+      <div class="header-actions">
+        <span class="offline-label"
+          ><span class="offline-dot"></span>Offline report</span
+        ><button
+          id="copy-view"
+          class="button secondary compact"
+          title="Copy a link to the current filters, time window, and selection"
+        >
+          Copy view link</button
+        ><button
+          id="theme-toggle"
+          class="icon-button"
+          aria-label="Switch color theme"
+          title="Switch color theme"
+        >
+          ◐
+        </button>
+      </div>
+    </header>
+    <main id="workspace">
+      <section class="run-heading" aria-labelledby="run-title">
+        <div>
+          <div class="eyebrow">PACKAGE SET / BUILD REPORT</div>
+          <h1 id="run-title">Build report</h1>
+          <div class="run-meta" id="run-meta"></div>
+        </div>
+        <div class="run-heading-actions">
+          <span id="run-status" class="status-pill">Loading</span
+          ><a
+            id="run-link"
+            class="button secondary"
+            hidden
+            target="_blank"
+            rel="noopener noreferrer"
+            >View on GitHub ↗</a
+          >
+        </div>
+      </section>
+      <section id="metrics" class="metrics" aria-label="Run overview"></section>
+      <section
+        id="insights"
+        class="insights"
+        aria-label="Notable observations"
+      ></section>
+      <div class="workspace-grid" id="workspace-grid">
+        <aside
+          class="facet-sidebar"
+          id="facet-sidebar"
+          aria-label="Filter activities and packages"
+        >
+          <details id="facet-disclosure" class="facet-disclosure" open>
+            <summary>
+              <span>Filters</span
+              ><span id="facet-summary" class="facet-summary"></span>
+            </summary>
+            <div class="facet-body">
+              <div class="facet-heading">
+                <span>Refine this view</span
+                ><button id="facet-reset" class="text-button">Reset</button>
+              </div>
+              <section
+                id="facet-kinds"
+                class="facet-section"
+                aria-labelledby="facet-kind-title"
+              >
+                <h2 id="facet-kind-title">Activity type</h2>
+                <div
+                  id="kind-filters"
+                  class="kind-filters"
+                  aria-label="Activity types"
+                ></div>
+                <p class="facet-note">Alt-click to isolate a type</p>
+              </section>
+              <section
+                class="facet-section"
+                aria-labelledby="facet-state-title"
+              >
+                <h2 id="facet-state-title">Outcome</h2>
+                <div id="facet-states" class="facet-states"></div>
+              </section>
+              <div class="facet-guide">
+                <span class="facet-guide-mark" aria-hidden="true">⌁</span>
+                <p>
+                  Start with the longest activity, then follow its inputs and
+                  consumers.
+                </p>
+                <p>Drag the overview to inspect a time window.</p>
+              </div>
+            </div>
+          </details>
+        </aside>
+        <section class="main-panel">
+          <div class="panel-navigation">
+            <div class="tabs" role="tablist" aria-label="Report views">
+              <button
+                role="tab"
+                aria-selected="true"
+                aria-controls="timeline-panel"
+                id="tab-timeline"
+                data-tab="timeline"
+              >
+                Waterfall</button
+              ><button
+                role="tab"
+                aria-selected="false"
+                aria-controls="packages-panel"
+                id="tab-packages"
+                data-tab="packages"
+                tabindex="-1"
+              >
+                Packages <span id="package-count"></span></button
+              ><button
+                role="tab"
+                aria-selected="false"
+                aria-controls="diagnostics-panel"
+                id="tab-diagnostics"
+                data-tab="diagnostics"
+                tabindex="-1"
+              >
+                Diagnostics <span id="diagnostic-count"></span>
+              </button>
+            </div>
+            <button id="clear-filters" class="text-button">
+              Reset filters
+            </button>
+          </div>
+          <div class="query-toolbar">
+            <div class="filters">
+              <label class="search-field"
+                ><span class="search-icon" aria-hidden="true"></span
+                ><input
+                  type="search"
+                  id="search"
+                  placeholder="Search activities… e.g. kind:build duration:>30s"
+                  autocomplete="off"
+                  spellcheck="false"
+                  aria-label="Search packages and activities"
+                  aria-describedby="query-help"
+                /><kbd>/</kbd></label
+              >
+              <label class="select-label outcome-select"
+                >Outcome<select
+                  id="state-filter"
+                  aria-label="Filter by outcome"
+                >
+                  <option value="all">All outcomes</option>
+                  <option value="failed">Failed or blocked</option>
+                  <option value="active">In progress</option>
+                  <option value="built">Built</option>
+                  <option value="cached">Cached</option>
+                  <option value="cancelled">Cancelled</option>
+                </select></label
+              >
+            </div>
+            <div class="query-meta">
+              <div
+                id="active-filters"
+                class="active-filters"
+                aria-label="Active filters"
+              ></div>
+              <details id="query-help" class="query-help">
+                <summary>
+                  Search syntax <span aria-hidden="true">?</span>
+                </summary>
+                <div class="query-help-panel">
+                  <strong>Find the work that matters</strong>
+                  <p>
+                    Combine terms to narrow your view. Click a filter to add or
+                    remove it.
+                  </p>
+                  <dl>
+                    <dt><code>kind:build</code></dt>
+                    <dd>Activity type</dd>
+                    <dt><code>status:failed</code></dt>
+                    <dd>Outcome</dd>
+                    <dt><code>duration:&gt;30s</code></dt>
+                    <dd>Observed duration</dd>
+                    <dt><code>name:postgresql</code></dt>
+                    <dd>Package or derivation name</dd>
+                    <dt><code>needed-by:caqti</code></dt>
+                    <dd>Requested consumer</dd>
+                    <dt><code>-kind:download</code></dt>
+                    <dd>Exclude a term</dd>
+                  </dl>
+                  <p>
+                    Bare text matches across searchable fields. Quote values
+                    with spaces; combine terms with spaces to require all of
+                    them.
+                  </p>
+                </div>
+              </details>
+            </div>
+            <div id="query-error" class="query-error" role="alert" hidden></div>
+          </div>
+          <section
+            id="timeline-panel"
+            class="tab-panel"
+            role="tabpanel"
+            aria-labelledby="tab-timeline"
+          >
+            <div class="section-heading">
+              <div>
+                <h2>Run timeline</h2>
+                <p>
+                  Select an activity to inspect its phases and dependencies.
+                </p>
+              </div>
+              <div class="zoom-controls">
+                <button id="zoom-in" class="icon-button" aria-label="Zoom in">
+                  +</button
+                ><button
+                  id="zoom-out"
+                  class="icon-button"
+                  aria-label="Zoom out"
+                >
+                  −</button
+                ><button id="zoom-fit" class="button secondary compact">
+                  Fit run
+                </button>
+              </div>
+            </div>
+            <div id="pipeline" class="pipeline" aria-label="Run stages"></div>
+            <div class="chart-heading">
+              <strong>Observed concurrency</strong
+              ><span id="concurrency-label"
+                >Active builds & downloads · not CPU utilization</span
+              >
+            </div>
+            <div id="overview" class="overview">
+              <canvas
+                id="overview-canvas"
+                aria-label="Concurrent observed builds and downloads over time. Adjust the time-window controls below to inspect an interval."
+                role="img"
+              ></canvas>
+              <div id="brush" class="brush" aria-hidden="true">
+                <span></span><span></span>
+              </div>
+              <span id="overview-empty" class="chart-empty" hidden
+                >No timed build or download activity recorded</span
+              >
+            </div>
+            <div class="window-controls">
+              <label
+                >From
+                <input
+                  type="range"
+                  id="window-start"
+                  min="0"
+                  max="1000"
+                  value="0"
+                  aria-label="Time window start" /></label
+              ><label
+                >To
+                <input
+                  type="range"
+                  id="window-end"
+                  min="0"
+                  max="1000"
+                  value="1000"
+                  aria-label="Time window end" /></label
+              ><output id="window-label"></output>
+            </div>
+            <div class="timeline-options">
+              <div class="timeline-legend">
+                <span><i style="--kind-color:var(--build)"></i>Builds</span
+                ><span
+                  ><i style="--kind-color:var(--download)"></i>Downloads</span
+                ><span class="timeline-hint"
+                  >Double-click to focus · Ctrl/⌘-scroll to zoom</span
+                >
+              </div>
+              <label class="select-label"
+                >Sort<select id="timeline-sort">
+                  <option value="start">Start time</option>
+                  <option value="duration">Longest span</option>
+                  <option value="kind">Activity type</option>
+                  <option value="name">Name</option>
+                </select></label
+              >
+            </div>
+            <div class="focus-strip" id="focus-strip" hidden>
+              <span id="focus-label"></span
+              ><button class="text-button" id="clear-focus">
+                Show all work ×
+              </button>
+            </div>
+            <div class="timeline-shell">
+              <div class="timeline-axis">
+                <span id="timeline-count">Activities</span>
+                <div id="axis-ticks"></div>
+              </div>
+              <div
+                class="virtual-scroll timeline-scroll"
+                id="timeline-scroll"
+                tabindex="0"
+                aria-label="Build timeline, scroll to see more activities"
+              >
+                <div id="timeline-rows" class="virtual-content"></div>
+              </div>
+            </div>
+            <div class="panel-footnote">
+              <span
+                ><span class="sample estimated"></span>Dashed bars: inferred
+                timing</span
+              ><span id="timeline-footnote"></span>
+            </div>
+          </section>
+          <section
+            id="packages-panel"
+            class="tab-panel"
+            role="tabpanel"
+            aria-labelledby="tab-packages"
+            hidden
+          >
+            <div class="section-heading">
+              <div>
+                <h2>Requested packages</h2>
+                <p>
+                  Every unique requested derivation, including cache hits.
+                  Attribute aliases stay together.
+                </p>
+              </div>
+              <label class="select-label"
+                >Sort<select id="package-sort">
+                  <option value="attention">Needs attention</option>
+                  <option value="time">Longest request</option>
+                  <option value="name">Name</option>
+                  <option value="state">Outcome</option>
+                </select></label
+              >
+            </div>
+            <div class="package-table-heading">
+              <span>Package / attributes</span><span>Outcome</span
+              ><span>Request</span><span>Build</span>
+            </div>
+            <div
+              class="virtual-scroll package-scroll"
+              id="package-scroll"
+              tabindex="0"
+              aria-label="Requested packages, scroll to see more"
+            >
+              <div id="package-rows" class="virtual-content"></div>
+            </div>
+            <div class="panel-footnote" id="package-footnote"></div>
+          </section>
+          <section
+            id="diagnostics-panel"
+            class="tab-panel"
+            role="tabpanel"
+            aria-labelledby="tab-diagnostics"
+            hidden
+          >
+            <div class="section-heading">
+              <div>
+                <h2>What needs attention</h2>
+                <p>
+                  Root causes, affected packages, and the evidence needed to
+                  reproduce them.
+                </p>
+              </div>
+            </div>
+            <div id="diagnostics-list"></div>
+          </section>
+        </section>
+        <aside
+          class="inspector"
+          id="inspector"
+          aria-labelledby="inspector-title"
+        >
+          <div class="inspector-placeholder">
+            <span class="inspect-illustration" aria-hidden="true">↳</span>
+            <div class="eyebrow">ACTIVITY DETAILS</div>
+            <h2 id="inspector-title">Select an activity</h2>
+            <p>
+              Inspect its timing, build phases, consumers, and dependency links.
+              Cached packages live in the Packages tab.
+            </p>
+            <div class="keyboard-hint">
+              <kbd>/</kbd> search <span>·</span> <kbd>Esc</kbd> clear selection
+            </div>
+          </div>
+        </aside>
+      </div>
+      <details class="report-context">
+        <summary>Run context & data notes</summary>
+        <div id="context-content"></div>
+        <p>
+          This report records Nix activity and wrapper request timings.
+          Concurrent intervals overlap; adding their durations does not give
+          wall time. It does not measure CPU, memory, worker capacity, or an
+          exact critical path. Cached dependency branches may be pruned from the
+          plan. Cache sync success means the copy command succeeded; it may have
+          transferred no bytes.
+        </p>
+        <p>
+          Open this file directly in a browser. Keep the
+          <code>logs/</code> directory alongside it for local log links. No data
+          leaves your browser.
+        </p>
+      </details>
+      <footer>
+        <span
+          >nix-ci-build <span class="footer-divider">/</span> Build
+          explorer</span
+        ><span id="generated-note">Self-contained report</span>
+      </footer>
+    </main>
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+    <noscript
+      ><p class="fatal-message">
+        This interactive report needs JavaScript. The same run is available in
+        <a href="summary.md">summary.md</a> and
+        <a href="results.json">results.json</a>.
+      </p></noscript
+    >
+    <script type="application/json" id="report-data">
+      __REPORT_DATA__
+    </script>
+    <script>
+      __REPORT_SCRIPT__
+    </script>
+  </body>
+</html>

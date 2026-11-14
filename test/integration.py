@@ -1378,6 +1378,11 @@ class Integration(unittest.TestCase):
         self.assertEqual(len(starts), 1)
         self.assertEqual(len(stops), 1)
         self.assertEqual(starts[0]["requestId"], stops[0]["requestId"])
+        self.assertEqual(starts[0]["id"], wait["id"])
+        self.assertEqual(stops[0]["id"], wait["id"])
+        self.assertTrue(wait["id"])
+        self.assertAlmostEqual(starts[0]["time"], wait["startedAt"], delta=0.1)
+        self.assertAlmostEqual(stops[0]["seconds"], stops[0]["time"] - starts[0]["time"], delta=0.1)
         self.assertEqual(stops[0]["drvs"], [app])
         self.assertGreaterEqual(stops[0]["seconds"], 0.35)
 
@@ -1441,6 +1446,68 @@ class Integration(unittest.TestCase):
         node = next(node for node in snapshot["derivations"] if node["drvPath"] == compiler)
         self.assert_cached(node)
         self.assertEqual(f.state()["copied"], [f.output(app)])
+
+    def test_parallel_output_downloads_have_independent_timeline_intervals(self):
+        f = self.fixture
+        outputs = {"out": store_path("shared-download"), "dev": store_path("shared-download-dev")}
+        dependency = f.node("shared-download", outputs=outputs, references=[], download_barrier="downloads")
+        first = f.job("packages.first", f.node("first", inputDrvs={dependency: ["out"]}))
+        second = f.job("packages.second", f.node("second", inputDrvs={dependency: ["dev"]}))
+        f.cached = list(outputs.values())
+        with self.running_fixture("--jobs", "2", "--cache-refresh", "0", "--copy-to", DESTINATION) as (process, log):
+            events = self.observe_events(process, lambda events: sum(
+                event["type"] == "activity-start" and event["drvPath"] == dependency
+                for event in events
+            ) == 2)
+            downloads = [event for event in events if event["type"] == "activity-start" and event["drvPath"] == dependency]
+            self.assertEqual({event["path"] for event in downloads}, set(outputs.values()))
+            self.assertEqual({event["activityKind"] for event in downloads}, {"download"})
+            self.assertEqual(len({event["activityId"] for event in downloads}), 2)
+            self.assertEqual(len({event["requestId"] for event in downloads}), 2)
+            self.assertFalse(any(event["type"] == "activity-stop" and event["drvPath"] == dependency for event in events))
+            f.release("downloads")
+            snapshot = self.finish_successfully(process, log)
+        events = f.events()
+        starts = {event["activityId"]: event for event in events if event["type"] == "activity-start"}
+        stops = {event["activityId"]: event for event in events if event["type"] == "activity-stop"}
+        self.assertEqual(len(starts), 4)
+        self.assertEqual(set(starts), set(stops))
+        for identity, start in starts.items():
+            self.assertIsInstance(identity, str)
+            self.assertIsInstance(start["requestId"], str)
+            stop = stops[identity]
+            for field in ("drvPath", "path", "requestId", "attempt", "activityKind"):
+                self.assertEqual(start[field], stop[field])
+            self.assertEqual(start["attempt"], 0)
+            self.assertLessEqual(start["time"], stop["time"])
+            self.assertAlmostEqual(stop["activitySeconds"], stop["time"] - start["time"], delta=0.1)
+        phases = [event for event in events if event["type"] == "phase"]
+        self.assertEqual({event["drvPath"] for event in phases}, {first, second})
+        for phase in phases:
+            start, stop = starts[phase["activityId"]], stops[phase["activityId"]]
+            self.assertEqual(phase["activityKind"], "build")
+            self.assertEqual(phase["requestId"], start["requestId"])
+            self.assertEqual(phase["attempt"], start["attempt"])
+            self.assertLessEqual(start["time"], phase["time"])
+            self.assertLessEqual(phase["time"], stop["time"])
+        for stage in ("evaluation", "planning"):
+            stage_events = [event for event in events if event["type"] == "stage" and event["stage"] == stage]
+            self.assertEqual([event["state"] for event in stage_events], ["started", "finished"])
+            self.assertLessEqual(stage_events[0]["time"], stage_events[1]["time"])
+            self.assertLessEqual(stage_events[1]["time"], min(event["time"] for event in starts.values()))
+        self.assertEqual(f.state()["attempts"], {first: 1, second: 1})
+        self.assertEqual(len(snapshot["uploads"]), 2)
+        for upload in snapshot["uploads"]:
+            self.assertEqual(upload["state"], "uploaded")
+            self.assertLessEqual(upload["queuedAt"], upload["startedAt"])
+            self.assertLessEqual(upload["startedAt"], upload["finishedAt"])
+            self.assertLessEqual(upload["finishedAt"], snapshot["context"]["finishedAt"])
+            self.assertAlmostEqual(upload["seconds"], upload["finishedAt"] - upload["startedAt"], delta=0.1)
+            transfer_starts = [event for event in events if event["type"] == "upload-start" and event["path"] == upload["path"]]
+            self.assertEqual(len(transfer_starts), 1)
+            self.assertAlmostEqual(transfer_starts[0]["time"], upload["startedAt"], delta=0.1)
+        self.assertTrue((f.report / "report.html").is_file())
+        self.assertGreater((f.report / "report.html").stat().st_size, 0)
 
     def test_completed_selected_output_download_is_not_reported_active(self):
         f = self.fixture
@@ -1712,6 +1779,7 @@ class Integration(unittest.TestCase):
             self.assertAlmostEqual(node["seconds"], node["finishedAt"] - node["startedAt"], delta=0.1)
         self.assertIn("started slow fixture", f.all_logs())
         self.assertTrue(f.summary.exists())
+        self.assertTrue((f.report / "report.html").is_file())
 
     def test_sigterm_preserves_built_packages_and_cancels_upload_queue(self):
         f = self.fixture
@@ -1743,7 +1811,23 @@ class Integration(unittest.TestCase):
         self.assert_built(self.jobs_by_attr(snapshot)["packages.app"])
         self.assertEqual(len(snapshot["uploads"]), 4)
         self.assertTrue(all(upload["state"] == "cancelled" for upload in snapshot["uploads"]))
+        started = []
+        for upload in snapshot["uploads"]:
+            self.assertIsNotNone(upload["finishedAt"])
+            self.assertLessEqual(upload["queuedAt"], upload["finishedAt"])
+            self.assertLessEqual(upload["finishedAt"], snapshot["context"]["finishedAt"])
+            if upload["startedAt"] is None:
+                self.assertEqual(upload["seconds"], 0)
+            else:
+                started.append(upload["path"])
+                self.assertLessEqual(upload["queuedAt"], upload["startedAt"])
+                self.assertLessEqual(upload["startedAt"], upload["finishedAt"])
+                self.assertAlmostEqual(upload["seconds"], upload["finishedAt"] - upload["startedAt"], delta=0.1)
+        self.assertGreater(len(started), 0)
+        self.assertLess(len(started), 4)
+        self.assertEqual({event["path"] for event in f.events() if event["type"] == "upload-start"}, set(started))
         self.assertTrue(f.summary.exists())
+        self.assertTrue((f.report / "report.html").is_file())
 
     def test_shared_dependency_priority_unlocks_more_roots_first(self):
         f = self.fixture
@@ -1844,6 +1928,28 @@ class Integration(unittest.TestCase):
         self.assertTrue(snapshot["planDiff"])
         self.assertIn("new-compiler", json.dumps(snapshot["planDiff"]))
         self.assertIn("new-compiler", f.summary.read_text())
+
+    def test_saved_report_renders_without_a_flake_or_nix_commands(self):
+        f = self.fixture
+        f.job("packages.cached", f.node("cached"), cache="cached")
+        self.success(f.run("--dry-run"))
+        report = f.report / "report.html"
+        self.assertTrue(report.is_file())
+        report.unlink()
+        snapshot = (f.report / "results.json").read_bytes()
+        events = (f.report / "events.jsonl").read_bytes()
+        commands = f.trace()
+        rendered = subprocess.run(
+            [EXECUTABLE, "--render-report", str(f.report)], env=f.env(),
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=10,
+        )
+        (f.directory / "render-report.log").write_text(rendered.stdout)
+        self.assertEqual(rendered.returncode, 0, rendered.stdout)
+        self.assertTrue(report.is_file())
+        self.assertGreater(report.stat().st_size, 0)
+        self.assertEqual((f.report / "results.json").read_bytes(), snapshot)
+        self.assertEqual((f.report / "events.jsonl").read_bytes(), events)
+        self.assertEqual(f.trace(), commands)
 
     def test_output_option_takes_precedence_over_github_summary(self):
         f = self.fixture

@@ -113,6 +113,7 @@ The report directory contains:
 | `plan.json` | The evaluated build plan, including dependency and cache information. |
 | `explanation.json` | Dependency paths and missing work for `--explain ATTRIBUTE`. |
 | `summary.md` | A bounded Markdown report for GitHub's job summary. |
+| `report.html` | An offline interactive timeline, package explorer, and dependency inspector. |
 | `logs/` | Complete captured build and transfer logs, plus diagnostic JSON for unexpected cache-query failures. |
 
 Snapshots and summaries are replaced atomically. Partial results remain useful
@@ -141,6 +142,61 @@ Actions logs use colored status labels, short expandable plan and failure
 groups, and error annotations that point to the cause of a failure. Set
 `NO_COLOR` to disable colors. Groups are emitted as complete blocks so output
 from concurrent builds does not get folded into another package's group.
+
+When a progress line abbreviates a dependency's consumers with `(+N more)`, a
+collapsed group lists all affected attributes. Each distinct consumer list is
+shown once, so repeated heartbeats keep the console readable.
+
+### Interactive reports
+
+Open `report.html` from the downloaded report directory to explore a run. The
+HTML embeds its data and application assets; it works offline without a server,
+external scripts, or a third-party analytics service. Keep the `logs/` directory
+alongside it to follow links to complete logs.
+
+The timeline separates package requests from observed Nix builds, downloads,
+waits, cache imports, and uploads. Filter by package or activity, narrow the
+time window, and select work to see phases, dependencies, consumers, failures,
+and reproduction commands. The explorer uses compact outcome and activity
+facets, a waterfall with hover timing, and a resizable detail panel with
+Overview, Dependencies, and Metadata tabs. Double-click an activity to focus
+its time window, drag the overview to select a range, or use Ctrl/Command +
+scroll over the waterfall to zoom. Drag empty waterfall space to pan; the
+time sliders, zoom buttons, and arrow-key navigation also work by keyboard.
+
+Search supports literal words and quoted phrases, plus `kind:`, `status:`,
+`name:`, `needed-by:`, and `duration:` fields. For example,
+`kind:build duration:>30s -name:source` finds long builds excluding source
+fetchers. Terms are combined with AND; prefix a term with `-` to exclude it.
+Durations accept `ms`, `s`, `m`, and `h`. Invalid queries show an explanation;
+each valid term can be removed individually. A `kind:` query overrides the
+activity-type checkboxes; changing those checkboxes replaces the query's kind
+terms. In Packages, `kind:request` and `duration:` refer to the package request.
+Copy view preserves filters, time window, and selected activity in the URL
+fragment so a hosted report can be shared at the exact point of investigation.
+
+Concurrency represents observed Nix activities,
+not CPU utilization. Slow activities and dependency paths help investigate
+bottlenecks; they do not establish that eliminating one activity would shorten
+the run by its entire duration.
+
+Reports are generated at the end of successful, failed, and gracefully
+cancelled runs. Older or abruptly interrupted runs can be rendered again from
+their durable files without invoking Nix:
+
+```sh
+nix-ci-build --render-report ./downloaded-report
+```
+
+Missing events and incomplete intervals are identified in the report. New
+events include request-scoped activity IDs, phase transitions, upload start
+times, and evaluation/planning boundaries. Older reports use the available
+snapshot timings and explicitly mark inferred intervals.
+
+GitHub's artifact viewer does not execute the HTML report. Download it to open
+locally, or publish it on a static host such as GitHub Pages. A publisher for
+pull-request builds should regenerate HTML from the saved JSON using a trusted
+version of the renderer, and run deployment separately from build jobs.
 
 The job summary leads with the outcome and totals, followed by root failures,
 affected packages, reproduction commands, and the slowest observed work.

@@ -23,7 +23,9 @@ val append_event : t -> Yojson.Safe.t -> unit
 
 val emit_event : t -> Yojson.Safe.t -> unit
 (** Render meaningful lifecycle events. Routine cache/download/sync events stay
-    in the event file and aggregate progress unless verbose output is enabled. *)
+    in the event file and aggregate progress unless verbose output is enabled.
+    In Actions, omitted consumers appear in a complete expandable group, once
+    per activity identity and distinct consumer list. *)
 
 val emit_plan : t -> Yojson.Safe.t -> unit
 (** Print a compact plan, a bounded completed detail group in Actions, and any
@@ -33,6 +35,8 @@ val write_snapshot : t -> Yojson.Safe.t -> unit
 (** Atomically replace [results.json] and [summary.md] in the report directory. *)
 
 val emit_progress : t -> Yojson.Safe.t -> unit
+(** Keep live lines compact and expose full omitted consumer lists in Actions.
+    Lists already shown by lifecycle events or prior heartbeats are not repeated. *)
 
 val emit_failure : t -> Yojson.Safe.t -> unit
 (** Emit one distinct root failure. GitHub annotations are bounded, and arbitrary
@@ -41,7 +45,8 @@ val emit_failure : t -> Yojson.Safe.t -> unit
 val finish : t -> Yojson.Safe.t -> unit
 (** Write the final snapshot and summary to the explicitly configured output.
     [None] prints the saved summary path. A filename is replaced atomically.
-    Evaluation and run errors are surfaced even when no build was submitted. *)
+    Evaluation and run errors are surfaced even when no build was submitted.
+    Generate [report.html] once at completion from the snapshot and saved events. *)
 
 val close : t -> unit
 
