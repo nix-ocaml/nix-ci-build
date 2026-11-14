@@ -134,6 +134,19 @@ test(
     const streams = new Set();
     const server = http.createServer(async (request, response) => {
       const url = new URL(request.url, "http://localhost");
+      if (url.pathname === "/api/session") {
+        response.setHeader("Content-Type", "application/json");
+        response.end(
+          JSON.stringify({
+            mode: "local",
+            user: null,
+            connections: [],
+            signInUrl: null,
+            installUrl: null,
+          }),
+        );
+        return;
+      }
       if (url.pathname === "/api/events") {
         response.writeHead(200, {
           "Content-Type": "text/event-stream",
