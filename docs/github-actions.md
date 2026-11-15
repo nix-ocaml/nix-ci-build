@@ -135,10 +135,11 @@ Independent work continues after a prerequisite failure, but each worker must
 import its own required published outputs before building. Failed publication
 remains a build failure. Missing or failed worker reports make the combined
 report job fail; rendering a report does not convert a failed build into a
-successful workflow. Empty plans are successful. Retrying failed workers keeps
-their previous attempts in the same report. Re-running planning starts a new
-report generation, so old worker reports do not make a newly cached plan appear
-incomplete; the old artifacts remain available in Actions.
+successful workflow. Empty plans are successful. When earlier worker artifacts
+remain available, retries include those attempts in the same report. Re-running
+planning starts a new report generation, so old worker reports do not make a
+newly cached plan appear incomplete. Download reports before a full workflow
+rerun if you need to preserve them: GitHub can remove the previous artifacts.
 
 This workflow uses the same
 [shared-plan execution model and current boundaries](shared-dependencies.md#current-boundaries)
