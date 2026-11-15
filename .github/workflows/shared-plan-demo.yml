@@ -38,6 +38,8 @@ jobs:
       packages: ${{ steps.plan.outputs.packages }}
       has-shared: ${{ steps.plan.outputs.has-shared }}
       has-packages: ${{ steps.plan.outputs.has-packages }}
+      tool-ready: ${{ steps.tool-artifact.outcome == 'success' }}
+      plan-ready: ${{ steps.plan.outcome == 'success' && steps.plan-artifact.outcome == 'success' }}
     steps:
       - uses: actions/checkout@v7
       - uses: cachix/install-nix-action@v31
@@ -81,6 +83,7 @@ jobs:
           Path('plan/bootstrap.json').write_text(bootstrap)
           PY
       - name: Upload the exact builder closure
+        id: tool-artifact
         uses: actions/upload-artifact@v7
         with:
           name: nix-ci-build-tool
@@ -157,6 +160,7 @@ jobs:
             cat plan/summary.md >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Upload the portable execution plan
+        id: plan-artifact
         if: always()
         uses: actions/upload-artifact@v7
         with:
@@ -420,7 +424,7 @@ jobs:
   aggregate:
     name: Combined build report
     needs: [plan, shared, packages]
-    if: always()
+    if: ${{ always() && needs.plan.outputs.tool-ready == 'true' && needs.plan.outputs.plan-ready == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
