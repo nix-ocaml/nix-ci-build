@@ -51,6 +51,7 @@
                 root = ./.;
                 fileset = fs.unions [
                   ./bin
+                  ./ci
                   ./lib
                   ./test
                   ./dune-project
@@ -80,6 +81,7 @@
           inputsFrom = [ self.packages.${pkgs.stdenv.hostPlatform.system}.default ];
           nativeBuildInputs = [
             pkgs.python3
+            pkgs.actionlint
           ]
           ++ (with pkgs.ocamlPackages; [
             merlin

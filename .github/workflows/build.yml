@@ -1,0 +1,366 @@
+name: Build package sets
+
+on:
+  workflow_call:
+    inputs:
+      config:
+        description: JSON configuration in the calling repository
+        required: true
+        type: string
+      name:
+        description: Artifact namespace, unique if this workflow is called more than once
+        default: build
+        type: string
+    secrets:
+      NIX_CACHE_SIGNING_KEY:
+        description: Nix signing key trusted by the configured read caches
+        required: true
+      AWS_ACCESS_KEY_ID:
+        required: false
+      AWS_SECRET_ACCESS_KEY:
+        required: false
+      AWS_SESSION_TOKEN:
+        required: false
+    outputs:
+      report-url:
+        description: Download the combined HTML report and full build evidence
+        value: ${{ jobs.report.outputs.url }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  NIX_CI_BUILD_RUN_ID: github:${{ github.repository }}:${{ github.run_id }}:${{ inputs.name }}
+  NIX_CI_BUILD_ATTEMPT_ID: ${{ github.run_attempt }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+
+jobs:
+  plan:
+    name: Plan package sets
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      shared: ${{ steps.plan.outputs.shared }}
+      packages: ${{ steps.plan.outputs.packages }}
+      has-shared: ${{ steps.plan.outputs.has-shared }}
+      has-packages: ${{ steps.plan.outputs.has-packages }}
+      bootstrap: ${{ steps.plan.outputs.bootstrap }}
+      has-bootstrap: ${{ steps.plan.outputs.has-bootstrap }}
+      timeout-minutes: ${{ steps.config.outputs.timeout-minutes }}
+      plan-attempt: ${{ steps.plan.outputs.plan-attempt }}
+      tool-ready: ${{ steps.tool-artifact.outcome == 'success' }}
+      plan-ready: ${{ steps.plan.outcome == 'success' && steps.plan-artifact.outcome == 'success' }}
+    env:
+      CONFIG: ${{ inputs.config }}
+      ARTIFACT_NAMESPACE: ${{ inputs.name }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check out the matching workflow implementation
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .nix-ci-build
+          persist-credentials: false
+      - name: Read configuration
+        id: config
+        run: |
+          if [[ ! "$ARTIFACT_NAMESPACE" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]]; then
+            echo 'The workflow name must be 1-64 letters, digits, underscores, or hyphens, starting with a letter or digit.' >&2
+            exit 1
+          fi
+          python3 .nix-ci-build/ci/github.py --config "$CONFIG" configure
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: ${{ steps.config.outputs.nix-config }}
+      - name: Build and export the signed builder
+        env:
+          NIX_CACHE_SIGNING_KEY: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
+        run: |
+          python3 .nix-ci-build/ci/github.py --config "$CONFIG" bootstrap export \
+            --flake "path:$PWD/.nix-ci-build#packages.x86_64-linux.default" \
+            --tool tool --report plan
+      - name: Save the builder for Linux workers and reporting
+        id: tool-artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.name }}-tool-x86_64-linux
+          path: tool/
+          overwrite: true
+          compression-level: 0
+          retention-days: 14
+      - name: Evaluate all sets and assign shared work
+        id: plan
+        run: |
+          python3 .nix-ci-build/ci/github.py --config "$CONFIG" plan \
+            --plan plan --system x86_64-linux
+          printf 'plan-attempt=%s\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+      - name: Publish planning details
+        if: always()
+        run: |
+          if [[ -f plan/summary.md ]]; then
+            cat plan/summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Save the portable plan and configuration
+        id: plan-artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.name }}-plan
+          path: plan/
+          overwrite: true
+          if-no-files-found: ignore
+          retention-days: 14
+
+  bootstrap:
+    name: Builder / ${{ matrix.system }}
+    needs: plan
+    if: ${{ needs.plan.result == 'success' && needs.plan.outputs.has-bootstrap == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.bootstrap) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .nix-ci-build
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.name }}-plan
+          path: plan
+      - name: Read configuration
+        id: config
+        run: python3 .nix-ci-build/ci/github.py --config plan/workflow-config.json configure
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: ${{ steps.config.outputs.nix-config }}
+      - name: Build the matching binary for this host system
+        env:
+          SYSTEM: ${{ matrix.system }}
+          NIX_CACHE_SIGNING_KEY: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
+        run: |
+          python3 .nix-ci-build/ci/github.py --config plan/workflow-config.json bootstrap export \
+            --flake "path:$PWD/.nix-ci-build#packages.$SYSTEM.default" \
+            --tool tool --report tool
+      - name: Save the signed builder
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.name }}-tool-${{ matrix.system }}
+          path: tool/
+          overwrite: true
+          compression-level: 0
+          retention-days: 14
+
+  shared:
+    name: Prerequisites / ${{ join(matrix.consumers, ', ') }}
+    needs: [plan, bootstrap]
+    # A failed builder on another system must not suppress independent groups.
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.has-shared == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.shared) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ fromJSON(needs.plan.outputs.timeout-minutes) }}
+    env:
+      GROUP_ID: ${{ matrix.group }}
+    steps:
+      - name: Record this worker attempt before setup
+        run: |
+          python3 - <<'PY'
+          import json, os, time
+          from pathlib import Path
+          Path('report').mkdir(exist_ok=True)
+          Path('report/bootstrap.json').write_text(json.dumps({
+              'groupId': os.environ['GROUP_ID'],
+              'runId': os.environ['NIX_CI_BUILD_RUN_ID'],
+              'attemptId': os.environ['NIX_CI_BUILD_ATTEMPT_ID'],
+              'startedAt': time.time(), 'status': 'failed',
+              'operation': 'prepare-worker', 'error': 'Worker setup did not finish',
+          }) + '\n')
+          PY
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .nix-ci-build
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.name }}-plan
+          path: plan
+      - name: Read configuration
+        id: config
+        run: python3 .nix-ci-build/ci/github.py --config plan/workflow-config.json configure
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: ${{ steps.config.outputs.nix-config }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.name }}-tool-${{ matrix.system }}
+          path: tool
+      - name: Import the signed builder
+        run: |
+          python3 .nix-ci-build/ci/github.py --config plan/workflow-config.json bootstrap import \
+            --tool tool --report report --group "$GROUP_ID"
+      - name: Build and publish shared prerequisites
+        env:
+          NIX_CACHE_SIGNING_KEY: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
+        run: |
+          python3 .nix-ci-build/ci/github.py --config plan/workflow-config.json execute \
+            --plan plan --report report --group "$GROUP_ID"
+      - name: Save worker evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.name }}-worker-${{ needs.plan.outputs.plan-attempt }}-${{ matrix.group }}-${{ github.run_attempt }}
+          path: report/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  packages:
+    name: Packages / ${{ join(matrix.consumers, ', ') }}
+    needs: [plan, bootstrap, shared]
+    # Each worker checks its own published prerequisites after a failed or
+    # empty shared stage, allowing unrelated packages to finish.
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.has-packages == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.packages) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ fromJSON(needs.plan.outputs.timeout-minutes) }}
+    env:
+      GROUP_ID: ${{ matrix.group }}
+    steps:
+      - name: Record this worker attempt before setup
+        run: |
+          python3 - <<'PY'
+          import json, os, time
+          from pathlib import Path
+          Path('report').mkdir(exist_ok=True)
+          Path('report/bootstrap.json').write_text(json.dumps({
+              'groupId': os.environ['GROUP_ID'],
+              'runId': os.environ['NIX_CI_BUILD_RUN_ID'],
+              'attemptId': os.environ['NIX_CI_BUILD_ATTEMPT_ID'],
+              'startedAt': time.time(), 'status': 'failed',
+              'operation': 'prepare-worker', 'error': 'Worker setup did not finish',
+          }) + '\n')
+          PY
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .nix-ci-build
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.name }}-plan
+          path: plan
+      - name: Read configuration
+        id: config
+        run: python3 .nix-ci-build/ci/github.py --config plan/workflow-config.json configure
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: ${{ steps.config.outputs.nix-config }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.name }}-tool-${{ matrix.system }}
+          path: tool
+      - name: Import the signed builder
+        run: |
+          python3 .nix-ci-build/ci/github.py --config plan/workflow-config.json bootstrap import \
+            --tool tool --report report --group "$GROUP_ID"
+      - name: Import prerequisites, build packages, and publish
+        env:
+          NIX_CACHE_SIGNING_KEY: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
+        run: |
+          python3 .nix-ci-build/ci/github.py --config plan/workflow-config.json execute \
+            --plan plan --report report --group "$GROUP_ID"
+      - name: Save worker evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.name }}-worker-${{ needs.plan.outputs.plan-attempt }}-${{ matrix.group }}-${{ github.run_attempt }}
+          path: report/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  report:
+    name: Combined build report
+    needs: [plan, bootstrap, shared, packages]
+    if: ${{ always() && needs.plan.outputs.tool-ready == 'true' && needs.plan.outputs.plan-ready == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      url: ${{ steps.artifact.outputs.artifact-url }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .nix-ci-build
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.name }}-plan
+          path: plan
+      - name: Read configuration
+        id: config
+        run: python3 .nix-ci-build/ci/github.py --config plan/workflow-config.json configure
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: ${{ steps.config.outputs.nix-config }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.name }}-tool-x86_64-linux
+          path: tool
+      - name: Import the signed builder
+        run: |
+          python3 .nix-ci-build/ci/github.py --config plan/workflow-config.json bootstrap import \
+            --tool tool --report aggregate
+      - name: Collect every available worker attempt
+        uses: actions/download-artifact@v8
+        with:
+          pattern: ${{ inputs.name }}-worker-${{ needs.plan.outputs.plan-attempt }}-*
+          path: reports
+      - name: Combine planning and worker reports
+        env:
+          NIX_CI_BUILD_STAGE_RESULTS: |
+            {"plan":"${{ needs.plan.result }}","bootstrap":"${{ needs.bootstrap.result }}","shared":"${{ needs.shared.result }}","packages":"${{ needs.packages.result }}"}
+        run: |
+          mkdir -p reports
+          python3 .nix-ci-build/ci/github.py --config plan/workflow-config.json aggregate \
+            --plan plan --reports reports --report aggregate
+      - name: Publish the combined summary
+        if: always()
+        run: |
+          if [[ -f aggregate/summary.md ]]; then
+            cat aggregate/summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Save the combined report and original evidence
+        id: artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.name }}-report-${{ github.run_attempt }}
+          path: |
+            aggregate/
+            reports/
+            plan/*.json
+            plan/summary.md
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Link the report
+        if: ${{ always() && steps.artifact.outputs.artifact-url != '' }}
+        env:
+          REPORT_URL: ${{ steps.artifact.outputs.artifact-url }}
+        run: printf '\n[Full build report](%s)\n' "$REPORT_URL" >> "$GITHUB_STEP_SUMMARY"

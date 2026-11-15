@@ -56,6 +56,10 @@ Running builds are never cancelled to pursue a cache import.
 
 ## Sharing dependencies across runner jobs
 
+For GitHub Actions, use the [reusable build workflow](docs/github-actions.md).
+One workflow call and a configuration file supply all package sets and cache
+settings; nix-ci-build owns the dynamic matrices, builder reuse, and reports.
+
 `--plan-sets sets.json` evaluates several package sets together and assigns
 each missing derivation to one worker. Shared prerequisites run first; package
 workers import their published outputs and build only their remaining work.
