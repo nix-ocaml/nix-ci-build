@@ -41,3 +41,8 @@
  (alias runtest)
  (deps integration.py fake_tools.py)
  (action (run %{bin:python3} -B %{dep:integration.py} %{exe:../bin/main.exe})))
+
+(rule
+ (alias runtest)
+ (deps github_workflow.py ../ci/github.py)
+ (action (run %{bin:python3} -B %{dep:github_workflow.py})))

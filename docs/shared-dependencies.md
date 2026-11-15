@@ -170,6 +170,10 @@ IDs would describe a separate attempt.
 
 ## GitHub Actions
 
+The [reusable build workflow](github-actions.md) packages this setup for callers.
+Use it for a package-set integration; the details below describe its underlying
+matrix protocol and the separate low-level demo.
+
 The planner appends `shared`, `packages`, `has-shared`, and `has-packages` to
 `GITHUB_OUTPUT`. Outside Actions, use `--github-output FILE` to write the same
 values. Both matrix values are compact JSON objects with an `include` array;
