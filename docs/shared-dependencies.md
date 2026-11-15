@@ -285,6 +285,27 @@ python3 -B test/shared_plan_benchmark.py result/bin/nix-ci-build \
   --directory "$PWD/shared-plan-benchmark"
 ```
 
+The `musl-lwt` scenario compares two real package sets: OCaml 5.5 and 5.6 Lwt
+cross compiled for musl. Both directly consume the same compiled `libev`
+derivation. It withholds only those three derivations and uses the same fresh
+stores, frozen seed, and ownership checks as the default comparison. The
+expected count remains four builds independently and three with coordination.
+Pass an immutable source from the exact nix-overlays checkout being tested:
+
+```sh
+overlay_snapshot=$(nix flake archive --json /path/to/nix-overlays | jq -r .path)
+python3 -B test/shared_plan_benchmark.py result/bin/nix-ci-build \
+  --scenario musl-lwt --nix-overlays-ref "path:$overlay_snapshot" \
+  --directory "$PWD/shared-musl-benchmark"
+```
+
+A full `github:nix-ocaml/nix-overlays/<40-character-commit>` reference is also
+accepted. This scenario enforces the 2 GiB seed ceiling and a 20 minute work
+deadline, followed by up to five seconds of process cleanup. It sends SIGTERM
+to the command's process group before escalating to SIGKILL. Tool bootstrap
+is outside that deadline and remains a separate workflow measurement. No
+production cache receives these deliberately repeated builds.
+
 The chosen directory must not exist. Nix's
 [chroot stores](https://nix.dev/manual/nix/2.35/store/types/local-store#local-chroot-store)
 require Linux mount and user namespaces; the Actions workflow runs this command

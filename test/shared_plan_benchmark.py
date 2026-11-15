@@ -5,6 +5,9 @@ Only fmt, astring, and their common topkg dependency may build. Everything else
 must already exist in the read caches. Each worker uses a fresh Linux chroot
 store; no paths are removed from the machine's ordinary store.
 
+The musl-lwt scenario instead compares OCaml 5.5/5.6 Lwt with their exact shared
+libev dependency, using an explicitly pinned nix-overlays source.
+
 Run with a packaged nix-ci-build binary (so nix-eval-jobs is on its PATH):
   python3 test/shared_plan_benchmark.py result/bin/nix-ci-build --directory DIR
 The directory must not exist. Reports and stores are retained on failure.
@@ -17,10 +20,13 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
+import signal
 import subprocess
 import tempfile
 import threading
 import time
+from urllib.parse import urlencode
 
 
 DEFAULT_CACHES = [
@@ -32,6 +38,11 @@ DEFAULT_CACHES = [
 def require(condition, message):
     if not condition:
         raise RuntimeError(message)
+
+
+def immutable_reference(reference):
+    return bool(re.fullmatch(r"github:nix-ocaml/nix-overlays/[0-9a-fA-F]{40}", reference)
+                or re.fullmatch(r"path:/nix/store/[a-z0-9]{32}-[^/\n?]+", reference))
 
 
 def read_json(path):
@@ -113,12 +124,24 @@ def new_cache(directory):
 
 
 class Benchmark:
-    def __init__(self, executable, directory, caches, max_seed_bytes):
+    def __init__(self, executable, directory, caches, max_seed_bytes, *,
+                 scenario="fmt-astring", overlays_ref=None, deadline_seconds=None):
         self.executable = str(executable.resolve())
         self.directory = directory.resolve()
         self.repo = Path(__file__).resolve().parents[1]
         self.caches = caches
         self.max_seed_bytes = max_seed_bytes
+        self.scenario = scenario
+        self.overlays_ref = overlays_ref
+        self.deadline = time.monotonic() + deadline_seconds if deadline_seconds else None
+        self.root_names = ["musl_5_5", "musl_5_6"] if scenario == "musl-lwt" else ["fmt", "astring"]
+        self.shared_name = "libev" if scenario == "musl-lwt" else "topkg"
+        self.description = (
+            "Unmodified musl Lwt for OCaml 5.5 and 5.6 from the pinned nix-overlays source; "
+            "only those roots and their exact common libev were missing."
+            if scenario == "musl-lwt" else
+            "Unmodified `fmt` and `astring` from the repository's locked nix-overlays; "
+            "only those roots and `topkg` were missing.")
         self.logs = self.directory / "commands"
         self.logs.mkdir()
         self.command_lock = threading.Lock()
@@ -134,7 +157,8 @@ class Benchmark:
             "narinfo-cache-negative-ttl = 0", "narinfo-cache-positive-ttl = 0",
             "max-jobs = 1", "cores = 1", "connect-timeout = 15", "download-attempts = 2",
         ]) + "\n"
-        self.summary = {"version": 1, "startedAt": time.time(), "status": "running"}
+        self.summary = {"version": 1, "startedAt": time.time(), "status": "running",
+                        "scenario": scenario, "deadlineSeconds": deadline_seconds}
         # A sandbox maps the calling UID but cannot use that UID's host
         # capabilities to traverse somebody else's private home directory.
         # Keep stores and builder temp dirs outside the runner-owned checkout;
@@ -146,6 +170,10 @@ class Benchmark:
         self.seed = new_cache(self.directory / "seed-cache")
 
     def run(self, label, command, env=None, allow_failure=False, timeout=900):
+        if self.deadline is not None:
+            remaining = self.deadline - time.monotonic()
+            require(remaining > 0, "Benchmark exceeded its total time budget")
+            timeout = min(timeout, remaining)
         with self.command_lock:
             self.counter += 1
             prefix = self.logs / ("%03d-%s" % (self.counter, label))
@@ -153,8 +181,27 @@ class Benchmark:
         print("[%s] %s" % (label, " ".join(command[:5])), flush=True)
         with prefix.with_suffix(".stdout").open("w+") as stdout, \
                 prefix.with_suffix(".stderr").open("w+") as stderr:
-            result = subprocess.run(command, env=env or self.env, stdout=stdout,
-                                    stderr=stderr, text=True, timeout=timeout)
+            result = subprocess.Popen(command, env=env or self.env, stdout=stdout,
+                                      stderr=stderr, text=True, start_new_session=True)
+            try:
+                result.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                # Let nix-ci-build cancel its owned Nix subprocesses before
+                # escalating. A direct-child SIGKILL can leave builds running.
+                try:
+                    os.killpg(result.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    result.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                try:
+                    os.killpg(result.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                result.wait()
+                raise
             stdout.seek(0)
             output = stdout.read()
             stderr.seek(0)
@@ -180,26 +227,42 @@ class Benchmark:
         require(source["type"] == "github" and source["owner"] == "nix-ocaml"
                 and source["repo"] == "nix-overlays", "Expected the existing locked nix-overlays input")
         reference = "github:%s/%s/%s" % (source["owner"], source["repo"], source["rev"])
+        if self.overlays_ref:
+            reference = self.overlays_ref
+            output, _ = self.run("lock-source", ["nix", "flake", "metadata", "--json", reference])
+            source = json.loads(output)["locked"]
+            if reference.startswith("path:"):
+                # Store paths are immutable, but getFlake still requires the
+                # content hash in its reference for pure evaluation.
+                reference += "?" + urlencode({"narHash": source["narHash"]})
+        packages = "let p = f.legacyPackages.x86_64-linux.ocaml-ng.ocamlPackages_5_5; in { inherit (p) fmt astring topkg; }"
+        if self.scenario == "musl-lwt":
+            packages = """let
+              p = f.legacyPackages.x86_64-linux.pkgsCross.musl64.ocaml-ng;
+              first = p.ocamlPackages_5_5.lwt;
+              helpers = builtins.filter (d: (d.pname or "") == "libev") first.propagatedBuildInputs;
+            in { musl_5_5 = first; musl_5_6 = p.ocamlPackages_5_6.lwt;
+                 libev = assert builtins.length helpers == 1; builtins.head helpers; }"""
         expression = """let
           f = builtins.getFlake %s;
-          p = f.legacyPackages.x86_64-linux.ocaml-ng.ocamlPackages_5_5;
+          packages = %s;
         in builtins.mapAttrs (_: d: {
           inherit (d) name system drvPath outputs;
           outputPaths = builtins.listToAttrs (map
             (output: { name = output; value = d.${output}.outPath; }) d.outputs);
-        }) { inherit (p) fmt astring topkg; }""" % json.dumps(reference)
+        }) packages""" % (json.dumps(reference), packages)
         output, _ = self.run("resolve-packages", ["nix", "eval", "--json", "--expr", expression])
         self.packages = json.loads(output)
         self.withheld = {package["drvPath"] for package in self.packages.values()}
         self.withheld_paths = {path for package in self.packages.values()
                                for path in package["outputPaths"].values()}
         output, _ = self.run("read-recipes", ["nix", "derivation", "show", "--recursive",
-                            self.packages["fmt"]["drvPath"], self.packages["astring"]["drvPath"]])
+                            *[self.packages[name]["drvPath"] for name in self.root_names]])
         self.graph = normalize_graph(json.loads(output))
-        topkg = self.packages["topkg"]["drvPath"]
-        for name in ["fmt", "astring"]:
-            require(topkg in self.graph[self.packages[name]["drvPath"]]["inputs"],
-                    name + " no longer directly consumes the exact topkg derivation")
+        shared = self.packages[self.shared_name]["drvPath"]
+        for name in self.root_names:
+            require(shared in self.graph[self.packages[name]["drvPath"]]["inputs"],
+                    name + " no longer directly consumes the exact " + self.shared_name + " derivation")
         boundary = {self.graph[dependency]["outputs"][output]
                                 for drv in self.withheld
                                 for dependency, outputs in self.graph[drv]["inputs"].items()
@@ -212,10 +275,12 @@ class Benchmark:
         self.fixture.mkdir()
         (self.fixture / "flake.nix").write_text("""{
           outputs = _: let
-            p = (builtins.getFlake %s).legacyPackages.x86_64-linux.ocaml-ng.ocamlPackages_5_5;
-          in { fmt.package = p.fmt; astring.package = p.astring; };
+            f = builtins.getFlake %s;
+            p = %s;
+          in { %s };
         }
-        """ % json.dumps(reference))
+        """ % (json.dumps(reference), packages,
+                 " ".join(name + ".package = p." + name + ";" for name in self.root_names)))
         self.summary.update(nixOverlays=source, packages=self.packages, boundaryPaths=self.boundary,
                             resolutionSeconds=time.time() - started)
         write_json(self.directory / "packages.json", self.packages)
@@ -290,7 +355,7 @@ class Benchmark:
         _, timing = self.run("plan-" + name, [self.executable, "--plan-sets", str(sets),
                              "--copy-from", self.seed.as_uri(), "--report-dir", str(directory)])
         manifest = read_json(directory / "execution-plan.json")
-        expected = {self.packages[package]["drvPath"] for package in packages} | {self.packages["topkg"]["drvPath"]}
+        expected = {self.packages[package]["drvPath"] for package in packages} | {self.packages[self.shared_name]["drvPath"]}
         groups = manifest["plan"]["groups"]
         members = [drv for group in groups for drv in group["members"]]
         require(set(members) == expected and len(members) == len(expected),
@@ -301,7 +366,7 @@ class Benchmark:
         shared = [group for group in groups if group["kind"] == "shared"]
         require((len(packages) == 1 and not shared and len(groups) == 1)
                 or (len(packages) == 2 and len(shared) == 1 and len(groups) == 3
-                    and shared[0]["members"] == [self.packages["topkg"]["drvPath"]]),
+                    and shared[0]["members"] == [self.packages[self.shared_name]["drvPath"]]),
                 "Unexpected ownership shape; refusing an unbounded comparison")
         return {"name": name, "directory": directory, "groups": groups,
                 "planningSeconds": timing["durationSeconds"]}
@@ -371,8 +436,8 @@ class Benchmark:
     def compare(self):
         self.resolve()
         self.seed_cache()
-        independent = [self.plan(package, [package]) for package in ["fmt", "astring"]]
-        coordinated = self.plan("coordinated", ["fmt", "astring"])
+        independent = [self.plan(package, [package]) for package in self.root_names]
+        coordinated = self.plan("coordinated", self.root_names)
         independent_caches = [new_cache(self.directory / "output-caches" / plan["name"])
                               for plan in independent]
         shared_cache = new_cache(self.directory / "output-caches" / "coordinated")
@@ -390,12 +455,12 @@ class Benchmark:
                        for group in coordinated["groups"] if group["kind"] == "package"]
             coordinated_results += [future.result() for future in futures]
         coordinated_wall = time.time() - started
-        expected_roots = {self.packages[name]["drvPath"]: 1 for name in ["fmt", "astring"]}
-        for name, results, expected_topkg in [("independent", independent_results, 2),
+        expected_roots = {self.packages[name]["drvPath"]: 1 for name in self.root_names}
+        for name, results, expected_shared in [("independent", independent_results, 2),
                                               ("coordinated", coordinated_results, 1)]:
             observed = collections.Counter(build["drvPath"] for result in results for build in result["builds"])
             expected = collections.Counter(expected_roots)
-            expected[self.packages["topkg"]["drvPath"]] = expected_topkg
+            expected[self.packages[self.shared_name]["drvPath"]] = expected_shared
             require(observed == expected, "Observed comparison differs from expected duplication: " + repr(observed))
             self.summary[name] = {"workers": results, "observedBuildCounts": dict(observed),
                 "buildCount": sum(observed.values()),
@@ -421,7 +486,7 @@ class Benchmark:
         if error:
             lines += ["The bounded experiment stopped: `%s`" % str(error).replace("`", "'"), ""]
         if "independent" in self.summary:
-            lines += ["Unmodified `fmt` and `astring` from the repository's locked nix-overlays; only those roots and `topkg` were missing.", "",
+            lines += [self.description, "",
                       "| Observed metric | Independent stores | Coordinated stores |",
                       "| --- | ---: | ---: |"]
             for label, field, unit in [("Derivations built", "buildCount", ""),
@@ -437,6 +502,11 @@ class Benchmark:
 
 
 def self_test():
+    assert immutable_reference("github:nix-ocaml/nix-overlays/" + "a" * 40)
+    assert immutable_reference("path:/nix/store/" + "a" * 32 + "-source")
+    assert not immutable_reference("github:nix-ocaml/nix-overlays/master")
+    assert not immutable_reference("path:/tmp/checkout")
+    assert not immutable_reference("path:/nix/store/" + "a" * 32 + "-source/../checkout")
     legacy = {"/nix/store/a-root.drv": {
         "name": "root", "system": "x86_64-linux", "inputDrvs": {},
         "outputs": {"out": {"path": "/nix/store/a-root"}},
@@ -481,6 +551,9 @@ def main():
     parser.add_argument("--directory", type=Path)
     parser.add_argument("--copy-from", action="append", dest="caches")
     parser.add_argument("--max-seed-bytes", type=int, default=2 * 1024 ** 3)
+    parser.add_argument("--scenario", choices=["fmt-astring", "musl-lwt"], default="fmt-astring")
+    parser.add_argument("--nix-overlays-ref", help="Full GitHub commit or immutable path:/nix/store source")
+    parser.add_argument("--deadline-seconds", type=float)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
@@ -489,8 +562,17 @@ def main():
     require(platform.system() == "Linux", "Real package builds require Linux chroot stores")
     require(args.executable and args.executable.is_file(), "Pass a built nix-ci-build executable")
     require(args.directory is not None, "Pass --directory to retain all experiment evidence")
+    require(not args.nix_overlays_ref or immutable_reference(args.nix_overlays_ref),
+            "The nix-overlays reference must be a full commit or an immutable store snapshot")
+    require(args.deadline_seconds is None or args.deadline_seconds > 0, "Deadline must be positive")
+    if args.scenario == "musl-lwt":
+        require(args.nix_overlays_ref, "musl-lwt requires an explicit immutable nix-overlays reference")
+        args.deadline_seconds = min(args.deadline_seconds or 1200, 1200)
+        require(args.max_seed_bytes <= 2 * 1024 ** 3, "musl-lwt has a fixed 2 GiB seed ceiling")
     args.directory.mkdir(parents=True, exist_ok=False)
-    benchmark = Benchmark(args.executable, args.directory, args.caches or DEFAULT_CACHES, args.max_seed_bytes)
+    benchmark = Benchmark(args.executable, args.directory, args.caches or DEFAULT_CACHES, args.max_seed_bytes,
+                          scenario=args.scenario, overlays_ref=args.nix_overlays_ref,
+                          deadline_seconds=args.deadline_seconds)
     try:
         benchmark.compare()
     except Exception as error:
