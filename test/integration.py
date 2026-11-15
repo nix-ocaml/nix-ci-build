@@ -32,6 +32,27 @@ def store_path(name, kind="out"):
     return "/nix/store/" + digest + "-" + name + (".drv" if kind == "drv" else "")
 
 
+def read_jsonl(path, process=None):
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return []
+    if process is not None:
+        if process.poll() is None:
+            # A writer can be between writes, even within one UTF-8 character.
+            # Only the final, unterminated record is deferred; malformed
+            # newline-terminated records must still fail immediately.
+            data = data[:data.rfind(b"\n") + 1]
+        else:
+            # The process may have finished after our first read. Validate its
+            # final file rather than mistaking that earlier snapshot for EOF.
+            data = path.read_bytes()
+    lines = data.split(b"\n")
+    if lines[-1] == b"":
+        lines.pop()
+    return [json.loads(line.decode("utf-8")) for line in lines]
+
+
 class Fixture:
     def __init__(self, directory):
         self.directory = Path(directory)
@@ -42,6 +63,7 @@ class Fixture:
         self.summary = self.directory / "summary.md"
         self.bin = self.directory / "bin"
         self.invocation = 0
+        self.process = None
         self.bin.mkdir()
         # An explicit interpreter also works in a Nix sandbox without /usr/bin/env.
         for name in ("nix", "nix-eval-jobs", "nix-store"):
@@ -161,8 +183,7 @@ class Fixture:
         return json.loads((self.directory / "state.json").read_text())
 
     def trace(self):
-        path = self.directory / "trace.jsonl"
-        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+        return read_jsonl(self.directory / "trace.jsonl", self.process)
 
     def commands(self, command):
         return [
@@ -178,8 +199,81 @@ class Fixture:
         )
 
     def events(self):
-        path = self.report / "events.jsonl"
-        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+        return read_jsonl(self.report / "events.jsonl", self.process)
+
+
+class JsonlReaders(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="nix-ci-jsonl-test-")
+        self.addCleanup(self.temporary.cleanup)
+        self.fixture = Fixture(self.temporary.name)
+        self.fixture.report.mkdir()
+
+    def readers(self):
+        f = self.fixture
+        return [(f.directory / "trace.jsonl", f.trace), (f.report / "events.jsonl", f.events)]
+
+    def test_live_partial_record_is_read_after_the_writer_completes_it(self):
+        # Use a real writer and explicit handshakes rather than hoping that a
+        # poll happens between two writes. Split a UTF-8 character as well.
+        writer = r'''
+from pathlib import Path
+import sys
+with Path(sys.argv[1]).open("wb", buffering=0) as output:
+    output.write(b'{"kind":"ready"}\n{"kind":"caf\xc3')
+    print("partial", flush=True)
+    sys.stdin.buffer.readline()
+    output.write(b'\xa9"}')
+    print("unterminated", flush=True)
+    sys.stdin.buffer.readline()
+    output.write(b'\n')
+'''
+        for path, reader in self.readers():
+            with self.subTest(path=path.name), subprocess.Popen(
+                [sys.executable, "-c", writer, str(path)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            ) as process:
+                self.fixture.process = process
+                try:
+                    self.assertEqual(process.stdout.readline(), b"partial\n")
+                    self.assertEqual(reader(), [{"kind": "ready"}])
+                    process.stdin.write(b"continue\n")
+                    process.stdin.flush()
+                    self.assertEqual(process.stdout.readline(), b"unterminated\n")
+                    self.assertEqual(reader(), [{"kind": "ready"}])
+                    process.stdin.write(b"finish\n")
+                    process.stdin.flush()
+                    self.assertEqual(process.wait(timeout=5), 0)
+                    self.assertEqual(reader(), [{"kind": "ready"}, {"kind": "café"}])
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait(timeout=5)
+
+    def test_live_readers_reject_malformed_complete_records(self):
+        with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE) as process:
+            self.fixture.process = process
+            try:
+                for path, reader in self.readers():
+                    for record in [b'{"broken":}\n', b'{"kind":"one"}{"kind":"two"}\n', b'\n']:
+                        with self.subTest(path=path.name, record=record):
+                            path.write_bytes(b'{"kind":"ready"}\n' + record + b'{"partial":')
+                            with self.assertRaises(json.JSONDecodeError):
+                                reader()
+            finally:
+                process.stdin.close()
+                process.wait(timeout=5)
+
+    def test_finished_readers_reject_incomplete_records(self):
+        process = subprocess.Popen([sys.executable, "-c", "pass"])
+        process.wait(timeout=5)
+        self.fixture.process = process
+        for path, reader in self.readers():
+            for ending in [b'{"partial":', b'{"broken":}\n', b'{"partial":"\xc3']:
+                with self.subTest(path=path.name, ending=ending):
+                    path.write_bytes(b'{"kind":"ready"}\n' + ending)
+                    with self.assertRaises((json.JSONDecodeError, UnicodeDecodeError)):
+                        reader()
 
 
 class Integration(unittest.TestCase):
@@ -306,6 +400,7 @@ class Integration(unittest.TestCase):
                 f.command(*args), env=f.env(), stdout=log, stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
+            f.process = process
             try:
                 yield process, log
             finally:
