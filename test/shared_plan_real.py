@@ -22,6 +22,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import tempfile
 import time
@@ -73,6 +74,7 @@ class RealFixture:
                     "substituters =",
                     "require-sigs = false",
                     "narinfo-cache-negative-ttl = 0",
+                    "narinfo-cache-positive-ttl = 0",
                     "max-jobs = 1",
                     "cores = 1",
                     "",
@@ -113,18 +115,36 @@ class RealFixture:
             if self.logical_store.exists():
                 self.logical_store.rename(directory / "store")
 
-    def run(self, label, command, environment, expect_success=True):
+    def run(self, label, command, environment, expect_success=True, interrupt_when=None):
         self.counter += 1
         prefix = self.logs / ("%02d-%s" % (self.counter, label))
         started = time.monotonic()
-        result = subprocess.run(
-            command,
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=120,
-        )
+        if interrupt_when is None:
+            result = subprocess.run(
+                command,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=120,
+            )
+        else:
+            process = subprocess.Popen(
+                command, env=environment, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
+            )
+            try:
+                deadline = time.monotonic() + 20
+                while not interrupt_when.exists() and process.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                check(interrupt_when.exists(), "worker must reach the cancellation checkpoint")
+                process.terminate()
+                stdout, stderr = process.communicate(timeout=15)
+                result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
         prefix.with_suffix(".stdout").write_text(result.stdout)
         prefix.with_suffix(".stderr").write_text(result.stderr)
         self.commands.append(
@@ -150,13 +170,16 @@ class RealFixture:
             self.ledger.read_text().splitlines() if self.ledger.exists() else []
         )
 
-    def execute(self, name, group, plan=None, expect_success=True, cache=None, environment=None):
+    def execute(self, name, group, plan=None, expect_success=True, cache=None, environment=None, interrupt_when=None, expected_status=None):
         report = self.directory / "reports" / name
         store = (
             self.store(name, worker=True)
             if environment is None else contextlib.nullcontext(environment)
         )
         with store as environment:
+            environment = dict(environment)
+            environment["NIX_CI_BUILD_RUN_ID"] = "real-integration"
+            environment["NIX_CI_BUILD_ATTEMPT_ID"] = name
             result = self.run(
                 name,
                 [
@@ -173,19 +196,53 @@ class RealFixture:
                 ],
                 environment,
                 expect_success=expect_success,
+                interrupt_when=interrupt_when,
             )
         check(
             not self.evaluator_invocations.exists(),
             "prepared worker must not invoke the evaluator, including --version",
         )
+        execution = read_json(report / "execution.json")
+        self.check_execution_events(report, execution, name, expect_success, expected_status)
         if expect_success:
-            execution = read_json(report / "execution.json")
             check(execution["status"] == "success", name + " must publish successfully")
             results = read_json(report / "results.json")
             check(results["status"] == "success", name + " build results must succeed")
             return execution, results
-        error = read_json(report / "execution-error.json")
+        error_path = report / "execution-error.json"
+        error = read_json(error_path) if error_path.exists() else execution
         return error, result
+
+    def check_execution_events(self, report, execution, name, expect_success, expected_status=None):
+        events = [json.loads(line) for line in (report / "execution-events.jsonl").read_text().splitlines()]
+        check(events and events[0]["type"] == "attempt_start", name + " must start an attempt")
+        check(events[-1]["type"] == "attempt_finish", name + " must finish its attempt")
+        check(events[-1]["status"] == (expected_status or ("success" if expect_success else "failed")), name + " terminal status must match")
+        check([event["sequence"] for event in events] == list(range(1, len(events) + 1)), "attempt event sequence must increase")
+        check([event["elapsed"] for event in events] == sorted(event["elapsed"] for event in events), "attempt timing must be monotonic")
+        check(execution["runId"] == "real-integration" and execution["attemptId"] == name, "worker must honor explicit execution identity")
+        check(execution["finishedAt"] >= execution["startedAt"], "execution must retain complete timing context")
+        for event in events:
+            check(event["version"] == 1, "execution events need a schema version")
+            for key in ["planId", "runId", "groupId", "attemptId"]:
+                check(event[key] == execution[key], "event identity must match execution: " + key)
+        started = [event["phase"] for event in events if event["type"] == "phase_start"]
+        finished = [event["phase"] for event in events if event["type"] == "phase_finish"]
+        check(started == finished, name + " must close every started phase")
+        if expect_success:
+            check(started == ["import_plan", "refresh_cache", "import_prerequisites", "build", "publish"], "worker must trace all orchestration phases")
+        for event in events:
+            if event["type"] in ["phase_finish", "attempt_finish"]:
+                check(event["durationSeconds"] >= 0, "phase durations must be nonnegative")
+        engine_events = report / "events.jsonl"
+        if engine_events.exists():
+            for line in engine_events.read_text().splitlines():
+                event = json.loads(line)
+                for key in ["planId", "runId", "groupId", "attemptId"]:
+                    check(event[key] == execution[key], "engine event identity must match execution: " + key)
+
+    def narinfo(self, path):
+        return self.cache / (Path(path).name.split("-", 1)[0] + ".narinfo")
 
     def no_substitute_scenario(self, fixture, system):
         baseline = self.builds()
@@ -377,12 +434,105 @@ class RealFixture:
         check(self.builds() == expected, "independent workers must build the compiler and each private branch once")
 
         for index, group in enumerate([shared] + packages):
-            _, results = self.execute("cached-rerun-%d" % index, group)
+            execution, results = self.execute("cached-rerun-%d" % index, group)
             check(self.builds() == expected, "cached reruns in fresh stores must not rebuild any owned output")
+            check(not execution["imported"], "cached roots must skip prerequisite and runtime-closure downloads")
             check(
                 results["jobs"] and all(job["state"] == "cached" for job in results["jobs"]),
                 "cached worker roots must be reported as reused",
             )
+
+        # The immutable plan still lists compiler outputs, but a newly cached
+        # root needs neither its compiler nor its build-only dependency chain.
+        # Remove those outputs completely from the cache before retrying.
+        compiler_paths = list(manifest["graph"][shared["members"][0]]["outputs"].values())
+        hidden_compiler = {}
+        for path in compiler_paths:
+            metadata = self.narinfo(path)
+            hidden_compiler[metadata] = metadata.read_bytes()
+            metadata.unlink()
+        native = next(group for group in packages if group["consumers"] == ["native"])
+        execution, results = self.execute("cached-root-obsolete-boundary", native)
+        check(self.builds() == expected, "a cached package must not rebuild its vanished prerequisite")
+        check(execution["plannedPrerequisites"] and not execution["requiredPrerequisites"], "refresh must prune the original prerequisite list")
+        check(not execution["imported"], "obsolete compiler paths must never be imported")
+        check(all(job["state"] == "cached" for job in results["jobs"]), "cached root should remain reported as reused")
+        for path in compiler_paths:
+            check(not (self.directory / "workers" / "cached-root-obsolete-boundary" / "store" / Path(path).name).exists(), "cached-root worker must not materialize its compiler")
+
+        # A cached private intermediate cuts the same build-only dependency
+        # chain even when the requested package itself still needs building.
+        native_root = manifest["graph"][native["roots"][0]["drvPath"]]
+        native_output = native_root["outputs"]["out"]
+        self.narinfo(native_output).unlink()
+        execution, results = self.execute("cached-intermediate-obsolete-boundary", native)
+        expected["native-consumer"] += 1
+        check(self.builds() == expected, "only the root above a cached private branch should build")
+        check(not execution["requiredPrerequisites"], "a cached private branch must prune external prerequisites")
+        check(execution["imported"] and not set(execution["imported"]) & set(compiler_paths), "worker must import the private cache cut without the compiler")
+        check(execution["refreshedBuilds"] == [native["roots"][0]["drvPath"]], "refresh must identify only the live owned root")
+        for metadata, content in hidden_compiler.items():
+            metadata.write_bytes(content)
+
+        # Selected outputs are separate obligations. A cached `out` must not
+        # erase the missing `dev` required by the cross consumer.
+        compiler = manifest["graph"][shared["members"][0]]
+        self.narinfo(compiler["outputs"]["dev"]).unlink()
+        execution, _ = self.execute("shared-missing-selected-output", shared)
+        expected["opaque-shared-tool"] += 1
+        check(self.builds() == expected, "a missing selected boundary output must still build")
+        check(set(execution["published"]) == set(compiler_paths), "both selected outputs must remain publication obligations")
+        check(execution["refreshedBuilds"] == shared["members"], "cached sibling output must not prune its producer")
+
+        # Lose the remote root after orchestration has refreshed its cache cut,
+        # immediately before the engine starts. Dispatch must refuse an unowned
+        # fallback build; this is a deliberate race, not an ordinary cache miss.
+        race_bin = self.directory / "race-bin"
+        race_bin.mkdir()
+        wrapper = race_bin / "nix"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            'if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then\n'
+            "  /bin/rm -f " + shlex.quote(str(self.narinfo(native_output))) + "\n"
+            "fi\n"
+            "exec " + shlex.quote(shutil.which("nix")) + ' "$@"\n'
+        )
+        wrapper.chmod(0o755)
+        native_metadata = self.narinfo(native_output).read_bytes()
+        with self.store("root-cache-dispatch-race", worker=True) as environment:
+            environment["PATH"] = str(race_bin) + os.pathsep + environment["PATH"]
+            execution, _ = self.execute(
+                "root-cache-dispatch-race", native, environment=environment,
+                expect_success=False,
+            )
+        self.narinfo(native_output).write_bytes(native_metadata)
+        check(self.builds() == expected, "cache disappearance must not dispatch an unowned fallback build")
+        check(not execution["requiredPrerequisites"], "race must happen after a cached-root refresh pruned prerequisites")
+        race_results = read_json(self.directory / "reports" / "root-cache-dispatch-race" / "results.json")
+        check("Refusing to build another group's dependencies" in json.dumps(race_results), "dispatch guard must explain the ownership failure")
+
+        cancel_bin = self.directory / "cancel-bin"
+        cancel_bin.mkdir()
+        checkpoint = self.directory / "cancellation-checkpoint"
+        wrapper = cancel_bin / "nix"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            'if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then\n'
+            "  : > " + shlex.quote(str(checkpoint)) + "\n"
+            "  exec /bin/sleep 30\n"
+            "fi\n"
+            "exec " + shlex.quote(shutil.which("nix")) + ' "$@"\n'
+        )
+        wrapper.chmod(0o755)
+        with self.store("cancelled-worker", worker=True) as environment:
+            environment["PATH"] = str(cancel_bin) + os.pathsep + environment["PATH"]
+            execution, result = self.execute(
+                "cancelled-worker", native, environment=environment,
+                expect_success=False, interrupt_when=checkpoint,
+                expected_status="cancelled",
+            )
+        check(result.returncode == 130 and execution["status"] == "cancelled", "worker cancellation must retain its distinct terminal status")
+        check(self.builds() == expected, "cancelled worker must start no fixture builders")
 
         # A separate empty cache simulates an expired/missing boundary after the
         # shared job has completed. A fresh package worker must still fail closed.
@@ -431,6 +581,10 @@ class RealFixture:
                 "sharedGroups": 1,
                 "packageGroups": 2,
                 "nonSubstitutableRootBuilds": 2,
+                "obsoletePrerequisiteChecks": 2,
+                "selectedOutputChecks": 1,
+                "dispatchRaceChecks": 1,
+                "cancellationChecks": 1,
                 "isolatedStores": len(list((self.directory / "workers").iterdir())),
             },
         )

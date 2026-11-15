@@ -67,6 +67,28 @@ execution commands, cache requirements, and current limits. The
 [GitHub Actions demo](.github/workflows/shared-plan-demo.yml) runs a small fixture
 on separate runners and verifies that its shared tool is built once.
 
+Plans can also run locally without GitHub runner labels:
+
+```sh
+nix-ci-build --run-plan shared-plan --workers 2 \
+  --copy-from file:///tmp/build-cache --copy-from https://cache.example.org \
+  --copy-to file:///tmp/build-cache \
+  --report-dir workers
+```
+
+The local adapter dispatches each group when its own prerequisites succeed and
+saves a combined interactive report at `workers/aggregate/index.html`. Combine
+reports downloaded from CI with the same renderer:
+
+```sh
+nix-ci-build --aggregate-plan shared-plan --reports downloaded-reports \
+  --report-dir aggregate
+```
+
+The aggregate report retains attempts, dependency relationships, and worker
+phases including imports and publication. It can be opened locally and needs
+no external assets. Missing reports remain visibly incomplete.
+
 ## Understanding progress
 
 A compact plan summarizes the work, followed by new requests, actual builds,
