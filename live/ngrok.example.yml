@@ -1,0 +1,10 @@
+version: 3
+# Credentials belong in your private ngrok config or NGROK_AUTHTOKEN.
+agent: {}
+endpoints:
+  - name: nix-ci-build
+    # Omit url to use your account's dev domain, or set your reserved domain:
+    # url: https://build-events.example.ngrok.app
+    upstream:
+      url: http://127.0.0.1:50051
+      protocol: http2

@@ -172,6 +172,11 @@ report directory always keeps its own `summary.md`.
 
 ## GitHub Actions
 
+The [custom action and live visualizer](docs/live-reporting.md) add a local
+workflow dashboard with commit/PR context, dynamic matrix progress, and build
+waterfalls. Runner uploads use authenticated gRPC/protobuf; the existing report
+artifacts and console output remain available.
+
 Actions logs use colored status labels, short expandable plan and failure
 groups, and error annotations that point to the cause of a failure. Set
 `NO_COLOR` to disable colors. Groups are emitted as complete blocks so output
