@@ -376,6 +376,53 @@ let test_substitution_policy () =
     ; [ "env", `Assoc [ "__json", `String "{" ] ]
     ]
 
+let test_non_substitutable_outputs () =
+  let graph =
+    Plan.of_nodes
+      [ node "root" ~allow_substitutes:false ~inputs:[ edge "compiler" ]
+      ; node "compiler"
+      ; node "consumer" ~inputs:[ edge "root" ]
+      ]
+  in
+  let remote = available [ out "root", cached () ] in
+  let plan = Plan.compute graph ~roots:[ edge "root" ] ~availability:remote in
+  check
+    (build_names plan = [ "compiler"; "root" ] && plan.downloads = [])
+    "a remote hit must not substitute a root that disables substitution";
+  check
+    (build_names
+       (Plan.compute graph ~roots:[ edge "consumer" ] ~availability:remote)
+    = [ "compiler"; "consumer"; "root" ])
+    "non-substitutable dependencies must keep their build inputs reachable";
+  check
+    (Plan.explain
+       graph
+       ~availability:remote
+       ~root:(edge "root")
+       ~target:(drv "compiler")
+    = Some [ drv "root"; drv "compiler" ])
+    "explanations must include inputs behind a forbidden substitute";
+  check
+    (Plan.failed_ancestors
+       graph
+       ~availability:remote
+       ~root:(edge "root")
+       ~failed:[ drv "compiler" ]
+    = [ drv "compiler" ])
+    "a forbidden substitute cannot bypass a failed build input";
+  let local = available [ out "root", Plan.Local ] in
+  let plan = Plan.compute graph ~roots:[ edge "root" ] ~availability:local in
+  check
+    (plan.builds = []
+    && plan.downloads = []
+    && plan.local_outputs = [ out "root" ])
+    "a valid local output satisfies a non-substitutable root";
+  check
+    (build_names
+       (Plan.compute graph ~roots:[ edge "consumer" ] ~availability:local)
+    = [ "consumer" ])
+    "explicitly imported local boundary outputs must remain reusable"
+
 let test_incomplete_and_cyclic_graph () =
   let graph = Plan.of_nodes [ node "root" ~inputs:[ edge "absent" ] ] in
   let plan = Plan.compute graph ~roots:[ edge "root" ] ~availability:missing in
@@ -502,6 +549,7 @@ let () =
   test_priority_and_aging ();
   test_json_formats ();
   test_substitution_policy ();
+  test_non_substitutable_outputs ();
   test_incomplete_and_cyclic_graph ();
   test_reused_ranking_plans ();
   test_snapshot_and_merge ();

@@ -140,8 +140,13 @@ let substituters process_mgr =
   String.split_on_char ~sep:' ' (String.trim r.stdout)
   |> List.filter ~f:(fun s -> s <> "")
 
+let store_prefix () =
+  Filename.concat
+    (Option.value (Sys.getenv_opt "NIX_STORE_DIR") ~default:"/nix/store")
+    ""
+
 let normalize_path path =
-  if String.starts_with ~prefix:"/" path then path else "/nix/store/" ^ path
+  if String.starts_with ~prefix:"/" path then path else store_prefix () ^ path
 
 let path_info_fields = function
   | `List xs -> List.map xs ~f:(fun j -> Json.string (Json.member "path" j), j)
@@ -165,7 +170,7 @@ let path_infos json =
           } ))
 
 let missing_diagnostic line =
-  String.starts_with ~prefix:"error: path '/nix/store/" line
+  String.starts_with ~prefix:("error: path '" ^ store_prefix ()) line
   && String.ends_with ~suffix:"' is not valid" line
 
 let query_noise line =
@@ -174,7 +179,7 @@ let query_noise line =
        ~prefix:"warning: '--json' without '--json-format' is deprecated"
        line
   || line = "don't know how to build these paths:"
-  || String.starts_with ~prefix:"/nix/store/" line
+  || String.starts_with ~prefix:(store_prefix ()) line
   || missing_diagnostic line
   || ((String.starts_with ~prefix:"this " line
       || String.starts_with ~prefix:"these " line)
@@ -376,18 +381,40 @@ let path_info process_mgr ?log_dir ?store ?(fresh = false) paths =
         in
         infos @ recovered, warning
 
-let graph process_mgr drvs =
+let graph process_mgr ?(recursive = true) drvs =
   let json, result =
     query_json
       process_mgr
       ~input:(String.concat ~sep:"\n" drvs ^ "\n")
-      [ "derivation"; "show"; "--recursive"; "--stdin" ]
+      ([ "derivation"; "show"; "--stdin" ]
+      @ if recursive then [ "--recursive" ] else [])
   in
   if not (successful result)
   then failwith ("Cannot read derivation graph: " ^ error result);
   match Plan.of_yojson json with Ok graph -> graph | Error e -> failwith e
 
-let build process_mgr ~log_path ~on_stderr drvs =
+let edge_installable (edge : Plan.edge) =
+  let edge =
+    { Plan.drv_path = Plan.normalize_drv_path edge.drv_path
+    ; outputs = List.sort_uniq ~cmp:String.compare edge.outputs
+    }
+  in
+  if edge.outputs = []
+  then invalid_arg "A build request must select at least one output";
+  edge.drv_path
+  ^ "^"
+  ^
+  if List.mem "*" ~set:edge.outputs
+  then "*"
+  else String.concat ~sep:"," edge.outputs
+
+let build_edges process_mgr ?substituters ~log_path ~on_stderr edges =
+  let cache_options =
+    match substituters with
+    | None -> []
+    | Some stores ->
+      [ "--option"; "substituters"; String.concat ~sep:" " stores ]
+  in
   run
     process_mgr
     ~capture:false
@@ -401,7 +428,15 @@ let build process_mgr ~log_path ~on_stderr drvs =
         ; "internal-json"
         ; "-L"
         ]
-       @ List.map drvs ~f:(fun drv -> drv ^ "^*")))
+       @ cache_options
+       @ List.map edges ~f:edge_installable))
+
+let build process_mgr ~log_path ~on_stderr drvs =
+  build_edges
+    process_mgr
+    ~log_path
+    ~on_stderr
+    (List.map drvs ~f:(fun drv_path -> { Plan.drv_path; outputs = [ "*" ] }))
 
 let copy process_mgr ?(append = false) ~log_path ~destination path =
   run
@@ -433,13 +468,48 @@ let copy_from process_mgr ~log_path ~source paths =
        ])
 
 let pin process_mgr ~root path =
-  let r =
-    run
-      process_mgr
-      [ "nix-store"; "--add-root"; root; "--indirect"; "--realise"; path ]
+  let is_derivation = String.ends_with ~suffix:".drv" path in
+  let args =
+    if is_derivation
+    then
+      (* A bare store-path installable denotes the derivation file itself.
+         nix-store --realise would instead build its outputs, outside the
+         scheduler and before shared-plan ownership checks could protect
+         them. *)
+      nix [ "build"; "--out-link"; root; path ]
+    else [ "nix-store"; "--add-root"; root; "--indirect"; "--realise"; path ]
   in
+  let r = run process_mgr args in
   if not (successful r)
-  then failwith ("Cannot protect cache output from GC: " ^ error r)
+  then
+    failwith
+      ("Cannot protect "
+      ^ (if is_derivation then "derivation" else "cache output")
+      ^ " from GC: "
+      ^ error r)
+
+let pin_derivations process_mgr ~root drvs =
+  let rec take remaining taken = function
+    | rest when remaining = 0 -> List.rev taken, rest
+    | [] -> List.rev taken, []
+    | path :: rest -> take (remaining - 1) (path :: taken) rest
+  in
+  let rec loop index = function
+    | [] -> ()
+    | paths ->
+      let batch, rest = take 128 [] paths in
+      let root = root ^ "-batch-" ^ string_of_int index in
+      (* Nix creates one indirect root per raw derivation installable. Batching
+         keeps a large package set from launching a subprocess for every
+         root. *)
+      let result =
+        run process_mgr (nix ([ "build"; "--out-link"; root ] @ batch))
+      in
+      if not (successful result)
+      then failwith ("Cannot protect derivations from GC: " ^ error result);
+      loop (index + 1) rest
+  in
+  loop 0 (List.sort_uniq ~cmp:String.compare drvs)
 
 let transient lines =
   let message = String.lowercase_ascii (String.concat ~sep:"\n" lines) in
