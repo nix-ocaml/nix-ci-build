@@ -434,6 +434,15 @@ class Integration(unittest.TestCase):
     def imports(self, snapshot):
         return snapshot.get("cacheReuse", [])
 
+    def wait_for_import_failures(self, process, drv, count):
+        # The mock's failure trace precedes child exit and runner bookkeeping.
+        # Releasing a build blocker before these events can cancel an import.
+        return self.observe_events(process, lambda events: sum(
+            event["type"] == "cache-import-finished"
+            and event["drvPath"] == drv and event["state"] == "failed"
+            for event in events
+        ) >= count)
+
     def test_cache_reuse_imports_dependency_published_during_running_request(self):
         f = self.fixture
         f.config["path_info_missing_output"] = "none"
@@ -594,7 +603,7 @@ class Integration(unittest.TestCase):
         with self.running_fixture("--cache-refresh", "0.05") as (process, log):
             self.wait_for_build(process, blocker)
             f.publish([f.output(target)])
-            self.observe_trace(process, lambda events: sum(event["kind"] == "import_failed" for event in events) >= 3)
+            self.wait_for_import_failures(process, target, 3)
             # A further refresh of another missing output proves that the follower
             # keeps running after exhausting this derivation's retry budget.
             before = len(f.trace())
@@ -660,15 +669,11 @@ class Integration(unittest.TestCase):
                 event["kind"] == "barrier_waiting" and event["name"] == "middle-cache"
                 for event in events
             ))
-            self.observe_events(process, lambda events: any(
-                entry["type"] == "cache-import-finished"
-                and entry["drvPath"] == target and entry["state"] == "failed"
-                for entry in events
-            ))
+            self.wait_for_import_failures(process, target, 1)
             # The first copy has failed while this same poll is querying its
             # middle source. The last source must not immediately relaunch it.
             f.release("middle-cache")
-            self.observe_trace(process, lambda events: sum(event["kind"] == "import_failed" for event in events) >= 3)
+            self.wait_for_import_failures(process, target, 3)
             f.release("blocker")
             snapshot = self.finish_successfully(process, log)
         self.assertEqual(f.state()["import_attempts"], 3)
@@ -742,6 +747,37 @@ class Integration(unittest.TestCase):
         self.assertEqual(f.state()["attempts"], {blocker: 1, target: 1, app: 1})
         self.assertEqual(f.state()["imported"], [])
         entry = next(entry for entry in self.imports(snapshot) if entry["drvPath"] == target)
+        self.assertEqual(entry["state"], "cancelled")
+
+    def test_cache_reuse_failure_trace_precedes_import_completion(self):
+        f = self.fixture
+        blocker, target, app = self.waiting_cache_target()
+        f.config["derivations"][target]["barrier"] = "target"
+        f.config["import"] = {"behavior": "fail", "exit_barrier": "import-exit"}
+        with self.running_fixture("--cache-refresh", "0.05") as (process, log):
+            self.wait_for_build(process, blocker)
+            f.publish([f.output(target)])
+            self.observe_trace(process, lambda events: any(
+                event["kind"] == "barrier_waiting" and event["name"] == "import-exit-1"
+                for event in events
+            ))
+            self.assertTrue(any(event["kind"] == "import_failed" for event in f.trace()))
+            self.assertFalse(any(event["type"] == "cache-import-finished" for event in f.events()))
+            # The failure marker is visible, but the child has not exited.
+            # Starting a local build must still cancel this optional import.
+            f.release("blocker")
+            self.wait_for_build(process, target)
+            self.observe_events(process, lambda events: any(
+                event["type"] == "cache-import-finished"
+                and event["drvPath"] == target and event["state"] == "cancelled"
+                for event in events
+            ))
+            f.release("target")
+            snapshot = self.finish_successfully(process, log)
+        self.assertEqual(f.state()["import_attempts"], 1)
+        self.assertEqual(f.state()["attempts"], {blocker: 1, target: 1, app: 1})
+        self.assertEqual(snapshot["rootFailures"], [])
+        entry, = self.imports(snapshot)
         self.assertEqual(entry["state"], "cancelled")
 
     def test_cache_reuse_cancels_unneeded_import_when_roots_finish(self):
