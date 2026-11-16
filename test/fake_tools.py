@@ -440,12 +440,18 @@ def import_paths(source, paths):
                 error += " (attempt %d)" % attempt
             print(error, file=sys.stderr)
             record("import_failed", paths=paths, source=source)
-            return 1
-        with state() as current:
-            current["local"] = sorted(set(current["local"] + paths))
-            current["imported"] = sorted(set(current.get("imported", []) + paths))
-        record("import_finished", paths=paths, source=source)
-    return 0
+            result = 1
+        else:
+            with state() as current:
+                current["local"] = sorted(set(current["local"] + paths))
+                current["imported"] = sorted(set(current.get("imported", []) + paths))
+            record("import_finished", paths=paths, source=source)
+            result = 0
+    # Let a local builder acquire the output locks while this child is still
+    # alive, even after it has written its final trace record.
+    if options.get("exit_barrier"):
+        barrier("%s-%d" % (options["exit_barrier"], attempt))
+    return result
 
 
 def evaluate():
