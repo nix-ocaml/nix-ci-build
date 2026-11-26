@@ -2007,10 +2007,7 @@ let run config env =
          t.uploads;
        if
          t.status <> "cancelled"
-         && (t.eval_errors <> []
-            || Hashtbl.length t.failures <> 0
-            || List.exists (values t.uploads) ~f:(fun (u : upload) ->
-              u.state = "failed"))
+         && (t.eval_errors <> [] || Hashtbl.length t.failures <> 0)
        then t.status <- "failed";
        t.context <- ("finishedAt", `Float (now ())) :: t.context;
        event t "finished" [ "status", `String t.status ];

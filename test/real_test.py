@@ -273,8 +273,8 @@ def main():
 
     invalid_cache = directory / "not-a-directory"
     invalid_cache.write_text("cache uploads must fail here\n")
-    uploads, _ = build("upload-failure", "uploadFailure", "--copy-to", (invalid_cache / "cache").as_uri(), "--retries", "0", expected=1)
-    assert uploads["status"] == "failed", uploads
+    uploads, _ = build("upload-failure", "uploadFailure", "--copy-to", (invalid_cache / "cache").as_uri(), "--retries", "0")
+    assert uploads["status"] == "success", uploads
     assert uploads["rootFailures"] == [], uploads["rootFailures"]
     assert any(upload["state"] == "failed" for upload in uploads["uploads"])
     assert all(job["state"] in ("cached", "built") for job in uploads["jobs"])
