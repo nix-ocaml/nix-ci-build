@@ -1731,15 +1731,55 @@ class Integration(unittest.TestCase):
         for command in f.commands("copy"):
             self.assertFalse(any("^" in arg or arg.endswith(".drv") for arg in command["args"]))
 
-    def test_upload_failure_is_separate_from_successful_compilation(self):
+    def test_upload_failure_warns_without_failing_successful_compilation(self):
         f = self.fixture
         f.job("packages.app", f.node("app"))
         f.config["copy_failure"] = True
-        snapshot = self.failure(f.run("--copy-to", DESTINATION, "--retries", "0"))
-        self.assert_built(self.jobs_by_attr(snapshot)["packages.app"])
-        self.assertEqual(snapshot["rootFailures"], [])
-        self.assertTrue(any(upload["state"] == "failed" for upload in snapshot["uploads"]))
-        self.assertIn("upload", f.summary.read_text().lower())
+        for github_actions in (False, True):
+            with self.subTest(github_actions=github_actions):
+                env = f.env()
+                if github_actions:
+                    env["GITHUB_ACTIONS"] = "true"
+                result = f.run("--copy-to", DESTINATION, "--retries", "0", env=env)
+                snapshot = self.success(result)
+                self.assertEqual(snapshot["status"], "success")
+                self.assert_built(self.jobs_by_attr(snapshot)["packages.app"])
+                self.assertEqual(snapshot["rootFailures"], [])
+                upload, = snapshot["uploads"]
+                self.assertEqual(upload["state"], "failed")
+                self.assertIn("cache upload fixture failure", upload["error"])
+                self.assertIn("cache upload fixture failure", (f.report / upload["logPath"]).read_text())
+                self.assertTrue(any(event["type"] == "upload" and event.get("state") == "failed"
+                                    for event in f.events()))
+                self.assertIn("Build succeeded", f.summary.read_text())
+                self.assertIn("Upload failures", f.summary.read_text())
+                self.assertIn("1 cache sync failures", result.stdout)
+                lines = result.stdout.splitlines()
+                self.assertTrue(any(line.startswith("DONE ") for line in lines), result.stdout)
+                self.assertFalse(any(line.startswith(("FAIL ", "::error ")) for line in lines), result.stdout)
+                if github_actions:
+                    self.assertTrue(any(line.startswith("::warning ") and "cache upload fixture failure" in line
+                                        for line in lines), result.stdout)
+                else:
+                    self.assertTrue(any(line.startswith("WARN ") and "Cache sync failure" in line
+                                        for line in lines), result.stdout)
+
+    def test_upload_failure_does_not_hide_build_or_evaluation_failures(self):
+        f = self.fixture
+        for failure in ("build", "evaluation"):
+            with self.subTest(failure=failure):
+                f.config = {"jobs": [], "derivations": {}, "copy_failure": True}
+                f.job("packages.app", f.node("app"))
+                if failure == "build":
+                    f.job("packages.broken", f.node("broken", behavior="fail"))
+                else:
+                    f.config["jobs"].append({"attr": "packages.broken", "error": "fixture evaluation error"})
+                snapshot = self.failure(f.run("--copy-to", DESTINATION, "--retries", "0"))
+                self.assertEqual(snapshot["status"], "failed")
+                self.assert_built(self.jobs_by_attr(snapshot)["packages.app"])
+                self.assertTrue(any(upload["state"] == "failed" for upload in snapshot["uploads"]))
+                self.assertTrue(snapshot["rootFailures"] if failure == "build" else snapshot["evaluation"]["errors"])
+                self.assertIn("Build failed", f.summary.read_text())
 
     def test_full_logs_survive_and_summary_stays_bounded(self):
         f = self.fixture

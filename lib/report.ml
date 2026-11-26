@@ -608,6 +608,7 @@ let render_summary snapshot =
   if failed_uploads <> []
   then (
     section "Upload failures";
+    add "Upload failures are warnings and do not affect the build result.\n\n";
     table [ "Output path"; "Time"; "Error" ];
     List.iter (take 30 failed_uploads) ~f:(fun upload ->
       row
@@ -1156,6 +1157,7 @@ let render_failure_with_annotation
   let name = activity_name root |> shorten ~limit:300 |> clean_terminal in
   let message = diagnostic_message (text "message" root) in
   let title = failure_kind (text "kind" root) ^ " failure: " ^ name in
+  let warning = text "kind" root = "upload" in
   let logs =
     excerpt root
     |> clean_terminal
@@ -1188,7 +1190,7 @@ let render_failure_with_annotation
     let annotation =
       if annotation
       then
-        "::error title="
+        (if warning then "::warning title=" else "::error title=")
         ^ workflow_escape ~property:true title
         ^ "::"
         ^ workflow_escape ~property:false (error_cause (text "message" root))
@@ -1201,7 +1203,11 @@ let render_failure_with_annotation
     ^ "\n"
     ^ protected_log details
     ^ "::endgroup::\n"
-  else status_line ~color "FAIL" (single_line title) ^ "\n" ^ details ^ "\n"
+  else
+    status_line ~color (if warning then "WARN" else "FAIL") (single_line title)
+    ^ "\n"
+    ^ details
+    ^ "\n"
 
 let render_failure ~github_actions root =
   render_failure_with_annotation ~github_actions ~annotation:true root

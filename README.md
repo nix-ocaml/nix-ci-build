@@ -17,7 +17,8 @@ nix-ci-build \
 
 Add `--copy-to URL` to upload successful outputs to a binary cache. All outputs
 of a requested derivation are realized before copying. Upload failures are
-reported separately from failed builds and make the command fail.
+reported as warnings without failing the command. Build and evaluation failures
+still make the command fail; upload diagnostics remain in the report and logs.
 
 Evaluation completes before building begins. This lets the scheduler inspect the
 whole dependency graph, combine attribute aliases, and rank the work globally.
