@@ -367,7 +367,7 @@ def build(args):
         activity = next_activity()
         emit({"action": "start", "id": activity, "level": 3, "type": 111,
               "text": wait["reason"], "fields": [], "parent": 0})
-        time.sleep(wait["seconds"])
+        barrier(wait["barrier"])
         emit({"action": "stop", "id": activity})
     for download in CONFIG.get("runtime_downloads", []):
         path = download["path"]
