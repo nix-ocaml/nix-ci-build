@@ -1479,38 +1479,31 @@ class Integration(unittest.TestCase):
         f = self.fixture
         app = f.job("packages.app", f.node("app"))
         reason = "waiting for a free build slot"
-        f.config["request_wait"] = {"reason": reason, "seconds": 0.4}
-        f.prepare()
-        with (f.directory / "process.log").open("w+") as log:
-            process = subprocess.Popen(f.command(), env=f.env(), stdout=log, stderr=subprocess.STDOUT)
-            try:
-                snapshot = self.observe_snapshot(process, lambda current: bool(current.get("waits")))
-                self.assertEqual(len(snapshot["waits"]), 1)
-                wait = snapshot["waits"][0]
-                self.assertEqual(wait["reason"], reason)
-                self.assertEqual(wait["drvs"], [app])
-                self.assertGreaterEqual(wait["seconds"], 0)
-                self.assertEqual(self.jobs_by_attr(snapshot)["packages.app"]["state"], "submitted")
-                self.assertEqual(self.jobs_by_attr(snapshot)["packages.app"]["buildSeconds"], 0)
-                self.assertFalse(any(node["state"] == "building" for node in snapshot["derivations"]))
-                process.wait(timeout=10)
-            finally:
-                if process.poll() is None:
-                    process.kill()
-                    process.wait()
+        f.config["request_wait"] = {"reason": reason, "barrier": "request-wait"}
+        with self.running_fixture() as (process, log):
+            snapshot = self.observe_snapshot(process, lambda current: bool(current.get("waits")))
+            self.assertEqual(len(snapshot["waits"]), 1)
+            wait = snapshot["waits"][0]
+            self.assertEqual(wait["reason"], reason)
+            self.assertEqual(wait["drvs"], [app])
+            self.assertGreaterEqual(wait["seconds"], 0)
+            self.assertEqual(self.jobs_by_attr(snapshot)["packages.app"]["state"], "submitted")
+            self.assertEqual(self.jobs_by_attr(snapshot)["packages.app"]["buildSeconds"], 0)
+            self.assertFalse(any(node["state"] == "building" for node in snapshot["derivations"]))
+            f.release("request-wait")
+            snapshot = self.finish_successfully(process, log)
             log.seek(0)
-            output = log.read()
-            self.assertEqual(process.returncode, 0, output)
-            self.assertIn(reason, output)
-        self.assertEqual(f.snapshot()["waits"], [])
-        events = [json.loads(line) for line in (f.report / "events.jsonl").read_text().splitlines()]
+            self.assertIn(reason, log.read())
+        self.assertEqual(snapshot["waits"], [])
+        self.assert_built(self.jobs_by_attr(snapshot)["packages.app"])
+        events = f.events()
         starts = [event for event in events if event["type"] == "request-wait"]
         stops = [event for event in events if event["type"] == "request-wait-ended"]
         self.assertEqual(len(starts), 1)
         self.assertEqual(len(stops), 1)
         self.assertEqual(starts[0]["requestId"], stops[0]["requestId"])
         self.assertEqual(stops[0]["drvs"], [app])
-        self.assertGreaterEqual(stops[0]["seconds"], 0.35)
+        self.assertGreaterEqual(stops[0]["seconds"], wait["seconds"])
 
     def test_unknown_runtime_download_is_observed_validated_and_not_uploaded(self):
         f = self.fixture
